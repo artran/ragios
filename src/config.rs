@@ -21,6 +21,10 @@ pub struct Config {
     pub max_concurrent_checks: usize,
     #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: usize,
+    #[serde(default = "default_retry_interval")]
+    pub retry_interval_seconds: u64,
+    #[serde(default = "default_confirmation_attempts")]
+    pub confirmation_attempts: u32,
     pub hosts: Vec<Host>,
 }
 
@@ -56,6 +60,12 @@ fn default_max_concurrent_checks() -> usize {
 }
 fn default_max_output_bytes() -> usize {
     64 * 1024
+}
+fn default_retry_interval() -> u64 {
+    60
+}
+fn default_confirmation_attempts() -> u32 {
+    3
 }
 
 impl Config {
@@ -101,6 +111,15 @@ impl Config {
             (1..=isize::MAX as usize).contains(&self.max_output_bytes),
             "max_output_bytes must be between 1 and {}",
             isize::MAX
+        );
+        ensure!(
+            (1..=u32::MAX as u64).contains(&self.retry_interval_seconds),
+            "retry_interval_seconds must be between 1 and {}",
+            u32::MAX
+        );
+        ensure!(
+            self.confirmation_attempts > 0,
+            "confirmation_attempts must be positive"
         );
         ensure!(
             !self.hosts.is_empty(),

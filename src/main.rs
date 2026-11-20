@@ -1,13 +1,9 @@
-mod config;
-mod runner;
-mod store;
 mod web;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use config::Config;
+use ragios::{config::Config, runner, store::Store};
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use store::Store;
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 
 #[derive(Parser)]
@@ -51,10 +47,20 @@ async fn main() -> Result<()> {
                     )
                     .await;
                     drop(permit);
-                    store
-                        .save(host_id.clone(), service.id.clone(), result)
+                    let problem = store
+                        .save(
+                            host_id.clone(),
+                            service.id.clone(),
+                            result,
+                            config.confirmation_attempts,
+                        )
                         .await?;
-                    tokio::time::sleep(Duration::from_secs(config.interval_seconds)).await;
+                    let delay = if problem.needs_retry() {
+                        config.retry_interval_seconds
+                    } else {
+                        config.interval_seconds
+                    };
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
             });
         }

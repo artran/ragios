@@ -69,18 +69,22 @@ Optional settings:
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `bind` | `127.0.0.1:8080` | Explicit HTTP socket address |
-| `interval_seconds` | `300` | Delay after each completed check before its next execution |
+| `interval_seconds` | `300` | Delay after a completed check when no confirmation is pending |
+| `retry_interval_seconds` | `60` | Delay while an initial problem or severity change awaits confirmation |
+| `confirmation_attempts` | `3` | Consecutive results needed to confirm a problem or severity change |
 | `timeout_seconds` | `30` | Execution deadline, including output collection and excluding time waiting for a concurrency slot |
 | `max_concurrent_checks` | `20` | Global limit on running checks across all hosts |
 | `max_output_bytes` | `65536` | Combined stdout/stderr capture budget per execution, in bytes |
 
-Intervals and deadlines are whole seconds between 1 and 4,294,967,295. Concurrency
-and output limits must be positive whole numbers within the platform's semaphore
-and buffer size limits; invalid limits fail startup validation. Checks become
-eligible immediately and wait fairly for a concurrency slot. Each check has at
-most one waiting or running execution and never overlaps itself. The interval
-starts after its result is saved, so missed intervals do not form a catch-up
-queue. On restart, stored results are visible while new checks run.
+Intervals and deadlines are whole seconds between 1 and 4,294,967,295;
+`confirmation_attempts` is an integer in the same range. Concurrency and output
+limits must be positive whole numbers within the platform's semaphore and buffer
+size limits. Invalid limits fail startup validation. Checks become eligible
+immediately and wait fairly for a concurrency slot. Each check has at most one
+waiting or running execution and never overlaps itself. The normal or retry
+interval starts after the result is saved, so missed intervals do not form a
+catch-up queue. On restart, stored results and problem state are visible while
+new checks run.
 
 For an installed Nagios plugin, set `plugin_dir` to its actual installation
 directory, then replace the service definition, for example:
@@ -108,6 +112,33 @@ Truncation does not change a plugin's exit status. Timeout handling kills the
 execution process group on Unix and reaps the direct child. These limits are not
 a security sandbox for untrusted executables.
 
+## Problem lifecycle
+
+A non-OK result appears immediately as a pending problem. By default, three
+consecutive non-OK results confirm it. WARNING, CRITICAL, and UNKNOWN all count
+toward that initial streak; the result reaching the threshold determines the
+confirmed severity.
+
+After confirmation, changing severity requires `confirmation_attempts`
+consecutive results at the same new severity. Changing the candidate severity
+restarts that streak at one; returning to the confirmed severity cancels it.
+The dashboard shows the latest result, confirmed problem, and pending severity
+change separately. Any OK result immediately clears a pending or confirmed
+problem. An initial OK result is not a recovery.
+
+Pending problems and pending severity changes use `retry_interval_seconds`.
+Confirmation, cancellation of a candidate change, and recovery restore the normal
+interval. Delays begin after the result is saved; restarting still checks
+immediately.
+
+SQLite saves each result, problem state, and lifecycle transition in one
+transaction. Streaks and confirmed severity survive restarts. Transitions include
+pending progress, confirmation, candidate changes/cancellation, confirmed severity
+changes, and recovery; repeated stable results do not create transitions. There
+is no history page or notification delivery yet. Databases from before lifecycle
+support retain their results: an existing non-OK result seeds one pending failure,
+not a confirmed problem or invented historical transitions.
+
 ## Access and current scope
 
 There are no accounts or browser mutations. Keep the default loopback binding;
@@ -116,10 +147,11 @@ appropriate network policy. Do not expose this unauthenticated server publicly.
 The SQLite database and configuration are separate from installed plugins; the
 server must be able to read configuration/plugins and write its data directory.
 
-This includes the first service-monitoring slice ([#1](https://github.com/artran/ragios/issues/1))
-and bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)).
-Problem confirmation, independent host reachability,
-reload, history, freshness/overdue assessment, and notifications are later work.
+This includes the first service-monitoring slice ([#1](https://github.com/artran/ragios/issues/1)),
+bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)), and
+problem confirmation ([#3](https://github.com/artran/ragios/issues/3)). Independent
+host reachability, reload, history browsing, freshness/overdue assessment, and
+notifications are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
 
@@ -138,6 +170,9 @@ dependencies, periodic executions without overlap or catch-up, global concurrenc
 bounded output, healthy progress under load, escaped output, startup validation,
 timeout/descendant cleanup and error diagnostics, and persisted results observed
 through HTTP after restarting the application.
+Lifecycle tests cover mixed-severity failure streaks, interrupted candidate
+changes, immediate recovery, configurable thresholds/retry timing, and persisted
+state and transitions through the store API and rendered dashboard.
 
 ## Bundled asset
 

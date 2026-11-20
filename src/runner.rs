@@ -10,7 +10,7 @@ use tokio::{
     process::{ChildStderr, ChildStdout, Command},
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ok,
     Warning,

@@ -1,4 +1,3 @@
-use crate::{config::Config, store::Store};
 use axum::{
     Router,
     extract::State,
@@ -6,6 +5,7 @@ use axum::{
     response::Html,
     routing::get,
 };
+use ragios::{config::Config, store::Store};
 use std::{fmt::Write, sync::Arc};
 
 #[derive(Clone)]
@@ -46,7 +46,7 @@ pre{{white-space:pre-wrap;overflow-wrap:anywhere;margin:0;max-width:40rem}}
 .OK{{color:#146138}}.WARNING{{color:#805000}}.CRITICAL{{color:#b02020}}.UNKNOWN{{color:#654398}}
 small{{color:#45556b}}.scroll{{overflow-x:auto}}
 </style></head><body><main><h1>Ragios</h1><p>Service health · email disabled</p>
-<p>Latest plugin results, not confirmed problems. Host reachability is not yet assessed.</p>
+<p>Latest results, confirmed problems, and pending changes are shown separately. Host reachability is not yet assessed.</p>
 <div id="status" hx-get="/status" hx-trigger="every 2s" hx-swap="innerHTML">{fragment}</div>
 <noscript>Reload this page to refresh results.</noscript></main></body></html>"#
     )))
@@ -65,7 +65,7 @@ async fn render(dashboard: &Dashboard) -> Result<String, (StatusCode, &'static s
         )
     })?;
     let mut html = String::from(
-        "<div class=\"scroll\"><table><thead><tr><th>Host</th><th>Service</th><th>Latest result</th><th>Output</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Duration</th></tr></thead><tbody>",
+        "<div class=\"scroll\"><table><thead><tr><th>Host</th><th>Service</th><th>Latest result</th><th>Confirmed problem</th><th>Pending problem / severity change</th><th>Output</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Duration</th></tr></thead><tbody>",
     );
     for host in &dashboard.config.hosts {
         for service in &host.services {
@@ -77,18 +77,44 @@ async fn render(dashboard: &Dashboard) -> Result<String, (StatusCode, &'static s
                 escape(&service.name),
                 escape(&service.id)
             );
-            if let Some(result) = latest.get(&(host.id.clone(), service.id.clone())) {
+            if let Some(state) = latest.get(&(host.id.clone(), service.id.clone())) {
+                let result = &state.result;
                 let label = result.status.label();
+                let _ = write!(html, "<td class=\"{label}\">{label}</td>");
+                if let Some(severity) = state.problem.confirmed_severity {
+                    let label = severity.label();
+                    let _ = write!(
+                        html,
+                        "<td class=\"{label}\">Confirmed problem: {label}</td>"
+                    );
+                } else {
+                    html.push_str("<td>No confirmed problem</td>");
+                }
+                if let Some(severity) = state.problem.pending_severity {
+                    let label = severity.label();
+                    let kind = if state.problem.confirmed_severity.is_some() {
+                        "Pending severity change"
+                    } else {
+                        "Pending problem"
+                    };
+                    let _ = write!(
+                        html,
+                        "<td class=\"{label}\">{kind}: {label} ({}/{})</td>",
+                        state.problem.pending_attempts, dashboard.config.confirmation_attempts
+                    );
+                } else {
+                    html.push_str("<td>No pending problem</td>");
+                }
                 let _ = write!(
                     html,
-                    "<td class=\"{label}\">{label}</td><td><pre>{}</pre></td><td>{}</td><td>{}</td><td>{} ms</td>",
+                    "<td><pre>{}</pre></td><td>{}</td><td>{}</td><td>{} ms</td>",
                     escape(&result.output),
                     escape(&result.started_at),
                     escape(&result.finished_at),
                     result.duration_ms
                 );
             } else {
-                html.push_str("<td>Not yet checked</td><td colspan=\"4\">No result available</td>");
+                html.push_str("<td>Not yet checked</td><td colspan=\"6\">No result available</td>");
             }
             html.push_str("</tr>\n");
         }

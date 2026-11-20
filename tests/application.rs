@@ -241,8 +241,11 @@ esac"#,
     let mut app = Application::start(&path);
     let result = app.page("/status", "healthy iteration 2");
     assert!(started.elapsed() < Duration::from_secs(7));
-    assert_eq!(result.matches("class=\"UNKNOWN\"").count(), 2);
-    assert_eq!(result.matches("class=\"OK\"").count(), 1);
+    assert_eq!(
+        result.matches("<td class=\"UNKNOWN\">UNKNOWN</td>").count(),
+        2
+    );
+    assert_eq!(result.matches("<td class=\"OK\">OK</td>").count(), 1);
     assert!(result.contains("execution timed out after 1 seconds"));
     assert!(result.contains("[output truncated at 128 bytes]"));
     assert!(result.len() < 4000, "noisy output must stay bounded");
@@ -315,6 +318,149 @@ fn installed_python_plugins_keep_their_runtime_dependencies_and_environment() {
 }
 
 #[test]
+fn problem_lifecycle_is_rendered_and_survives_restart() {
+    let dir = TempDir::new().unwrap();
+    let path = config(&dir, "");
+    let gate = dir.path().join("release");
+    let mut previous: Option<(String, String)> = None;
+    for (n, (code, confirmed, pending)) in [
+        (0, "No confirmed problem", "No pending problem"),
+        (1, "No confirmed problem", "Pending problem: WARNING (1/3)"),
+        (2, "No confirmed problem", "Pending problem: CRITICAL (2/3)"),
+        (3, "Confirmed problem: UNKNOWN", "No pending problem"),
+        (
+            1,
+            "Confirmed problem: UNKNOWN",
+            "Pending severity change: WARNING (1/3)",
+        ),
+        (
+            1,
+            "Confirmed problem: UNKNOWN",
+            "Pending severity change: WARNING (2/3)",
+        ),
+        (
+            2,
+            "Confirmed problem: UNKNOWN",
+            "Pending severity change: CRITICAL (1/3)",
+        ),
+        (3, "Confirmed problem: UNKNOWN", "No pending problem"),
+        (
+            2,
+            "Confirmed problem: UNKNOWN",
+            "Pending severity change: CRITICAL (1/3)",
+        ),
+        (
+            2,
+            "Confirmed problem: UNKNOWN",
+            "Pending severity change: CRITICAL (2/3)",
+        ),
+        (2, "Confirmed problem: CRITICAL", "No pending problem"),
+        (0, "No confirmed problem", "No pending problem"),
+        (1, "No confirmed problem", "Pending problem: WARNING (1/3)"),
+        (0, "No confirmed problem", "No pending problem"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let _ = fs::remove_file(&gate);
+        plugin(
+            &dir,
+            &format!(
+                "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 3; sleep 0.02; done\nprintf 'observation {n} complete\\n'\nexit {code}",
+                gate.display(),
+                dir.path().display()
+            ),
+        );
+        let mut app = Application::start(&path);
+        if let Some((marker, saved)) = &previous {
+            assert_eq!(
+                &app.page("/status", marker),
+                saved,
+                "persisted dashboard changed on restart"
+            );
+        } else {
+            app.page("/status", "Not yet checked");
+        }
+        fs::write(&gate, "").unwrap();
+        let marker = format!("observation {n} complete");
+        let rendered = app.page("/status", &marker);
+        assert!(
+            rendered.contains(confirmed),
+            "missing {confirmed}: {rendered}"
+        );
+        assert!(rendered.contains(pending), "missing {pending}: {rendered}");
+        let latest = ["OK", "WARNING", "CRITICAL", "UNKNOWN"][code as usize];
+        assert!(rendered.contains(&format!("<td class=\"{latest}\">{latest}</td>")));
+        previous = Some((marker, rendered));
+    }
+}
+
+#[test]
+fn configurable_attempts_use_retry_timing_only_while_confirmation_is_pending() {
+    let dir = TempDir::new().unwrap();
+    let counter = dir.path().join("counter");
+    plugin(
+        &dir,
+        &format!(
+            r#"n=0
+if [ -f '{counter}' ]; then n=$(cat '{counter}'); fi
+printf '%s' "$((n+1))" > '{counter}'
+printf 'scheduled observation %s complete\n' "$n"
+case "$n" in
+  0|5) exit 1;;
+  1|3) exit 2;;
+  2) exit 3;;
+  *) exit 0;;
+esac"#,
+            counter = counter.display()
+        ),
+    );
+    let path = config(
+        &dir,
+        "interval_seconds: 3\nretry_interval_seconds: 1\nconfirmation_attempts: 2",
+    );
+    let mut app = Application::start(&path);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let store = ragios::store::Store::open(&dir.path().join("state.sqlite3")).unwrap();
+    let mut previous_finished = None;
+    for (n, (expected, delay)) in [
+        ("Pending problem: WARNING (1/2)", 0),
+        ("Confirmed problem: CRITICAL", 1),
+        ("Pending severity change: UNKNOWN (1/2)", 3),
+        ("No pending problem", 1),
+        ("No confirmed problem", 3),
+        ("Pending problem: WARNING (1/2)", 3),
+        ("No pending problem", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rendered = app.page("/status", &format!("scheduled observation {n} complete"));
+        assert!(rendered.contains(expected), "{rendered}");
+        if n == 2 || n == 3 {
+            assert!(
+                rendered.contains("Confirmed problem: CRITICAL"),
+                "{rendered}"
+            );
+        }
+        let latest = runtime.block_on(store.latest()).unwrap();
+        let saved = &latest[&("local".into(), "application".into())].result;
+        let started = chrono::DateTime::parse_from_rfc3339(&saved.started_at).unwrap();
+        if let Some(finished) = previous_finished {
+            let gap = started.signed_duration_since(finished).num_milliseconds();
+            assert!(
+                gap >= delay * 1000 - 20,
+                "observation {n}: {gap} ms, expected {delay}s"
+            );
+            if delay == 1 {
+                assert!(gap < 2800, "retry waited for the normal interval: {gap} ms");
+            }
+        }
+        previous_finished = Some(chrono::DateTime::parse_from_rfc3339(&saved.finished_at).unwrap());
+    }
+}
+
+#[test]
 fn operating_system_assigned_listener_serves_the_configured_check() {
     let dir = TempDir::new().unwrap();
     plugin(&dir, "printf 'ephemeral listener works\\n'\nexit 0");
@@ -342,7 +488,7 @@ case "$n" in
   *) exit 3;;
 esac"#,
     );
-    let config = config(&dir, "interval_seconds: 1");
+    let config = config(&dir, "interval_seconds: 1\nretry_interval_seconds: 1");
     let injection_marker = dir.path().join("must-not-exist");
     let literal = format!(
         "argument with spaces; $(touch {}) & | <tag>",
@@ -527,6 +673,22 @@ fn invalid_configuration_fails_before_any_plugin_starts() {
         (
             format!("{valid}\nmax_output_bytes: 1.5"),
             "parse configuration",
+        ),
+        (
+            format!("{valid}\nretry_interval_seconds: 0"),
+            "retry_interval_seconds",
+        ),
+        (
+            format!("{valid}\nretry_interval_seconds: 4294967296"),
+            "retry_interval_seconds",
+        ),
+        (
+            format!("{valid}\nconfirmation_attempts: 0"),
+            "confirmation_attempts",
+        ),
+        (
+            format!("{valid}\nconfirmation_attempts: 4294967296"),
+            "confirmation_attempts",
         ),
         (valid.replace("id: local", "id: ''"), "host ID"),
         (
