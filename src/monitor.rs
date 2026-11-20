@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use ragios::{
     config::{Check, Config},
     runner::{self, CheckResult},
@@ -55,6 +55,16 @@ impl ScheduledCheck {
                     self.check.interval_seconds
                 })
         })
+    }
+
+    /// When the check may next start: its deadline, or later while its window
+    /// is closed. Catch-up after a restart therefore never runs through a
+    /// closed window.
+    fn start_at(&self, config: &Config, now: Instant, wall: DateTime<Utc>) -> Instant {
+        let deadline = self.deadline(config).max(now);
+        let at = wall + TimeDelta::from_std(deadline - now).expect("bounded deadline");
+        let open = schedule::eligible_from(&self.check, at);
+        deadline + (open - at).to_std().unwrap_or_default()
     }
 }
 
@@ -194,10 +204,11 @@ impl Monitor {
         if self.tasks.len() >= self.config.max_concurrent_checks {
             return None;
         }
+        let (now, wall) = (Instant::now(), Utc::now());
         self.checks
             .iter()
             .filter(|(key, _)| !self.running.contains(*key))
-            .map(|(key, check)| (key.clone(), check.deadline(&self.config)))
+            .map(|(key, check)| (key.clone(), check.start_at(&self.config, now, wall)))
             .min_by_key(|(_, deadline)| *deadline)
     }
 

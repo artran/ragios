@@ -1,15 +1,19 @@
 //! When checks fall due and whether their latest results are still current.
 //! Every decision takes an explicit `now`, so callers control time.
 
-use crate::{config::Check, store::ProblemState};
-use chrono::{DateTime, TimeDelta, Utc};
+use crate::{
+    config::{Check, CheckWindow},
+    store::ProblemState,
+};
+use chrono::{DateTime, Datelike, Days, NaiveDateTime, TimeDelta, TimeZone, Timelike, Utc};
 use std::time::Duration;
 
 /// Slack beyond a due execution's own timeout before it counts as overdue.
 pub const OVERDUE_GRACE: TimeDelta = TimeDelta::seconds(30);
 
 /// When a check is next due and allowed to run after the result that finished
-/// at `finished`. Pending problems use retry timing. A result that claims to
+/// at `finished`. Pending problems use retry timing, and a check due while its
+/// window is closed falls due when the window next opens. A result that claims to
 /// finish after `now` means the clock moved back, so its due time is unknown.
 pub fn due_at(
     check: &Check,
@@ -26,7 +30,67 @@ pub fn due_at(
     } else {
         check.interval_seconds
     };
-    Some(finished + seconds(interval))
+    Some(eligible_from(check, finished + seconds(interval)))
+}
+
+/// The earliest instant at or after `at` when `check` may start.
+pub fn eligible_from(check: &Check, at: DateTime<Utc>) -> DateTime<Utc> {
+    check
+        .window
+        .as_ref()
+        .map_or(at, |window| next_open(window, at))
+}
+
+/// Whether local wall-clock time at `at` falls inside one of the window's
+/// ranges. Local time keeps the window fixed across daylight-saving changes.
+fn is_open(window: &CheckWindow, at: DateTime<Utc>) -> bool {
+    let local = at.with_timezone(&window.timezone);
+    let minute = local.hour() * 60 + local.minute();
+    window.ranges.iter().any(|range| {
+        range.days.contains(&local.weekday())
+            && (range.start_minute..range.end_minute).contains(&minute)
+    })
+}
+
+/// A closed window next opens where a range starts, or where a range starting
+/// inside a skipped daylight-saving hour first exists. A repeated hour offers
+/// both of its instants. Validation guarantees a range, so one opens within a
+/// week.
+fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
+    if is_open(window, at) {
+        return at;
+    }
+    let today = at.with_timezone(&window.timezone).date_naive();
+    (0..=8)
+        .filter_map(|offset| today.checked_add_days(Days::new(offset)))
+        .flat_map(|day| {
+            window
+                .ranges
+                .iter()
+                .filter(move |range| range.days.contains(&day.weekday()))
+                .map(move |range| {
+                    day.and_time(chrono::NaiveTime::MIN)
+                        + TimeDelta::minutes(range.start_minute.into())
+                })
+        })
+        .flat_map(|start| instants(window.timezone, start))
+        .filter(|&instant| instant > at && is_open(window, instant))
+        .min()
+        .expect("a validated window opens every week")
+}
+
+fn instants(timezone: chrono_tz::Tz, local: NaiveDateTime) -> Vec<DateTime<Utc>> {
+    // Skipped local times resolve to the first minute that exists after them.
+    (0..=24 * 60)
+        .map(|minute| timezone.from_local_datetime(&(local + TimeDelta::minutes(minute))))
+        .find_map(|times| times.earliest().map(|earliest| (earliest, times.latest())))
+        .map_or_else(Vec::new, |(earliest, latest)| {
+            [Some(earliest), latest]
+                .into_iter()
+                .flatten()
+                .map(|time| time.to_utc())
+                .collect()
+        })
 }
 
 /// Whether a check due at `due` should have produced a newer result by `now`.

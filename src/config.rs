@@ -76,6 +76,25 @@ pub struct Check {
     pub args: Vec<String>,
     pub interval_seconds: u64,
     pub timeout_seconds: u64,
+    /// When the check may start; `None` means at any time.
+    pub window: Option<CheckWindow>,
+}
+
+/// A named recurring weekly period, in local time, during which checks may start.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckWindow {
+    pub id: String,
+    pub timezone: chrono_tz::Tz,
+    pub ranges: Vec<WindowRange>,
+}
+
+/// Local minutes of the day from `start_minute` up to, but excluding,
+/// `end_minute` (at most 1440) on each of `days`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowRange {
+    pub days: Vec<chrono::Weekday>,
+    pub start_minute: u32,
+    pub end_minute: u32,
 }
 
 fn index<'a, T>(
@@ -315,6 +334,7 @@ impl Resolver<'_> {
                                 .timeout_seconds
                                 .or(host.timeout_seconds)
                                 .unwrap_or(self.file.timeout_seconds),
+                            window: None,
                         },
                     })
                 })
@@ -375,6 +395,7 @@ impl Resolver<'_> {
                     .or(service.timeout_seconds)
                     .or(host.timeout_seconds)
                     .unwrap_or(self.file.timeout_seconds),
+                window: None,
             },
         })
     }

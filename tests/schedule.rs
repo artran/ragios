@@ -1,8 +1,8 @@
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc, Weekday};
 use ragios::{
-    config::Check,
+    config::{Check, CheckWindow, WindowRange},
     runner::Status,
-    schedule::{due_at, is_overdue, startup_delays},
+    schedule::{due_at, eligible_from, is_overdue, startup_delays},
     store::ProblemState,
 };
 use std::time::Duration;
@@ -17,6 +17,34 @@ fn check(interval_seconds: u64, timeout_seconds: u64) -> Check {
         args: Vec::new(),
         interval_seconds,
         timeout_seconds,
+        window: None,
+    }
+}
+
+const WEEKDAYS: [Weekday; 5] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+];
+
+fn windowed(check: Check, timezone: &str, days: &[Weekday], start: &str, end: &str) -> Check {
+    let minutes = |text: &str| {
+        let (hours, minutes) = text.split_once(':').unwrap();
+        hours.parse::<u32>().unwrap() * 60 + minutes.parse::<u32>().unwrap()
+    };
+    Check {
+        window: Some(CheckWindow {
+            id: "window".into(),
+            timezone: timezone.parse().unwrap(),
+            ranges: vec![WindowRange {
+                days: days.to_vec(),
+                start_minute: minutes(start),
+                end_minute: minutes(end),
+            }],
+        }),
+        ..check
     }
 }
 
@@ -135,5 +163,177 @@ fn checks_falling_due_during_the_startup_period_queue_behind_overdue_ones_but_ne
             ("oldest", Duration::ZERO),
             ("after-startup", Duration::from_secs(120)),
         ]
+    );
+}
+
+#[test]
+fn a_weekday_work_hours_check_due_at_the_weekend_falls_due_when_its_window_next_opens() {
+    // Friday 17:00 in London (GMT in November).
+    let finished = at("2026-11-20T17:00:00Z");
+    let check = windowed(check(300, 30), "Europe/London", &WEEKDAYS, "09:00", "17:30");
+    assert_eq!(
+        due_at(&check, 60, finished, ProblemState::default(), finished),
+        Some(at("2026-11-20T17:05:00Z")),
+        "a check due inside its window runs on its interval"
+    );
+    let finished = at("2026-11-20T17:28:00Z");
+    let saturday = at("2026-11-21T10:00:00Z");
+    let monday = at("2026-11-23T09:00:00Z");
+    assert_eq!(
+        due_at(&check, 60, finished, ProblemState::default(), saturday),
+        Some(monday)
+    );
+    assert!(
+        !is_overdue(&check, monday, saturday),
+        "a closed window alone never makes a check overdue"
+    );
+}
+
+#[test]
+fn checks_sharing_a_window_keep_independent_intervals_including_daily_weekday_checks() {
+    let finished = at("2026-11-19T09:00:05Z");
+    let frequent = windowed(check(300, 30), "UTC", &WEEKDAYS, "09:00", "10:00");
+    let certificate = windowed(check(86_400, 30), "UTC", &WEEKDAYS, "09:00", "10:00");
+    let state = ProblemState::default();
+    assert_eq!(
+        due_at(&frequent, 60, finished, state, finished),
+        Some(at("2026-11-19T09:05:05Z"))
+    );
+    assert_eq!(
+        due_at(&certificate, 60, finished, state, finished),
+        Some(at("2026-11-20T09:00:05Z")),
+        "Thursday's certificate check runs again on Friday"
+    );
+    let friday = at("2026-11-20T09:00:05Z");
+    assert_eq!(
+        due_at(&certificate, 60, friday, state, friday),
+        Some(at("2026-11-23T09:00:00Z")),
+        "Friday's certificate check skips the weekend"
+    );
+    let late = at("2026-11-19T09:58:00Z");
+    assert_eq!(
+        due_at(&frequent, 60, late, state, late),
+        Some(at("2026-11-20T09:00:00Z")),
+        "a due time after the window closes waits for the next day's window"
+    );
+}
+
+#[test]
+fn retries_wait_for_the_window_to_reopen() {
+    let check = windowed(check(300, 30), "UTC", &WEEKDAYS, "09:00", "17:30");
+    let finished = at("2026-11-19T17:29:30Z");
+    assert_eq!(
+        due_at(&check, 60, finished, PENDING, finished),
+        Some(at("2026-11-20T09:00:00Z"))
+    );
+    let finished = at("2026-11-19T12:00:00Z");
+    assert_eq!(
+        due_at(&check, 60, finished, PENDING, finished),
+        Some(at("2026-11-19T12:01:00Z")),
+        "retries inside an open window keep retry timing"
+    );
+}
+
+#[test]
+fn a_restart_outside_the_window_waits_for_it_to_open_instead_of_catching_up() {
+    let check = windowed(check(300, 30), "UTC", &WEEKDAYS, "09:00", "17:30");
+    let saturday = at("2026-11-21T12:00:00Z");
+    let monday = at("2026-11-23T09:00:00Z");
+    let due = due_at(
+        &check,
+        60,
+        at("2026-11-20T17:28:00Z"),
+        ProblemState::default(),
+        saturday,
+    );
+    assert_eq!(due, Some(monday));
+    assert!(!is_overdue(&check, monday, saturday));
+    assert_eq!(
+        startup_delays(vec![("work", due)], saturday, Duration::from_secs(60)),
+        [("work", (monday - saturday).to_std().unwrap())]
+    );
+}
+
+#[test]
+fn a_check_missed_inside_its_window_is_overdue_but_waits_for_the_window_to_run() {
+    let check = windowed(check(300, 30), "UTC", &WEEKDAYS, "09:00", "17:30");
+    let saturday = at("2026-11-21T12:00:00Z");
+    let missed = at("2026-11-20T12:05:00Z");
+    let due = due_at(
+        &check,
+        60,
+        at("2026-11-20T12:00:00Z"),
+        ProblemState::default(),
+        saturday,
+    );
+    assert_eq!(due, Some(missed));
+    assert!(is_overdue(&check, missed, saturday));
+    assert_eq!(
+        eligible_from(&check, saturday),
+        at("2026-11-23T09:00:00Z"),
+        "catch-up and new checks start only when the window opens"
+    );
+}
+
+#[test]
+fn windows_keep_their_local_hours_across_daylight_saving_changes() {
+    let check = windowed(check(300, 30), "Europe/London", &WEEKDAYS, "09:00", "17:30");
+    // British Summer Time starts on Sunday 29 March 2026 and ends on Sunday
+    // 25 October 2026.
+    assert_eq!(
+        eligible_from(&check, at("2026-03-27T18:00:00Z")),
+        at("2026-03-30T08:00:00Z"),
+        "Monday 09:00 BST"
+    );
+    assert_eq!(
+        eligible_from(&check, at("2026-10-23T18:00:00Z")),
+        at("2026-10-26T09:00:00Z"),
+        "Monday 09:00 GMT"
+    );
+    assert_eq!(
+        eligible_from(&check, at("2026-03-30T16:15:00Z")),
+        at("2026-03-30T16:15:00Z"),
+        "17:15 BST is still open"
+    );
+    assert_eq!(
+        eligible_from(&check, at("2026-03-30T16:45:00Z")),
+        at("2026-03-31T08:00:00Z"),
+        "17:45 BST is closed until Tuesday 09:00 BST"
+    );
+}
+
+#[test]
+fn a_window_starting_in_a_skipped_hour_opens_when_local_time_resumes() {
+    let check = windowed(
+        check(300, 30),
+        "Europe/London",
+        &[Weekday::Sun],
+        "01:30",
+        "03:00",
+    );
+    // Clocks go from 01:00 GMT straight to 02:00 BST.
+    assert_eq!(
+        eligible_from(&check, at("2026-03-28T12:00:00Z")),
+        at("2026-03-29T01:00:00Z")
+    );
+}
+
+#[test]
+fn a_window_in_a_repeated_hour_opens_on_each_occurrence() {
+    let check = windowed(
+        check(300, 30),
+        "Europe/London",
+        &[Weekday::Sun],
+        "01:30",
+        "02:00",
+    );
+    // Local 01:00-02:00 happens first in BST (00:00-01:00 UTC), then in GMT.
+    assert_eq!(
+        eligible_from(&check, at("2026-10-24T12:00:00Z")),
+        at("2026-10-25T00:30:00Z")
+    );
+    assert_eq!(
+        eligible_from(&check, at("2026-10-25T01:10:00Z")),
+        at("2026-10-25T01:30:00Z")
     );
 }

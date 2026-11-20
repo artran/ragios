@@ -232,9 +232,10 @@ impl Snapshot {
         state: Option<(&CheckResult, ProblemState)>,
     ) -> Freshness {
         let Some((result, problem)) = state else {
-            return match self.scheduler.unchecked_since.get(key) {
-                Some(&due) if schedule::is_overdue(check, due, self.now) => Freshness::Missing(due),
-                Some(&due) => Freshness::Current(due),
+            let due = self.scheduler.unchecked_since.get(key);
+            return match due.map(|&since| schedule::eligible_from(check, since)) {
+                Some(due) if schedule::is_overdue(check, due, self.now) => Freshness::Missing(due),
+                Some(due) => Freshness::Current(due),
                 None => Freshness::NotYetChecked,
             };
         };
