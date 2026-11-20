@@ -29,22 +29,34 @@ const PENDING: ProblemState = ProblemState {
 #[test]
 fn checks_fall_due_one_interval_after_their_last_result_or_one_retry_interval_while_pending() {
     let finished = at("2026-11-20T12:00:00Z");
+    let now = at("2026-11-20T12:00:30Z");
     assert_eq!(
-        due_at(&check(300, 30), 60, finished, ProblemState::default()),
-        at("2026-11-20T12:05:00Z")
+        due_at(&check(300, 30), 60, finished, ProblemState::default(), now),
+        Some(at("2026-11-20T12:05:00Z"))
     );
     assert_eq!(
-        due_at(&check(300, 30), 60, finished, PENDING),
-        at("2026-11-20T12:01:00Z")
+        due_at(&check(300, 30), 60, finished, PENDING, now),
+        Some(at("2026-11-20T12:01:00Z"))
     );
     let confirmed = ProblemState {
         confirmed_severity: Some(Status::Critical),
         ..ProblemState::default()
     };
     assert_eq!(
-        due_at(&check(300, 30), 60, finished, confirmed),
-        at("2026-11-20T12:05:00Z"),
+        due_at(&check(300, 30), 60, finished, confirmed, now),
+        Some(at("2026-11-20T12:05:00Z")),
         "a stable confirmed problem uses the normal interval"
+    );
+    assert_eq!(
+        due_at(
+            &check(300, 30),
+            60,
+            finished,
+            ProblemState::default(),
+            at("2026-11-20T11:59:59Z")
+        ),
+        None,
+        "a result from the future means the clock moved back"
     );
 }
 
@@ -98,4 +110,30 @@ fn without_a_startup_period_overdue_checks_are_all_eligible_immediately() {
         Duration::ZERO,
     );
     assert_eq!(delays, [(1, Duration::ZERO), (2, Duration::ZERO)]);
+}
+
+#[test]
+fn checks_falling_due_during_the_startup_period_queue_behind_overdue_ones_but_never_run_early() {
+    let now = at("2026-11-20T12:00:00Z");
+    let delays = startup_delays(
+        vec![
+            ("late", Some(at("2026-11-20T12:00:50Z"))),
+            ("soon", Some(at("2026-11-20T12:00:10Z"))),
+            ("overdue", Some(at("2026-11-20T11:59:00Z"))),
+            ("oldest", Some(at("2026-11-20T11:00:00Z"))),
+            ("after-startup", Some(at("2026-11-20T12:02:00Z"))),
+        ],
+        now,
+        Duration::from_secs(60),
+    );
+    assert_eq!(
+        delays,
+        [
+            ("late", Duration::from_secs(50)),
+            ("soon", Duration::from_secs(30)),
+            ("overdue", Duration::from_secs(15)),
+            ("oldest", Duration::ZERO),
+            ("after-startup", Duration::from_secs(120)),
+        ]
+    );
 }

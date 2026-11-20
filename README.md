@@ -124,25 +124,39 @@ A restart resumes the saved schedule. Latest results, confirmed problems, and
 pending streaks are restored from SQLite, so an existing problem is not
 confirmed or reported again. Each saved check falls due one normal interval
 after its saved result finished, or one retry interval while a problem or
-severity change is pending, and waits until then. Checks already overdue at
-startup are spaced evenly, oldest first, across `startup_spread_seconds`; checks
-that have never run start immediately. Concurrency, no-overlap, and backlog
-limits still apply. A saved result's schedule follows the configuration loaded
-at startup, even if the check's command changed while Ragios was stopped.
+severity change is pending. Checks that have never run start immediately.
+Checks due before the end of `startup_spread_seconds` take evenly spaced slots
+across that period in due order, oldest first. Overdue checks are therefore
+neither forgotten nor launched together, a check that is not yet overdue never
+jumps ahead of one that is, and no check runs before it is due. Later checks
+wait for their due time. Concurrency, no-overlap, and backlog limits still
+apply. A saved result's schedule follows the configuration loaded at startup,
+even if the check's command changed while Ragios was stopped.
 
 Freshness comes from when a check is due, not from the plugin status. A check
-is overdue once its due time, its own timeout, and 30 seconds of scheduling
-grace have all passed without a newer result. The dashboard then shows the
-latest result as stale (for example `OK (stale)`, without the status colour),
-shows when the check fell due, and shows a banner counting overdue checks. A
-stale result keeps its plugin status; it is never turned into UNKNOWN. Detail
-pages also show the result's age.
+with no saved result is due from when it was first configured in the running
+server. A check is overdue once its due time, its own timeout, and 30 seconds
+of scheduling grace have all passed without a newer result. The dashboard then
+shows the latest result as stale (for example `OK (stale)`, without the status
+colour), or `no result yet` for a check that has never saved one. It also shows
+when the check fell due, plus a banner counting overdue checks. A stale result
+keeps its plugin status; it is never turned into UNKNOWN. Detail pages also
+show the result's age. A result timestamped later than the current time means
+the system clock moved back: it is shown as stale, and at startup its check
+runs immediately.
 
-If Ragios cannot record a check result, for example because SQLite rejects the
-write, it keeps monitoring other checks, retries that check at retry timing,
-logs the error, and shows a scheduler-fault banner with the first failure time
-and the latest error on every page. The banner clears once every affected check
-has saved a result again. Results lost while the fault lasts leave their checks overdue. An external
+Ragios shows a scheduler-fault banner on every page, with the first failure time
+and the latest error, when:
+
+- it cannot record a check result, for example because SQLite rejects the write;
+- a check execution stops without a result;
+- it cannot read the saved schedule at startup, in which case every check
+  starts immediately.
+
+It keeps monitoring the other checks, retries an affected check at retry
+timing, and logs the error. The banner clears once every affected check has
+saved a result again; after a failed startup read, that means every check.
+Results lost while the fault lasts leave their checks overdue. An external
 watchdog is still needed to detect loss of the server process itself.
 
 For an installed Nagios plugin, set `plugin_dir` to its actual installation
@@ -274,8 +288,9 @@ end to end with backdated state changes.
 Restart tests stop and restart the application against the same database.
 They check restored problems without repeated confirmation, waiting for checks
 that are not yet due, and evenly spread catch-up of overdue checks. They also
-check stale marking of backdated results and scheduler-fault banners from a
-simulated SQLite write failure. Due-time, overdue, and startup-spread rules
+check stale marking of backdated and future-dated results, overdue checks that
+never save a result, and scheduler-fault banners from a simulated SQLite write
+failure. Due-time, overdue, and startup-spread rules
 are also tested against an explicit clock.
 
 ## Bundled asset

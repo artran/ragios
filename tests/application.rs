@@ -2326,3 +2326,74 @@ fn failures_to_record_results_are_shown_prominently_and_clear_once_monitoring_pr
         !page.contains("Scheduler fault")
     });
 }
+
+#[test]
+fn results_timestamped_in_the_future_are_stale_and_checked_again_at_startup() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("runs.log");
+    plugin(
+        &dir,
+        &format!(
+            "echo run >> '{}'\nwhile [ -d '{}' ]; do sleep 0.05; done\nexit 3",
+            log.display(),
+            dir.path().display()
+        ),
+    );
+    let path = config(&dir, "");
+    // As if the system clock moved back a day after this result was saved.
+    let future = (chrono::Utc::now() + chrono::TimeDelta::days(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    seed(&dir, "local", "application", 0, &future, 3);
+
+    let mut app = Application::start(&path);
+    let page = app.page("/status", "seeded application");
+    let row = row_for(&page, "Application health");
+    assert!(
+        row.contains("OK (stale)"),
+        "a future result cannot be current: {row}"
+    );
+    assert!(page.contains("1 check is overdue"), "{page}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runs(&log) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the check did not run at startup"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn checks_that_never_record_a_result_become_overdue_from_when_they_were_first_due() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "printf 'healthy\\n'\nexit 0");
+    let path = config(&dir, "timeout_seconds: 1\nretry_interval_seconds: 1");
+    drop(ragios::store::Store::open(&dir.path().join("state.sqlite3")).unwrap());
+    let database = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER simulated_fault BEFORE INSERT ON check_results
+             BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END;",
+        )
+        .unwrap();
+    let mut app = Application::start(&path);
+    let page = app.page("/status", "Scheduler fault");
+    assert!(page.contains("Not yet checked"), "{page}");
+    assert!(
+        !page.contains("overdue"),
+        "not overdue within its deadline and grace: {page}"
+    );
+
+    // One-second deadline plus 30 seconds of scheduling grace.
+    thread::sleep(Duration::from_secs(32));
+    let page = app.page("/status", "1 check is overdue");
+    let row = row_for(&page, "Application health");
+    assert!(row.contains("Overdue since"), "{row}");
+    assert!(row.contains("no result yet"), "{row}");
+
+    database
+        .execute_batch("DROP TRIGGER simulated_fault")
+        .unwrap();
+    let page = app.page("/status", "healthy");
+    assert!(!page.contains("overdue"), "{page}");
+}

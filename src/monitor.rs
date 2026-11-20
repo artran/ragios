@@ -7,7 +7,7 @@ use ragios::{
     store::{CheckTarget, ProblemState, Store},
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -18,7 +18,7 @@ use tokio::{
     time::Instant,
 };
 
-type Key = (String, String);
+pub type Key = (String, String);
 
 /// A failure that stops monitoring from making recorded progress. It persists
 /// until every check whose result could not be saved has saved one again.
@@ -26,6 +26,14 @@ type Key = (String, String);
 pub struct SchedulerFault {
     pub since: DateTime<Utc>,
     pub message: String,
+}
+
+/// What operators need to know about the scheduler beyond saved results.
+#[derive(Clone, Default)]
+pub struct SchedulerStatus {
+    pub fault: Option<SchedulerFault>,
+    /// When each configured check without a saved result first became due.
+    pub unchecked_since: HashMap<Key, DateTime<Utc>>,
 }
 
 struct ScheduledCheck {
@@ -70,8 +78,11 @@ struct Monitor {
     checks: BTreeMap<Key, ScheduledCheck>,
     running: HashSet<Key>,
     tasks: JoinSet<(Key, u64, CheckResult)>,
+    /// The check and generation behind each task, so a task that panics
+    /// without returning its key can still be attributed.
+    executions: HashMap<tokio::task::Id, (Key, u64)>,
     generation: u64,
-    faults: watch::Sender<Option<SchedulerFault>>,
+    status: watch::Sender<SchedulerStatus>,
     /// Checks whose latest result could not be saved.
     unsaved: HashSet<Key>,
 }
@@ -79,6 +90,7 @@ struct Monitor {
 impl Monitor {
     fn replace(&mut self, config: Arc<Config>) {
         let mut checks = BTreeMap::new();
+        let mut added = Vec::new();
         for host in &config.hosts {
             let definitions = host
                 .reachability
@@ -91,6 +103,9 @@ impl Monitor {
                 );
             for (target, check) in definitions {
                 let key = check_key(&host.id, &target);
+                if !self.checks.contains_key(&key) {
+                    added.push(key.clone());
+                }
                 let previous = self.checks.remove(&key).filter(|old| {
                     self.config.plugin_dir == config.plugin_dir
                         && self.config.max_output_bytes == config.max_output_bytes
@@ -114,8 +129,17 @@ impl Monitor {
                 checks.insert(key, scheduled);
             }
         }
-        // A removed check can no longer clear its fault by saving.
+        // A removed check can no longer clear its fault by saving. An added
+        // check is due now; one with a saved result is never shown as unchecked.
         self.unsaved.retain(|key| checks.contains_key(key));
+        let now = Utc::now();
+        self.status.send_modify(|status| {
+            let unchecked = &mut status.unchecked_since;
+            unchecked.retain(|key, _| checks.contains_key(key));
+            for key in added {
+                unchecked.entry(key).or_insert(now);
+            }
+        });
         self.checks = checks;
         self.config = config;
     }
@@ -142,17 +166,22 @@ impl Monitor {
             .checks
             .iter()
             .map(|(key, scheduled)| {
+                // A result without a known due time is checked like a new one.
                 let due = saved(key).and_then(|(result, problem)| {
-                    Some(schedule::due_at(
+                    schedule::due_at(
                         &scheduled.check,
                         self.config.retry_interval_seconds,
                         result.finished()?,
                         problem,
-                    ))
+                        now,
+                    )
                 });
                 (key.clone(), due)
             })
             .collect();
+        self.status.send_modify(|status| {
+            status.unchecked_since.retain(|key, _| saved(key).is_none());
+        });
         let started = Instant::now();
         let spread = Duration::from_secs(self.config.startup_spread_seconds);
         for (key, delay) in schedule::startup_delays(due, now, spread) {
@@ -178,10 +207,29 @@ impl Monitor {
         let check = scheduled.check.clone();
         let config = self.config.clone();
         self.running.insert(key.clone());
-        self.tasks.spawn(async move {
-            let result = runner::execute(&config.plugin_dir, &check, config.max_output_bytes).await;
-            (key, generation, result)
+        let task = self.tasks.spawn({
+            let key = key.clone();
+            async move {
+                let result =
+                    runner::execute(&config.plugin_dir, &check, config.max_output_bytes).await;
+                (key, generation, result)
+            }
         });
+        self.executions.insert(task.id(), (key, generation));
+    }
+
+    /// An execution that stopped without a result is a fault, not a reason to
+    /// stop every other check. Its check is retried at retry timing.
+    fn abandon(&mut self, key: Key, generation: u64, error: tokio::task::JoinError) {
+        self.running.remove(&key);
+        if let Some(scheduled) = self.checks.get_mut(&key)
+            && scheduled.generation == generation
+        {
+            scheduled.finished = Some(Instant::now());
+            scheduled.retry = true;
+            self.unsaved.insert(key);
+        }
+        self.report_fault(format!("a check execution stopped unexpectedly: {error}"));
     }
 
     async fn complete(&mut self, key: Key, generation: u64, result: CheckResult) {
@@ -203,9 +251,12 @@ impl Monitor {
                 Ok(problem) => {
                     scheduled.retry = problem.needs_retry();
                     self.unsaved.remove(&key);
-                    if self.unsaved.is_empty() {
-                        self.faults.send_if_modified(|fault| fault.take().is_some());
-                    }
+                    let recovered = self.unsaved.is_empty();
+                    self.status.send_if_modified(|status| {
+                        let checked = status.unchecked_since.remove(&key).is_some();
+                        let cleared = recovered && status.fault.take().is_some();
+                        checked || cleared
+                    });
                 }
                 Err(error) => {
                     // The observation is lost; try again at retry timing
@@ -221,9 +272,12 @@ impl Monitor {
     /// Report a fault in the log and to operators, keeping its first occurrence.
     fn report_fault(&self, message: String) {
         eprintln!("Scheduler fault: {message}");
-        self.faults.send_modify(|fault| {
-            let since = fault.as_ref().map_or_else(Utc::now, |fault| fault.since);
-            *fault = Some(SchedulerFault { since, message });
+        self.status.send_modify(|status| {
+            let since = status
+                .fault
+                .as_ref()
+                .map_or_else(Utc::now, |fault| fault.since);
+            status.fault = Some(SchedulerFault { since, message });
         });
     }
 }
@@ -233,7 +287,7 @@ pub async fn run(
     config: Arc<Config>,
     store: Store,
     published: watch::Sender<Arc<Config>>,
-    faults: watch::Sender<Option<SchedulerFault>>,
+    status: watch::Sender<SchedulerStatus>,
     mut reloads: tokio::signal::unix::Signal,
 ) -> Result<()> {
     let mut monitor = Monitor {
@@ -242,12 +296,15 @@ pub async fn run(
         checks: BTreeMap::new(),
         running: HashSet::new(),
         tasks: JoinSet::new(),
+        executions: HashMap::new(),
         generation: 0,
-        faults,
+        status,
         unsaved: HashSet::new(),
     };
     monitor.replace(config);
     if let Err(error) = monitor.restore().await {
+        // Keep the fault visible until every check has saved a result again.
+        monitor.unsaved = monitor.checks.keys().cloned().collect();
         monitor.report_fault(format!(
             "cannot restore the saved schedule, so every check starts now: {error:#}"
         ));
@@ -288,10 +345,18 @@ pub async fn run(
                     Err(error) => eprintln!("Configuration reload rejected: {error:#}"),
                 }
             }
-            result = monitor.tasks.join_next(), if !monitor.tasks.is_empty() => {
-                let (key, generation, result) = result.context("missing execution")?
-                    .context("monitoring task stopped")?;
-                monitor.complete(key, generation, result).await;
+            joined = monitor.tasks.join_next_with_id(), if !monitor.tasks.is_empty() => {
+                match joined.context("missing execution")? {
+                    Ok((id, (key, generation, result))) => {
+                        monitor.executions.remove(&id);
+                        monitor.complete(key, generation, result).await;
+                    }
+                    Err(error) => {
+                        let (key, generation) = monitor.executions.remove(&error.id())
+                            .context("unknown execution stopped")?;
+                        monitor.abandon(key, generation, error);
+                    }
+                }
             }
             () = async {
                 match &next {
