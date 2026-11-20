@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, ensure};
+use chrono::{DateTime, Utc};
 use ragios::{
     config::{Check, Config},
     runner::{self, CheckResult},
-    store::{CheckTarget, Store},
+    schedule,
+    store::{CheckTarget, ProblemState, Store},
 };
 use std::{
     collections::{BTreeMap, HashSet},
@@ -17,6 +19,14 @@ use tokio::{
 };
 
 type Key = (String, String);
+
+/// A failure that stops monitoring from making recorded progress. It persists
+/// until every check whose result could not be saved has saved one again.
+#[derive(Clone)]
+pub struct SchedulerFault {
+    pub since: DateTime<Utc>,
+    pub message: String,
+}
 
 struct ScheduledCheck {
     target: CheckTarget,
@@ -61,6 +71,9 @@ struct Monitor {
     running: HashSet<Key>,
     tasks: JoinSet<(Key, u64, CheckResult)>,
     generation: u64,
+    faults: watch::Sender<Option<SchedulerFault>>,
+    /// Checks whose latest result could not be saved.
+    unsaved: HashSet<Key>,
 }
 
 impl Monitor {
@@ -101,8 +114,51 @@ impl Monitor {
                 checks.insert(key, scheduled);
             }
         }
+        // A removed check can no longer clear its fault by saving.
+        self.unsaved.retain(|key| checks.contains_key(key));
         self.checks = checks;
         self.config = config;
+    }
+
+    /// Resume the saved schedule instead of checking everything at once. Each
+    /// check falls due one interval after its saved result; overdue checks are
+    /// spread across the startup period.
+    async fn restore(&mut self) -> Result<()> {
+        let services = self.store.latest().await?;
+        let hosts = self.store.latest_hosts().await?;
+        let now = Utc::now();
+        let saved = |key: &Key| -> Option<(&CheckResult, ProblemState)> {
+            if key.1.is_empty() {
+                hosts
+                    .get(&key.0)
+                    .map(|state| (&state.result, state.problem))
+            } else {
+                services
+                    .get(key)
+                    .map(|state| (&state.result, state.problem))
+            }
+        };
+        let due = self
+            .checks
+            .iter()
+            .map(|(key, scheduled)| {
+                let due = saved(key).and_then(|(result, problem)| {
+                    Some(schedule::due_at(
+                        &scheduled.check,
+                        self.config.retry_interval_seconds,
+                        result.finished()?,
+                        problem,
+                    ))
+                });
+                (key.clone(), due)
+            })
+            .collect();
+        let started = Instant::now();
+        let spread = Duration::from_secs(self.config.startup_spread_seconds);
+        for (key, delay) in schedule::startup_delays(due, now, spread) {
+            self.checks.get_mut(&key).expect("scheduled check").eligible = started + delay;
+        }
+        Ok(())
     }
 
     fn next(&self) -> Option<(Key, Instant)> {
@@ -128,24 +184,47 @@ impl Monitor {
         });
     }
 
-    async fn complete(&mut self, key: Key, generation: u64, result: CheckResult) -> Result<()> {
+    async fn complete(&mut self, key: Key, generation: u64, result: CheckResult) {
         self.running.remove(&key);
         if let Some(scheduled) = self.checks.get_mut(&key)
             && scheduled.generation == generation
         {
-            let problem = self
+            let saved = self
                 .store
                 .save_check(
-                    key.0,
+                    key.0.clone(),
                     scheduled.target.clone(),
                     result,
                     self.config.confirmation_attempts,
                 )
-                .await?;
+                .await;
             scheduled.finished = Some(Instant::now());
-            scheduled.retry = problem.needs_retry();
+            match saved {
+                Ok(problem) => {
+                    scheduled.retry = problem.needs_retry();
+                    self.unsaved.remove(&key);
+                    if self.unsaved.is_empty() {
+                        self.faults.send_if_modified(|fault| fault.take().is_some());
+                    }
+                }
+                Err(error) => {
+                    // The observation is lost; try again at retry timing
+                    // rather than stopping every other check.
+                    scheduled.retry = true;
+                    self.unsaved.insert(key);
+                    self.report_fault(format!("cannot record check results: {error:#}"));
+                }
+            }
         }
-        Ok(())
+    }
+
+    /// Report a fault in the log and to operators, keeping its first occurrence.
+    fn report_fault(&self, message: String) {
+        eprintln!("Scheduler fault: {message}");
+        self.faults.send_modify(|fault| {
+            let since = fault.as_ref().map_or_else(Utc::now, |fault| fault.since);
+            *fault = Some(SchedulerFault { since, message });
+        });
     }
 }
 
@@ -154,6 +233,7 @@ pub async fn run(
     config: Arc<Config>,
     store: Store,
     published: watch::Sender<Arc<Config>>,
+    faults: watch::Sender<Option<SchedulerFault>>,
     mut reloads: tokio::signal::unix::Signal,
 ) -> Result<()> {
     let mut monitor = Monitor {
@@ -163,8 +243,15 @@ pub async fn run(
         running: HashSet::new(),
         tasks: JoinSet::new(),
         generation: 0,
+        faults,
+        unsaved: HashSet::new(),
     };
     monitor.replace(config);
+    if let Err(error) = monitor.restore().await {
+        monitor.report_fault(format!(
+            "cannot restore the saved schedule, so every check starts now: {error:#}"
+        ));
+    }
     let mut validation: Option<oneshot::Receiver<Result<Config>>> = None;
     loop {
         let next = monitor.next();
@@ -204,7 +291,7 @@ pub async fn run(
             result = monitor.tasks.join_next(), if !monitor.tasks.is_empty() => {
                 let (key, generation, result) = result.context("missing execution")?
                     .context("monitoring task stopped")?;
-                monitor.complete(key, generation, result).await?;
+                monitor.complete(key, generation, result).await;
             }
             () = async {
                 match &next {

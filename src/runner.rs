@@ -1,5 +1,5 @@
 use crate::config::Check;
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use std::{
     path::Path,
     process::Stdio,
@@ -69,6 +69,15 @@ pub struct CheckResult {
     pub started_at: String,
     pub finished_at: String,
     pub duration_ms: u64,
+}
+
+impl CheckResult {
+    /// When the execution finished, if its stored timestamp is readable.
+    pub fn finished(&self) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(&self.finished_at)
+            .ok()
+            .map(|finished| finished.to_utc())
+    }
 }
 
 pub async fn execute(plugin_dir: &Path, check: &Check, max_output_bytes: usize) -> CheckResult {

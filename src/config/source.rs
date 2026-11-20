@@ -28,6 +28,8 @@ pub(super) struct File {
     pub retry_interval_seconds: u64,
     #[serde(default = "default_confirmation_attempts")]
     pub confirmation_attempts: u32,
+    #[serde(default = "default_startup_spread")]
+    pub startup_spread_seconds: u64,
     #[serde(default)]
     pub commands: Vec<Command>,
     #[serde(default)]
@@ -244,6 +246,9 @@ fn default_retry_interval() -> u64 {
 fn default_confirmation_attempts() -> u32 {
     3
 }
+fn default_startup_spread() -> u64 {
+    60
+}
 
 fn duration(name: &str, value: u64) -> Result<()> {
     ensure!(
@@ -314,6 +319,11 @@ impl File {
         ensure!(
             self.confirmation_attempts > 0,
             "confirmation_attempts must be positive"
+        );
+        ensure!(
+            self.startup_spread_seconds <= u32::MAX as u64,
+            "startup_spread_seconds must be between 0 and {}",
+            u32::MAX
         );
         ensure!(
             (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_concurrent_checks),

@@ -38,14 +38,15 @@ async fn main() -> Result<()> {
         .await
         .context("bind HTTP listener")?;
     let (published, active) = watch::channel(config.clone());
+    let (faults, fault_view) = watch::channel(None);
     eprintln!(
         "Ragios listening on http://{}; email disabled",
         listener.local_addr()?
     );
-    let server = axum::serve(listener, web::router(active, store.clone()));
+    let server = axum::serve(listener, web::router(active, fault_view, store.clone()));
     tokio::select! {
         result = server => result.context("HTTP server failed"),
-        result = monitor::run(arguments.config, config, store.clone(), published, reloads) => result,
+        result = monitor::run(arguments.config, config, store.clone(), published, faults, reloads) => result,
         () = prune_history(store) => unreachable!("history pruning never stops"),
         result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C"),
     }

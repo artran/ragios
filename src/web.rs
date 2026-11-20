@@ -1,3 +1,4 @@
+use crate::monitor::SchedulerFault;
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -5,10 +6,11 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::get,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use ragios::{
-    config::{Config, Host, HostGroup, Probe, Service},
+    config::{Check, Config, Host, HostGroup, Probe, Service},
     runner::{CheckResult, Reachability, Status},
+    schedule,
     store::{
         LatestHosts, LatestResults, ProblemState, Store, TRANSITION_RETENTION, Transition,
         TransitionKind,
@@ -21,13 +23,18 @@ use tokio::sync::watch;
 #[derive(Clone)]
 struct Dashboard {
     config: watch::Receiver<Arc<Config>>,
+    faults: watch::Receiver<Option<SchedulerFault>>,
     store: Store,
 }
 
 type WebError = (StatusCode, &'static str);
 type WebResult = Result<Html<String>, WebError>;
 
-pub fn router(config: watch::Receiver<Arc<Config>>, store: Store) -> Router {
+pub fn router(
+    config: watch::Receiver<Arc<Config>>,
+    faults: watch::Receiver<Option<SchedulerFault>>,
+    store: Store,
+) -> Router {
     Router::new()
         .route("/", get(page))
         .route("/status", get(status))
@@ -52,7 +59,11 @@ pub fn router(config: watch::Receiver<Arc<Config>>, store: Store) -> Router {
                 )
             }),
         )
-        .with_state(Dashboard { config, store })
+        .with_state(Dashboard {
+            config,
+            faults,
+            store,
+        })
 }
 
 #[derive(Default, Deserialize)]
@@ -126,6 +137,8 @@ form{{display:flex;flex-wrap:wrap;gap:1rem;align-items:end;margin:1rem 0}}
 label{{display:grid;gap:.25rem}}select,button{{font:inherit;padding:.3rem}}
 .empty{{background:white;padding:1rem;border:1px solid #d8dee8}}
 .facts{{max-width:60rem}}.facts th{{width:16rem}}nav{{margin-bottom:1rem}}
+.stale{{color:#45556b;background:#eceff4;font-style:italic}}
+.alert{{background:#fff1d6;border:2px solid #b06a00;padding:1rem;font-weight:bold}}
 </style></head><body><main>{body}</main></body></html>"#,
         title = escape(title)
     ))
@@ -203,12 +216,103 @@ struct Snapshot {
     config: Arc<Config>,
     services: LatestResults,
     hosts: LatestHosts,
+    fault: Option<SchedulerFault>,
+    now: DateTime<Utc>,
 }
 
 impl Snapshot {
     fn host(&self, id: &str) -> Option<&Host> {
         self.config.hosts.iter().find(|host| host.id == id)
     }
+
+    fn freshness(&self, check: &Check, state: Option<(&CheckResult, ProblemState)>) -> Freshness {
+        let Some((result, problem)) = state else {
+            return Freshness::NotYetChecked;
+        };
+        // An unreadable timestamp cannot establish current monitoring.
+        let Some(finished) = result.finished() else {
+            return Freshness::Overdue(None);
+        };
+        let due = schedule::due_at(check, self.config.retry_interval_seconds, finished, problem);
+        if schedule::is_overdue(check, due, self.now) {
+            Freshness::Overdue(Some(due))
+        } else {
+            Freshness::Current(due)
+        }
+    }
+
+    fn overdue_count(&self) -> usize {
+        let mut count = 0;
+        for host in &self.config.hosts {
+            if let Some(probe) = &host.reachability {
+                let state = self.hosts.get(&host.id);
+                let state = state.map(|state| (&state.result, state.problem));
+                count += usize::from(self.freshness(&probe.check, state).is_overdue());
+            }
+            for service in &host.services {
+                let state = self.services.get(&(host.id.clone(), service.id.clone()));
+                let state = state.map(|state| (&state.result, state.problem));
+                count += usize::from(self.freshness(&service.check, state).is_overdue());
+            }
+        }
+        count
+    }
+}
+
+/// Whether a latest result still reflects current monitoring. Freshness is
+/// assessed from when the check is due, never from the plugin's status.
+#[derive(Clone, Copy)]
+enum Freshness {
+    NotYetChecked,
+    Current(DateTime<Utc>),
+    Overdue(Option<DateTime<Utc>>),
+}
+
+impl Freshness {
+    fn is_overdue(self) -> bool {
+        matches!(self, Self::Overdue(_))
+    }
+
+    fn cell(self) -> String {
+        let time = |due: DateTime<Utc>| due.to_rfc3339_opts(SecondsFormat::Millis, true);
+        match self {
+            Self::NotYetChecked => "<td>Not yet checked</td>".into(),
+            Self::Current(due) => format!("<td>Due {}</td>", time(due)),
+            Self::Overdue(Some(due)) => format!(
+                "<td class=\"stale\">Overdue since {}; latest result is stale</td>",
+                time(due)
+            ),
+            Self::Overdue(None) => {
+                "<td class=\"stale\">Overdue; due time unknown, latest result is stale</td>".into()
+            }
+        }
+    }
+}
+
+/// Banners for conditions that stop monitoring from making progress.
+fn alerts(snapshot: &Snapshot) -> String {
+    let mut html = String::new();
+    if let Some(fault) = &snapshot.fault {
+        let _ = write!(
+            html,
+            r#"<p class="alert">Scheduler fault since {}: {}. Monitoring is not recording progress.</p>"#,
+            fault.since.to_rfc3339_opts(SecondsFormat::Millis, true),
+            escape(&fault.message)
+        );
+    }
+    match snapshot.overdue_count() {
+        0 => {}
+        1 => {
+            html.push_str(r#"<p class="alert">1 check is overdue; its latest result is stale.</p>"#)
+        }
+        count => {
+            let _ = write!(
+                html,
+                r#"<p class="alert">{count} checks are overdue; their latest results are stale.</p>"#
+            );
+        }
+    }
+    html
 }
 
 async fn snapshot(dashboard: &Dashboard) -> Result<Snapshot, WebError> {
@@ -224,6 +328,8 @@ async fn snapshot(dashboard: &Dashboard) -> Result<Snapshot, WebError> {
                 config,
                 services,
                 hosts,
+                fault: dashboard.faults.borrow().clone(),
+                now: Utc::now(),
             });
         }
     }
@@ -235,14 +341,15 @@ fn overview(snapshot: &Snapshot, filters: &Filters) -> String {
         |host| filters.group.is_empty() || host.group == filters.group,
         filters.problem,
     );
-    table.unwrap_or_else(|| {
+    let table = table.unwrap_or_else(|| {
         if filters.is_default() {
             r#"<p class="empty">No hosts are configured.</p>"#.into()
         } else {
             r#"<p class="empty">No checks match these filters. <a href="/">Show all checks</a></p>"#
                 .into()
         }
-    })
+    });
+    alerts(snapshot) + &table
 }
 
 /// Rows for the selected hosts' checks, in group order, or `None` if no check
@@ -256,6 +363,7 @@ fn checks_table(
         config,
         services,
         hosts,
+        ..
     } = snapshot;
     let mut rows = String::new();
     for group in &config.groups {
@@ -275,10 +383,14 @@ fn checks_table(
                         &format!("Configured probe: {}", probe.probe.label()),
                         &reachability_url(host),
                     );
+                    let state = state.map(|state| (&state.result, state.problem));
                     render_result(
                         &mut rows,
-                        state.map(|state| (&state.result, state.problem)),
-                        CheckDisplay::Reachability(state.map_or(probe.probe, |state| state.probe)),
+                        state,
+                        snapshot.freshness(&probe.check, state),
+                        CheckDisplay::Reachability(
+                            hosts.get(&host.id).map_or(probe.probe, |state| state.probe),
+                        ),
                         config.confirmation_attempts,
                     );
                 }
@@ -294,9 +406,11 @@ fn checks_table(
                         &service.id,
                         &service_url(host, service),
                     );
+                    let state = state.map(|state| (&state.result, state.problem));
                     render_result(
                         &mut rows,
-                        state.map(|state| (&state.result, state.problem)),
+                        state,
+                        snapshot.freshness(&service.check, state),
                         CheckDisplay::Service,
                         config.confirmation_attempts,
                     );
@@ -305,7 +419,7 @@ fn checks_table(
         }
     }
     (!rows.is_empty()).then(|| format!(
-        "<div class=\"scroll\"><table><thead><tr><th>Group</th><th>Host</th><th>Check</th><th>Latest result</th><th>Confirmed problem</th><th>Pending problem / severity change</th><th>Output</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Duration</th></tr></thead><tbody>{rows}</tbody></table></div>"
+        "<div class=\"scroll\"><table><thead><tr><th>Group</th><th>Host</th><th>Check</th><th>Latest result</th><th>Freshness</th><th>Confirmed problem</th><th>Pending problem / severity change</th><th>Output</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Duration</th></tr></thead><tbody>{rows}</tbody></table></div>"
     ))
 }
 
@@ -368,10 +482,16 @@ impl CheckDisplay {
     }
 }
 
-fn latest_cell(result: &CheckResult, display: CheckDisplay) -> String {
+/// A stale result keeps its plugin status but loses its status colour, so an
+/// old OK never looks like current successful monitoring.
+fn latest_cell(result: &CheckResult, display: CheckDisplay, freshness: Freshness) -> String {
     let class = result.status.label();
     let label = display.label(result.status);
-    let mut cell = format!("<td class=\"{class}\">{label}");
+    let mut cell = if freshness.is_overdue() {
+        format!("<td class=\"stale\">{label} (stale)")
+    } else {
+        format!("<td class=\"{class}\">{label}")
+    };
     if let CheckDisplay::Reachability(probe) = display {
         let degraded = if result.status == Status::Warning {
             "degraded; "
@@ -425,11 +545,13 @@ fn pending_cell(
 fn render_result(
     html: &mut String,
     state: Option<(&CheckResult, ProblemState)>,
+    freshness: Freshness,
     display: CheckDisplay,
     confirmation_attempts: u32,
 ) {
     if let Some((result, problem)) = state {
-        html.push_str(&latest_cell(result, display));
+        html.push_str(&latest_cell(result, display, freshness));
+        html.push_str(&freshness.cell());
         html.push_str(&confirmed_cell(problem, display));
         html.push_str(&pending_cell(problem, display, confirmation_attempts));
         let _ = write!(
@@ -441,7 +563,7 @@ fn render_result(
             result.duration_ms
         );
     } else {
-        html.push_str("<td>Not yet checked</td><td colspan=\"6\">No result available</td>");
+        html.push_str("<td>Not yet checked</td><td colspan=\"7\">No result available</td>");
     }
     html.push_str("</tr>\n");
 }
@@ -521,12 +643,13 @@ async fn host_status(
 
 fn host_checks(snapshot: &Snapshot, host: &Host) -> String {
     // Every resolved host has at least one service, so the table is never empty.
-    checks_table(
+    let table = checks_table(
         snapshot,
         |candidate| candidate.id == host.id,
         ProblemFilter::All,
     )
-    .unwrap_or_default()
+    .unwrap_or_default();
+    alerts(snapshot) + &table
 }
 
 /// A configured check on a host, identified for history lookup and display.
@@ -537,6 +660,7 @@ struct CheckDetail<'a> {
     url: String,
     display: CheckDisplay,
     state: Option<(&'a CheckResult, ProblemState)>,
+    freshness: Freshness,
 }
 
 impl<'a> CheckDetail<'a> {
@@ -546,30 +670,34 @@ impl<'a> CheckDetail<'a> {
             .services
             .iter()
             .find(|service| service.id == service_id)?;
+        let state = snapshot
+            .services
+            .get(&(host.id.clone(), service.id.clone()))
+            .map(|state| (&state.result, state.problem));
         Some(Self {
             host,
             name: &service.name,
             subtitle: service.id.clone(),
             url: service_url(host, service),
             display: CheckDisplay::Service,
-            state: snapshot
-                .services
-                .get(&(host.id.clone(), service.id.clone()))
-                .map(|state| (&state.result, state.problem)),
+            state,
+            freshness: snapshot.freshness(&service.check, state),
         })
     }
 
     fn reachability(snapshot: &'a Snapshot, host_id: &str) -> Option<Self> {
         let host = snapshot.host(host_id)?;
         let probe = host.reachability.as_ref()?;
-        let state = snapshot.hosts.get(&host.id);
+        let saved = snapshot.hosts.get(&host.id);
+        let state = saved.map(|state| (&state.result, state.problem));
         Some(Self {
             host,
             name: "Host reachability",
             subtitle: format!("Configured probe: {}", probe.probe.label()),
             url: reachability_url(host),
-            display: CheckDisplay::Reachability(state.map_or(probe.probe, |state| state.probe)),
-            state: state.map(|state| (&state.result, state.problem)),
+            display: CheckDisplay::Reachability(saved.map_or(probe.probe, |state| state.probe)),
+            state,
+            freshness: snapshot.freshness(&probe.check, state),
         })
     }
 
@@ -584,26 +712,24 @@ impl<'a> CheckDetail<'a> {
         )
     }
 
-    fn fragment(
-        &self,
-        transitions: &[Transition],
-        confirmation_attempts: u32,
-        now: DateTime<Utc>,
-    ) -> String {
-        let mut html = String::from("<h2>Current state</h2><table class=\"facts\"><tbody>");
+    fn fragment(&self, snapshot: &Snapshot, transitions: &[Transition]) -> String {
+        let confirmation_attempts = snapshot.config.confirmation_attempts;
+        let mut html = alerts(snapshot);
+        html.push_str("<h2>Current state</h2><table class=\"facts\"><tbody>");
         match self.state {
             Some((result, problem)) => {
                 let _ = write!(
                     html,
-                    "<tr><th>Latest result</th>{}</tr><tr><th>Confirmed problem</th>{}</tr><tr><th>Pending problem / severity change</th>{}</tr><tr><th>Output</th><td><pre>{}</pre></td></tr><tr><th>Started (UTC)</th><td>{}</td></tr><tr><th>Finished (UTC)</th><td>{}</td></tr><tr><th>Duration</th><td>{} ms</td></tr><tr><th>Result age</th><td>{}</td></tr>",
-                    latest_cell(result, self.display),
+                    "<tr><th>Latest result</th>{}</tr><tr><th>Freshness</th>{}</tr><tr><th>Confirmed problem</th>{}</tr><tr><th>Pending problem / severity change</th>{}</tr><tr><th>Output</th><td><pre>{}</pre></td></tr><tr><th>Started (UTC)</th><td>{}</td></tr><tr><th>Finished (UTC)</th><td>{}</td></tr><tr><th>Duration</th><td>{} ms</td></tr><tr><th>Result age</th><td>{}</td></tr>",
+                    latest_cell(result, self.display, self.freshness),
+                    self.freshness.cell(),
                     confirmed_cell(problem, self.display),
                     pending_cell(problem, self.display, confirmation_attempts),
                     escape(&result.output),
                     escape(&result.started_at),
                     escape(&result.finished_at),
                     result.duration_ms,
-                    age(&result.finished_at, now)
+                    age(result, snapshot.now)
                 );
             }
             None => html.push_str("<tr><th>Latest result</th><td>Not yet checked</td></tr>"),
@@ -656,8 +782,8 @@ fn change_label(transition: &Transition, display: CheckDisplay) -> String {
     }
 }
 
-fn age(finished_at: &str, now: DateTime<Utc>) -> String {
-    let Ok(finished) = DateTime::parse_from_rfc3339(finished_at) else {
+fn age(result: &CheckResult, now: DateTime<Utc>) -> String {
+    let Some(finished) = result.finished() else {
         return "unknown".into();
     };
     let seconds = now.signed_duration_since(finished).num_seconds().max(0);
@@ -697,11 +823,7 @@ async fn check_detail(
         CheckPath::Reachability(host) => dashboard.store.host_transitions(host.clone()).await,
     }
     .map_err(load_error)?;
-    let fragment = detail.fragment(
-        &transitions,
-        snapshot.config.confirmation_attempts,
-        Utc::now(),
-    );
+    let fragment = detail.fragment(&snapshot, &transitions);
     Ok(if fragment_only {
         Html(fragment).into_response()
     } else {

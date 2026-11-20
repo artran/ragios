@@ -106,16 +106,44 @@ Optional settings:
 | `timeout_seconds` | `30` | Execution deadline, including output collection and excluding time waiting for a concurrency slot |
 | `max_concurrent_checks` | `20` | Global limit on running checks across all hosts |
 | `max_output_bytes` | `65536` | Combined stdout/stderr capture budget per execution, in bytes |
+| `startup_spread_seconds` | `60` | Period across which checks already overdue at startup are spread; `0` starts them together |
 
 Intervals and deadlines are whole seconds between 1 and 4,294,967,295;
-`confirmation_attempts` is an integer in the same range. Concurrency and output
+`confirmation_attempts` is an integer in the same range, and
+`startup_spread_seconds` is between 0 and 4,294,967,295. Concurrency and output
 limits must be positive whole numbers within the platform's semaphore and buffer
 size limits. Invalid limits fail startup validation. Checks become eligible
 immediately and wait fairly for a concurrency slot. Each check has at most one
 waiting or running execution and never overlaps itself. The normal or retry
 interval starts after the result is saved, so missed intervals do not form a
-catch-up queue. On restart, stored results and problem state are visible while
-new checks run.
+catch-up queue.
+
+## Restarts and freshness
+
+A restart resumes the saved schedule. Latest results, confirmed problems, and
+pending streaks are restored from SQLite, so an existing problem is not
+confirmed or reported again. Each saved check falls due one normal interval
+after its saved result finished, or one retry interval while a problem or
+severity change is pending, and waits until then. Checks already overdue at
+startup are spaced evenly, oldest first, across `startup_spread_seconds`; checks
+that have never run start immediately. Concurrency, no-overlap, and backlog
+limits still apply. A saved result's schedule follows the configuration loaded
+at startup, even if the check's command changed while Ragios was stopped.
+
+Freshness comes from when a check is due, not from the plugin status. A check
+is overdue once its due time, its own timeout, and 30 seconds of scheduling
+grace have all passed without a newer result. The dashboard then shows the
+latest result as stale (for example `OK (stale)`, without the status colour),
+shows when the check fell due, and shows a banner counting overdue checks. A
+stale result keeps its plugin status; it is never turned into UNKNOWN. Detail
+pages also show the result's age.
+
+If Ragios cannot record a check result, for example because SQLite rejects the
+write, it keeps monitoring other checks, retries that check at retry timing,
+logs the error, and shows a scheduler-fault banner with the first failure time
+and the latest error on every page. The banner clears once every affected check
+has saved a result again. Results lost while the fault lasts leave their checks overdue. An external
+watchdog is still needed to detect loss of the server process itself.
 
 For an installed Nagios plugin, set `plugin_dir` to its actual installation
 directory, then replace the service definition, for example:
@@ -166,8 +194,7 @@ problem. An initial OK result is not a recovery.
 
 Pending problems and pending severity changes use `retry_interval_seconds`.
 Confirmation, cancellation of a candidate change, and recovery restore the normal
-interval. Delays begin after the result is saved; restarting still checks
-immediately.
+interval. Delays begin after the result is saved and continue across restarts.
 
 For host reachability, OK and WARNING mean **reachable**; WARNING is displayed
 as degraded but still clears any host problem immediately. CRITICAL means
@@ -205,9 +232,10 @@ bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)),
 problem confirmation ([#3](https://github.com/artran/ragios/issues/3)), host
 reachability ([#4](https://github.com/artran/ragios/issues/4)), fleet
 configuration ([#5](https://github.com/artran/ragios/issues/5)), and atomic
-configuration reload ([#6](https://github.com/artran/ragios/issues/6)), and
-problem and history browsing ([#7](https://github.com/artran/ragios/issues/7)).
-Freshness assessment and notifications are later work.
+configuration reload ([#6](https://github.com/artran/ragios/issues/6)),
+problem and history browsing ([#7](https://github.com/artran/ragios/issues/7)), and
+restart recovery with freshness assessment
+([#8](https://github.com/artran/ragios/issues/8)). Notifications are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
 
@@ -243,6 +271,12 @@ Browsing tests cover group and problem filtering, no-match states, detail
 navigation with percent-encoded IDs, chronological history, hostile output
 escaping, and 30-day retention, both against an explicit clock in the store and
 end to end with backdated state changes.
+Restart tests stop and restart the application against the same database.
+They check restored problems without repeated confirmation, waiting for checks
+that are not yet due, and evenly spread catch-up of overdue checks. They also
+check stale marking of backdated results and scheduler-fault banners from a
+simulated SQLite write failure. Due-time, overdue, and startup-spread rules
+are also tested against an explicit clock.
 
 ## Bundled asset
 

@@ -450,7 +450,8 @@ echo 'service still broken'; exit 2"#,
 fn saved_host_results_keep_their_probe_origin_after_selection_changes() {
     let dir = TempDir::new().unwrap();
     plugin(&dir, "echo 'saved ping assessment'; exit 2");
-    let path = config(&dir, "confirmation_attempts: 1");
+    // A one-second interval makes the saved result due again after restart.
+    let path = config(&dir, "confirmation_attempts: 1\ninterval_seconds: 1");
     with_reachability(&path, "ping", "check", &[]);
     let mut first = Application::start(&path);
     first.page("/status", "Confirmed problem: Down");
@@ -602,9 +603,13 @@ exit 0"#,
             marker.display()
         ),
     );
-    let path = config(&dir, "timeout_seconds: 1\nmax_concurrent_checks: 1");
+    let path = config(
+        &dir,
+        "timeout_seconds: 1\nmax_concurrent_checks: 1\nretry_interval_seconds: 1",
+    );
     // The observer needs a longer deadline than the plugin under test. It polls
     // the marker after restart so both configurations retain the same limits.
+    // A short retry interval makes the pending UNKNOWN due again after restart.
     let started = Instant::now();
     let mut app = Application::start(&path);
     let result = app.page("/status", "execution timed out after 1 seconds");
@@ -652,7 +657,8 @@ fn installed_python_plugins_keep_their_runtime_dependencies_and_environment() {
 #[test]
 fn problem_lifecycle_is_rendered_and_survives_restart() {
     let dir = TempDir::new().unwrap();
-    let path = config(&dir, "");
+    // One-second intervals make each saved result due again after restart.
+    let path = config(&dir, "interval_seconds: 1\nretry_interval_seconds: 1");
     let gate = dir.path().join("release");
     let mut previous: Option<(String, String)> = None;
     for (n, (code, confirmed, pending)) in [
@@ -698,9 +704,11 @@ fn problem_lifecycle_is_rendered_and_survives_restart() {
         plugin(
             &dir,
             &format!(
-                "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 3; sleep 0.02; done\nprintf 'observation {n} complete\\n'\nexit {code}",
-                gate.display(),
-                dir.path().display()
+                // Consuming the gate holds later executions, so each restart
+                // records exactly one observation.
+                "while [ ! -f '{gate}' ]; do [ -d '{dir}' ] || exit 3; sleep 0.02; done\nrm '{gate}'\nprintf 'observation {n} complete\\n'\nexit {code}",
+                gate = gate.display(),
+                dir = dir.path().display()
             ),
         );
         let mut app = Application::start(&path);
@@ -838,7 +846,7 @@ hosts:
     )
     .unwrap();
     let path = dir.path().join("ragios.yaml");
-    fs::write(&path, "bind: 127.0.0.1:0\nplugin_dir: .\ndatabase: state.sqlite3\nrecipients: [global@example.invalid]\nincludes: [fleet/checks.yaml, fleet/hosts.yaml]\n").unwrap();
+    fs::write(&path, "bind: 127.0.0.1:0\nplugin_dir: .\ndatabase: state.sqlite3\ninterval_seconds: 1\nrecipients: [global@example.invalid]\nincludes: [fleet/checks.yaml, fleet/hosts.yaml]\n").unwrap();
     let mut app = Application::start(&path);
     app.page("/status", "target=alpha.invalid port=443");
     let fragment = app.page("/status", "port=8443");
@@ -1033,8 +1041,18 @@ fn noisy_plugins_complete_with_a_shared_stdout_stderr_capture_limit() {
 #[test]
 fn latest_result_survives_restart_before_the_next_check_finishes() {
     let dir = TempDir::new().unwrap();
-    plugin(&dir, "printf 'persisted problem\\n'\nexit 1");
-    let path = config(&dir, "");
+    // Fail once, then hold, so the saved result stays the latest one.
+    let once = dir.path().join("failed-once");
+    plugin(
+        &dir,
+        &format!(
+            "if [ -f '{once}' ]; then while [ -d '{dir}' ]; do sleep 0.02; done; exit 3; fi\ntouch '{once}'\nprintf 'persisted problem\\n'\nexit 1",
+            once = once.display(),
+            dir = dir.path().display()
+        ),
+    );
+    // A one-second retry interval makes the pending problem due again after restart.
+    let path = config(&dir, "retry_interval_seconds: 1");
     let mut first = Application::start(&path);
     let saved = first.page("/status", "persisted problem");
     assert!(saved.contains("WARNING"));
@@ -1049,7 +1067,6 @@ fn latest_result_survives_restart_before_the_next_check_finishes() {
             dir.path().display()
         ),
     );
-    let path = config(&dir, "");
     let mut restarted = Application::start(&path);
     let restored = restarted.page("/status", "persisted problem");
     assert_eq!(
@@ -2095,8 +2112,8 @@ fn running_server_prunes_old_state_changes_but_keeps_current_problems_visible() 
         !page.contains(&old)
     });
     assert!(
-        detail.contains(r#"<td class="CRITICAL">CRITICAL</td>"#),
-        "{detail}"
+        detail.contains(r#"<td class="stale">CRITICAL (stale)</td>"#),
+        "a day-old result is stale: {detail}"
     );
     assert!(detail.contains("Confirmed problem: WARNING"), "{detail}");
     assert!(
@@ -2112,8 +2129,200 @@ fn running_server_prunes_old_state_changes_but_keeps_current_problems_visible() 
     let overview = app.page("/?problem=confirmed", "Message queue");
     let row = row_for(&overview, "Message queue");
     assert!(
-        row.contains(r#"<td class="CRITICAL">CRITICAL</td>"#),
+        row.contains(r#"<td class="stale">CRITICAL (stale)</td>"#),
         "{row}"
     );
     assert!(row.contains("Confirmed problem: WARNING"), "{row}");
+}
+
+fn runs(log: &Path) -> usize {
+    fs::read_to_string(log).map_or(0, |text| text.lines().count())
+}
+
+#[test]
+fn restart_restores_confirmed_problems_without_rerunning_checks_that_are_not_due() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("runs.log");
+    plugin(
+        &dir,
+        &format!(
+            "echo run >> '{}'\nprintf 'service down\\n'\nexit 2",
+            log.display()
+        ),
+    );
+    let path = config(&dir, "confirmation_attempts: 1");
+    let mut first = Application::start(&path);
+    let saved = first.page("/status", "Confirmed problem: CRITICAL");
+    drop(first);
+    assert_eq!(runs(&log), 1);
+
+    let mut restarted = Application::start(&path);
+    let restored = restarted.page("/status", "Confirmed problem: CRITICAL");
+    assert_eq!(
+        saved, restored,
+        "restart should restore the dashboard as it was"
+    );
+    thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        runs(&log),
+        1,
+        "a check that is not yet due must wait for its interval"
+    );
+    let history = restarted.page("/hosts/local/services/application", "Problem confirmed");
+    assert_eq!(
+        history.matches("Problem confirmed").count(),
+        1,
+        "a restored problem is not confirmed again: {history}"
+    );
+}
+
+#[test]
+fn overdue_checks_are_spread_across_the_startup_period_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("starts.log");
+    let first_round = dir.path().join("first-round");
+    fs::write(&first_round, "").unwrap();
+    // While `first-round` exists, checks run normally; afterwards each logs its
+    // start time once, then holds its execution slot until the test ends.
+    plugin(
+        &dir,
+        &format!(
+            r#"if [ -f '{first}' ]; then printf 'first round\n'; exit 0; fi
+printf '%s %s\n' "$1" "$(python3 -c 'import time; print(time.time())')" >> '{log}'
+while [ -d '{dir}' ]; do sleep 0.05; done
+exit 3"#,
+            first = first_round.display(),
+            log = log.display(),
+            dir = dir.path().display()
+        ),
+    );
+    let path = config(&dir, "interval_seconds: 1\nstartup_spread_seconds: 2");
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    yaml["hosts"][0]["services"] = serde_yaml::from_str(
+        "[{id: a, name: A, executable: check, args: [a]}, {id: b, name: B, executable: check, args: [b]},
+          {id: c, name: C, executable: check, args: [c]}, {id: d, name: D, executable: check, args: [d]}]",
+    )
+    .unwrap();
+    fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+
+    let mut first = Application::start(&path);
+    first.page_where("/status", "four first-round results", |page| {
+        page.matches("first round").count() == 4
+    });
+    drop(first);
+    fs::remove_file(&first_round).unwrap();
+    // Every saved result is now more than one interval old.
+    thread::sleep(Duration::from_millis(1200));
+
+    let mut restarted = Application::start(&path);
+    restarted.page("/status", "first round");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runs(&log) < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "overdue checks did not all start"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(runs(&log), 4, "each overdue check starts exactly once");
+    let mut starts: Vec<f64> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| line.split_once(' ').unwrap().1.parse().unwrap())
+        .collect();
+    starts.sort_by(f64::total_cmp);
+    // Four overdue checks over two seconds are half a second apart.
+    for gap in starts.windows(2).map(|pair| pair[1] - pair[0]) {
+        assert!(
+            (0.3..0.8).contains(&gap),
+            "uneven startup spacing: {starts:?}"
+        );
+    }
+}
+
+#[test]
+fn overdue_checks_are_marked_stale_instead_of_presenting_an_old_ok_as_current() {
+    let dir = TempDir::new().unwrap();
+    let gate = dir.path().join("release");
+    plugin(
+        &dir,
+        &format!(
+            "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 3; sleep 0.02; done\nprintf 'fresh result\\n'\nexit 0",
+            gate.display(),
+            dir.path().display()
+        ),
+    );
+    let path = config(&dir, "");
+    let finished = chrono::Utc::now() - chrono::TimeDelta::hours(2);
+    let timestamp = |time: chrono::DateTime<chrono::Utc>| {
+        time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    seed(&dir, "local", "application", 0, &timestamp(finished), 3);
+    let due = timestamp(finished + chrono::TimeDelta::minutes(5));
+
+    let mut app = Application::start(&path);
+    let page = app.page("/status", "seeded application");
+    let row = row_for(&page, "Application health");
+    assert!(
+        !row.contains("class=\"OK\""),
+        "an old OK must not look current: {row}"
+    );
+    assert!(
+        row.contains("OK (stale)"),
+        "the plugin status stays visible: {row}"
+    );
+    assert!(
+        !row.contains("UNKNOWN"),
+        "staleness is not a plugin UNKNOWN: {row}"
+    );
+    assert!(row.contains(&format!("Overdue since {due}")), "{row}");
+    assert!(page.contains("1 check is overdue"), "{page}");
+    let detail = app.page("/hosts/local/services/application", "seeded application");
+    assert!(detail.contains("Overdue since"), "{detail}");
+    assert!(
+        detail.contains("2 h 0 min ago"),
+        "result age stays separately visible: {detail}"
+    );
+
+    fs::write(&gate, "").unwrap();
+    let page = app.page("/status", "fresh result");
+    let row = row_for(&page, "Application health");
+    assert!(row.contains("<td class=\"OK\">OK</td>"), "{row}");
+    assert!(!page.contains("overdue"), "{page}");
+}
+
+#[test]
+fn failures_to_record_results_are_shown_prominently_and_clear_once_monitoring_progresses() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "printf 'healthy\\n'\nexit 0");
+    let path = config(&dir, "interval_seconds: 1\nretry_interval_seconds: 1");
+    let mut app = Application::start(&path);
+    app.page("/status", "healthy");
+
+    let database = rusqlite::Connection::open(dir.path().join("state.sqlite3")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER simulated_fault BEFORE INSERT ON check_results
+             BEGIN SELECT RAISE(ABORT, 'simulated <storage> failure'); END;",
+        )
+        .unwrap();
+    let page = app.page("/status", "Scheduler fault");
+    assert!(
+        page.contains("simulated &lt;storage&gt; failure"),
+        "the fault explains itself, escaped as text: {page}"
+    );
+    let detail = app.page("/hosts/local/services/application", "Scheduler fault");
+    assert!(
+        detail.contains("simulated &lt;storage&gt; failure"),
+        "{detail}"
+    );
+
+    database
+        .execute_batch("DROP TRIGGER simulated_fault")
+        .unwrap();
+    app.page_where("/status", "fault cleared", |page| {
+        !page.contains("Scheduler fault")
+    });
 }

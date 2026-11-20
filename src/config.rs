@@ -20,6 +20,7 @@ pub struct Config {
     pub max_output_bytes: usize,
     pub retry_interval_seconds: u64,
     pub confirmation_attempts: u32,
+    pub startup_spread_seconds: u64,
     pub hosts: Vec<Host>,
     pub groups: Vec<HostGroup>,
 }
@@ -230,6 +231,7 @@ impl Config {
             max_output_bytes: file.max_output_bytes,
             retry_interval_seconds: file.retry_interval_seconds,
             confirmation_attempts: file.confirmation_attempts,
+            startup_spread_seconds: file.startup_spread_seconds,
             hosts,
             groups,
         })

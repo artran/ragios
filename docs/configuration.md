@@ -289,6 +289,8 @@ Recipient changes update routing definitions only; email remains disabled.
   its result is discarded without changing persisted state or history. A
   replacement with the same IDs waits for that execution to finish, even after
   removal and re-addition, so executions never overlap themselves.
+- Restarting is not a reload: saved checks resume their schedule rather than
+  becoming eligible immediately. See "Restarts and freshness" in the README.
 - Unchanged in-flight checks can still save results, using the active
   confirmation threshold. Normal/retry interval changes recalculate waiting
   deadlines from the last saved completion; overdue checks become eligible
