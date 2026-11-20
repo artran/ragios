@@ -1,10 +1,10 @@
-use crate::monitor::{Key, SchedulerStatus};
+use crate::monitor::{CheckRequest, CheckRequestOutcome, Key, SchedulerStatus};
 use axum::{
-    Router,
+    Form, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{Html, IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use ragios::{
@@ -18,13 +18,15 @@ use ragios::{
 };
 use serde::Deserialize;
 use std::{fmt::Write, sync::Arc};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Clone)]
 struct Dashboard {
     config: watch::Receiver<Arc<Config>>,
     scheduler: watch::Receiver<SchedulerStatus>,
     store: Store,
+    requests: mpsc::Sender<CheckRequest>,
+    csrf: Arc<str>,
 }
 
 type WebError = (StatusCode, &'static str);
@@ -34,8 +36,16 @@ pub fn router(
     config: watch::Receiver<Arc<Config>>,
     scheduler: watch::Receiver<SchedulerStatus>,
     store: Store,
-) -> Router {
-    Router::new()
+    requests: mpsc::Sender<CheckRequest>,
+) -> anyhow::Result<Router> {
+    let mut random = [0u8; 32];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow::anyhow!("generate dashboard CSRF token: {error}"))?;
+    let mut csrf = String::with_capacity(random.len() * 2);
+    for byte in random {
+        let _ = write!(csrf, "{byte:02x}");
+    }
+    Ok(Router::new()
         .route("/", get(page))
         .route("/status", get(status))
         .route("/hosts/{host}", get(host_page))
@@ -51,6 +61,14 @@ pub fn router(
             get(service_status),
         )
         .route(
+            "/hosts/{host}/reachability/check-now",
+            post(reachability_check_now),
+        )
+        .route(
+            "/hosts/{host}/services/{service}/check-now",
+            post(service_check_now),
+        )
+        .route(
             "/assets/htmx.min.js",
             get(|| async {
                 (
@@ -63,7 +81,9 @@ pub fn router(
             config,
             scheduler,
             store,
-        })
+            requests,
+            csrf: csrf.into(),
+        }))
 }
 
 #[derive(Default, Deserialize)]
@@ -862,7 +882,20 @@ async fn check_detail(
     Ok(if fragment_only {
         Html(fragment).into_response()
     } else {
-        detail_page(detail.name, &detail.heading(), &detail.url, &fragment)
+        let control = check_now_form(&detail.url, &dashboard.csrf);
+        let mut response = detail_page(
+            detail.name,
+            &(detail.heading() + &control),
+            &detail.url,
+            &fragment,
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
+            .headers_mut()
+            .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        response
     })
 }
 
@@ -892,6 +925,96 @@ async fn reachability_status(
     Path(host): Path<String>,
 ) -> Result<Response, WebError> {
     check_detail(&dashboard, CheckPath::Reachability(host), true).await
+}
+
+fn check_now_form(url: &str, csrf: &str) -> String {
+    format!(
+        r##"<form method="post" action="{url}/check-now" hx-post="{url}/check-now" hx-target="#check-request-status" hx-disabled-elt="find button" hx-on::response-error="document.getElementById('check-request-status').textContent = 'Check request failed. Reload this page and try again.'"><input type="hidden" name="csrf" value="{csrf}"><button>Check now</button></form>
+<div id="check-request-status" role="status"></div>"##
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckNowForm {
+    csrf: String,
+}
+
+async fn check_now(
+    dashboard: &Dashboard,
+    key: Key,
+    uri: &Uri,
+    headers: &HeaderMap,
+    form: CheckNowForm,
+) -> Result<Response, WebError> {
+    // The private dashboard has no accounts. A foreign page cannot read this
+    // process-local token, and explicit non-same-origin browser requests are
+    // rejected even when they include a token.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site != "same-origin")
+        || form.csrf != *dashboard.csrf
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Invalid check request; reload the dashboard.",
+        ));
+    }
+    if uri.query().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Check requests do not accept query parameters.",
+        ));
+    }
+    let unavailable = (StatusCode::SERVICE_UNAVAILABLE, "Scheduler is unavailable.");
+    let (reply, outcome) = oneshot::channel();
+    let outcome = match dashboard.requests.try_send(CheckRequest { key, reply }) {
+        Ok(()) => outcome.await.map_err(|_| unavailable)?,
+        Err(mpsc::error::TrySendError::Full(_)) => CheckRequestOutcome::Busy,
+        Err(mpsc::error::TrySendError::Closed(_)) => return Err(unavailable),
+    };
+    let message = match outcome {
+        CheckRequestOutcome::Started => "Check started. Its result will appear after it finishes.",
+        CheckRequestOutcome::AlreadyRunning => {
+            "This check is already running. No duplicate was started."
+        }
+        CheckRequestOutcome::Busy => {
+            "The scheduler is busy. No check was queued; try again shortly."
+        }
+        CheckRequestOutcome::NotConfigured => return Ok(not_configured("check")),
+    };
+    if headers
+        .get("hx-request")
+        .is_some_and(|value| value == "true")
+    {
+        return Ok(Html(format!("<p>{message}</p>")).into_response());
+    }
+    let detail_url = escape(
+        uri.path()
+            .strip_suffix("/check-now")
+            .expect("check-now route"),
+    );
+    Ok(layout("Check request", &format!(r#"<h1>Check request</h1><p>{message}</p><p><a href="{detail_url}">View check and latest result</a></p>"#)).into_response())
+}
+
+async fn service_check_now(
+    State(dashboard): State<Dashboard>,
+    Path(key): Path<Key>,
+    uri: Uri,
+    headers: HeaderMap,
+    Form(form): Form<CheckNowForm>,
+) -> Result<Response, WebError> {
+    check_now(&dashboard, key, &uri, &headers, form).await
+}
+
+async fn reachability_check_now(
+    State(dashboard): State<Dashboard>,
+    Path(host): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    Form(form): Form<CheckNowForm>,
+) -> Result<Response, WebError> {
+    check_now(&dashboard, (host, String::new()), &uri, &headers, form).await
 }
 
 fn escape(text: &str) -> String {

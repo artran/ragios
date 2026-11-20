@@ -69,6 +69,12 @@ impl Application {
         app
     }
 
+    fn check_now(&self, path: &str, token: &str) -> reqwest::blocking::RequestBuilder {
+        self.client
+            .post(format!("{}{path}/check-now", self.url))
+            .form(&[("csrf", token)])
+    }
+
     fn request_reload(&mut self) {
         while self.stderr_lines.try_recv().is_ok() {}
         nix::sys::signal::kill(
@@ -225,6 +231,191 @@ fn row_for<'a>(page: &'a str, name: &str) -> &'a str {
         .split("</tr>")
         .next()
         .unwrap()
+}
+
+fn check_now_token(page: &str) -> &str {
+    page.split_once("name=\"csrf\" value=\"")
+        .expect("Check now form has a CSRF token")
+        .1
+        .split('"')
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn check_now_runs_outside_a_weekday_window_and_records_the_problem_lifecycle() {
+    let dir = TempDir::new().unwrap();
+    // All weekday windows are closed now, including when this test runs on Saturday.
+    use chrono::Timelike;
+    let (start, end) = if chrono::Utc::now().hour() < 12 {
+        ("18:00", "19:00")
+    } else {
+        ("06:00", "07:00")
+    };
+    let path = config(
+        &dir,
+        &format!(
+            "confirmation_attempts: 2\nmax_concurrent_checks: 1\ntimeout_seconds: 10\n\
+             check_window: weekdays\ncheck_windows:\n  - id: weekdays\n    timezone: UTC\n    ranges:\n      - {{days: [mon, tue, wed, thu, fri], start: '{start}', end: '{end}'}}"
+        ),
+    );
+    plugin(
+        &dir,
+        "cd \"${0%/*}\" || exit 3\nprintf 'run\\n' >> runs\nwhile [ ! -f release ]; do sleep 0.05; done\nread -r exit_code < release\nprintf 'configured check result %s\\n' \"$exit_code\"\nexit \"$exit_code\"",
+    );
+    with_reachability(&path, "tcp", "check", &["host"]);
+    let mut app = Application::start(&path);
+    let service = "/hosts/local/services/application";
+    let reachability = "/hosts/local/reachability";
+    let page = app.page(service, "Not yet checked");
+    assert!(page.contains("Check now"), "{page}");
+    let token = check_now_token(&page);
+    let response = app.check_now(service, token).send().unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.text().unwrap().contains("Check started"));
+    let response = app
+        .check_now(service, token)
+        .header("HX-Request", "true")
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.text().unwrap().contains("already running"));
+    let host_page = app.page(reachability, "Check now");
+    let host_token = check_now_token(&host_page);
+    let response = app.check_now(reachability, host_token).send().unwrap();
+    assert!(response.text().unwrap().contains("No check was queued"));
+    let fragment = format!("{service}/status");
+    fs::write(dir.path().join("release"), "2\n").unwrap();
+    app.page(&fragment, "Pending problem: CRITICAL (attempt 1)");
+    let response = app
+        .check_now(service, token)
+        .header("HX-Request", "true")
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().unwrap();
+    assert!(
+        body.contains("Check started") && !body.contains("<!doctype"),
+        "{body}"
+    );
+    app.page(&fragment, "Problem confirmed: CRITICAL");
+    fs::write(dir.path().join("release"), "1\n").unwrap();
+    for outcome in [
+        "Pending severity change: WARNING",
+        "Confirmed severity changed: WARNING",
+    ] {
+        let response = app.check_now(service, token).send().unwrap();
+        assert!(response.text().unwrap().contains("Check started"));
+        app.page(&fragment, outcome);
+    }
+    fs::write(dir.path().join("release"), "0\n").unwrap();
+    let response = app.check_now(service, token).send().unwrap();
+    assert!(response.text().unwrap().contains("Check started"));
+    app.page(&fragment, "Recovered");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("runs")).unwrap(),
+        "run\n".repeat(5)
+    );
+    let response = app.check_now(reachability, host_token).send().unwrap();
+    assert!(response.text().unwrap().contains("Check started"));
+    app.page(
+        "/hosts/local/reachability/status",
+        "configured check result 0",
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("runs")).unwrap(),
+        "run\n".repeat(6)
+    );
+}
+
+#[test]
+fn check_now_rejects_cross_site_requests_and_only_accepts_active_check_ids() {
+    let dir = TempDir::new().unwrap();
+    let path = config(&dir, "interval_seconds: 3600");
+    plugin(
+        &dir,
+        "cd \"${0%/*}\" || exit 3\nprintf 'run\\n' >> runs\nprintf 'configured result\\n'",
+    );
+    let mut app = Application::start(&path);
+    let service = "/hosts/local/services/application";
+    let page = app.page(service, "configured result");
+    let token = check_now_token(&page);
+    let endpoint = format!("{}{service}/check-now", app.url);
+    assert_eq!(app.client.get(&endpoint).send().unwrap().status(), 405);
+    assert_eq!(
+        app.check_now(service, "wrong-token")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        app.check_now(service, token)
+            .header("Sec-Fetch-Site", "cross-site")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        app.check_now(service, token)
+            .header("Sec-Fetch-Site", "same-site")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    for field in ["executable", "args", "env"] {
+        let response = app
+            .client
+            .post(&endpoint)
+            .form(&[("csrf", token), (field, "unconfigured-check")])
+            .send()
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "accepted override: {field}"
+        );
+    }
+    let response = app
+        .client
+        .post(format!("{endpoint}?executable=unconfigured-check"))
+        .form(&[("csrf", token)])
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    for missing in [
+        "/hosts/missing/services/application",
+        "/hosts/local/services/missing",
+        "/hosts/local/services/application%20unconfigured-check",
+        "/hosts/local/reachability",
+    ] {
+        assert_eq!(
+            app.check_now(missing, token).send().unwrap().status(),
+            404,
+            "{missing}"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("runs")).unwrap(),
+        "run\n"
+    );
+    update_config(&path, |yaml| {
+        yaml["hosts"][0]["services"][0]["id"] = "replacement".into()
+    });
+    app.reload("reloaded");
+    assert_eq!(app.check_now(service, token).send().unwrap().status(), 404);
+    let replacement = "/hosts/local/services/replacement";
+    app.page(replacement, "configured result");
+    let response = app
+        .check_now(replacement, token)
+        .header("Sec-Fetch-Site", "same-origin")
+        .send()
+        .unwrap();
+    assert!(response.text().unwrap().contains("Check started"));
+    app.page_where(replacement, "a third configured execution", |_| {
+        fs::read_to_string(dir.path().join("runs")).unwrap() == "run\n".repeat(3)
+    });
 }
 
 #[test]

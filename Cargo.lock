@@ -844,6 +844,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "getrandom",
  "nix",
  "reqwest",
  "rusqlite",

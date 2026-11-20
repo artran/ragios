@@ -13,12 +13,24 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinSet,
     time::Instant,
 };
 
 pub type Key = (String, String);
+
+pub struct CheckRequest {
+    pub key: Key,
+    pub reply: oneshot::Sender<CheckRequestOutcome>,
+}
+
+pub enum CheckRequestOutcome {
+    Started,
+    AlreadyRunning,
+    Busy,
+    NotConfigured,
+}
 
 /// The longest the scheduler sleeps before recomputing start times from the
 /// wall clock. Shorter than the shortest check window (one minute), so a
@@ -102,6 +114,22 @@ struct Monitor {
 }
 
 impl Monitor {
+    fn new(config: Arc<Config>, store: Store, status: watch::Sender<SchedulerStatus>) -> Self {
+        let mut monitor = Self {
+            config: config.clone(),
+            store,
+            checks: BTreeMap::new(),
+            running: HashSet::new(),
+            tasks: JoinSet::new(),
+            executions: HashMap::new(),
+            generation: 0,
+            status,
+            unsaved: HashSet::new(),
+        };
+        monitor.replace(config);
+        monitor
+    }
+
     fn replace(&mut self, config: Arc<Config>) {
         let mut checks = BTreeMap::new();
         let mut added = Vec::new();
@@ -206,11 +234,10 @@ impl Monitor {
         Ok(())
     }
 
-    fn next(&self) -> Option<(Key, Instant)> {
+    fn next(&self, now: Instant, wall: DateTime<Utc>) -> Option<(Key, Instant)> {
         if self.tasks.len() >= self.config.max_concurrent_checks {
             return None;
         }
-        let (now, wall) = (Instant::now(), Utc::now());
         // Overdue checks share the current instant as their start time, so the
         // oldest deadline goes first.
         self.checks
@@ -224,13 +251,23 @@ impl Monitor {
             .map(|(key, start, _)| (key, start))
     }
 
+    fn check_now(&mut self, key: Key) -> CheckRequestOutcome {
+        // Resolve against the scheduler's active definitions, including reloads.
+        if !self.checks.contains_key(&key) {
+            return CheckRequestOutcome::NotConfigured;
+        }
+        if self.running.contains(&key) {
+            return CheckRequestOutcome::AlreadyRunning;
+        }
+        if self.tasks.len() >= self.config.max_concurrent_checks {
+            return CheckRequestOutcome::Busy;
+        }
+        self.start(key);
+        CheckRequestOutcome::Started
+    }
+
     fn start(&mut self, key: Key) {
         let scheduled = &self.checks[&key];
-        // A long wait can outlast a wall-clock step. Re-check the window so a
-        // check never starts while it is closed; the next pass reschedules it.
-        if !schedule::window_wait(&scheduled.check, Utc::now()).is_zero() {
-            return;
-        }
         let generation = scheduled.generation;
         let check = scheduled.check.clone();
         let config = self.config.clone();
@@ -317,19 +354,9 @@ pub async fn run(
     published: watch::Sender<Arc<Config>>,
     status: watch::Sender<SchedulerStatus>,
     mut reloads: tokio::signal::unix::Signal,
+    mut requests: mpsc::Receiver<CheckRequest>,
 ) -> Result<()> {
-    let mut monitor = Monitor {
-        config: config.clone(),
-        store,
-        checks: BTreeMap::new(),
-        running: HashSet::new(),
-        tasks: JoinSet::new(),
-        executions: HashMap::new(),
-        generation: 0,
-        status,
-        unsaved: HashSet::new(),
-    };
-    monitor.replace(config);
+    let mut monitor = Monitor::new(config, store, status);
     if let Err(error) = monitor.restore().await {
         // Keep the fault visible until every check has saved a result again.
         monitor.unsaved = monitor.checks.keys().cloned().collect();
@@ -339,8 +366,13 @@ pub async fn run(
     }
     let mut validation: Option<oneshot::Receiver<Result<Config>>> = None;
     loop {
-        let next = monitor.next();
+        let next = monitor.next(Instant::now(), Utc::now());
         tokio::select! {
+            Some(request) = requests.recv() => {
+                if !request.reply.is_closed() {
+                    let _ = request.reply.send(monitor.check_now(request.key));
+                }
+            }
             Some(_) = reloads.recv(), if validation.is_none() => {
                 let path = path.clone();
                 let (sender, receiver) = oneshot::channel();
@@ -395,10 +427,62 @@ pub async fn run(
                 }
             } => {
                 let (key, start) = next.expect("eligible check");
-                if start <= Instant::now() {
+                // A long wait can outlast a wall-clock step. Re-check the
+                // scheduled window immediately before launching the check.
+                if start <= Instant::now()
+                    && schedule::window_wait(&monitor.checks[&key].check, Utc::now()).is_zero()
+                {
                     monitor.start(key);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    #[tokio::test]
+    async fn a_weekday_only_check_can_run_manually_on_saturday() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("check");
+        fs::write(&executable, "#!/bin/sh\nprintf 'executed on request\\n'\n").unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("ragios.yaml");
+        fs::write(
+            &path,
+            r#"
+plugin_dir: .
+database: state.sqlite3
+check_window: weekdays
+check_windows:
+  - id: weekdays
+    timezone: UTC
+    ranges: [{days: [mon, tue, wed, thu, fri], start: '09:00', end: '17:00'}]
+hosts:
+  - id: local
+    name: Local
+    services:
+      - {id: application, name: Application, executable: check, args: []}
+"#,
+        )
+        .unwrap();
+        let config = Arc::new(Config::load(&path).unwrap());
+        let store = Store::open(&config.database).unwrap();
+        let (status, _) = watch::channel(SchedulerStatus::default());
+        let mut monitor = Monitor::new(config, store, status);
+        let now = Instant::now();
+        let saturday = Utc.with_ymd_and_hms(2026, 11, 21, 12, 0, 0).unwrap();
+        let (key, scheduled) = monitor.next(now, saturday).unwrap();
+        assert_eq!(scheduled - now, Duration::from_secs(45 * 3600)); // Monday 09:00
+        assert!(matches!(
+            monitor.check_now(key),
+            CheckRequestOutcome::Started
+        ));
+        let (_, _, result) = monitor.tasks.join_next().await.unwrap().unwrap();
+        assert_eq!(result.output.trim(), "executed on request");
     }
 }

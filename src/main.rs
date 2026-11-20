@@ -5,7 +5,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ragios::{config::Config, store::Store};
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, watch},
+};
 
 #[derive(Parser)]
 #[command(
@@ -39,14 +42,16 @@ async fn main() -> Result<()> {
         .context("bind HTTP listener")?;
     let (published, active) = watch::channel(config.clone());
     let (status, scheduler) = watch::channel(Default::default());
+    let (request_check, requests) = mpsc::channel(1);
+    let router = web::router(active, scheduler, store.clone(), request_check)?;
     eprintln!(
         "Ragios listening on http://{}; email disabled",
         listener.local_addr()?
     );
-    let server = axum::serve(listener, web::router(active, scheduler, store.clone()));
+    let server = axum::serve(listener, router);
     tokio::select! {
         result = server => result.context("HTTP server failed"),
-        result = monitor::run(arguments.config, config, store.clone(), published, status, reloads) => result,
+        result = monitor::run(arguments.config, config, store.clone(), published, status, reloads, requests) => result,
         () = prune_history(store) => unreachable!("history pruning never stops"),
         result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C"),
     }

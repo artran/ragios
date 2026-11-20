@@ -242,7 +242,14 @@ transition IDs; it does not infer host reachability from service results.
 
 ## Access and current scope
 
-There are no accounts or browser mutations. Keep the default loopback binding;
+Use **Check now** on a reachability or service detail page to run that
+configured check, even when its check window is closed. Results are saved and
+follow the same confirmation, recovery, and scheduling rules as timed checks.
+If the check is already running or all execution slots are busy, no extra run
+is queued. Try again after a slot frees up.
+
+There are no accounts. Check requests use POST and require a token from the
+dashboard to prevent cross-site requests. Keep the default loopback binding;
 private Tailscale access requires an explicit private address in `bind` and
 appropriate network policy. Do not expose this unauthenticated server publicly.
 The SQLite database and configuration are separate from installed plugins; the
@@ -256,7 +263,9 @@ configuration ([#5](https://github.com/artran/ragios/issues/5)), and atomic
 configuration reload ([#6](https://github.com/artran/ragios/issues/6)),
 problem and history browsing ([#7](https://github.com/artran/ragios/issues/7)), and
 restart recovery with freshness assessment
-([#8](https://github.com/artran/ragios/issues/8)). Notifications are later work.
+([#8](https://github.com/artran/ragios/issues/8)), weekly check windows
+([#9](https://github.com/artran/ragios/issues/9)), and manual checks
+([#10](https://github.com/artran/ragios/issues/10)). Notifications are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
 
