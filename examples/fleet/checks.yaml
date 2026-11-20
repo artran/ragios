@@ -11,6 +11,13 @@ bundles:
         name: HTTPS response
         command: demo-probe
 
+# Checks with a window start only while it is open; others run at any time.
+check_windows:
+  - id: lab-hours
+    timezone: Europe/London
+    ranges:
+      - {days: [mon, tue, wed, thu, fri], start: "08:00", end: "18:00"}
+
 # Groups organise hosts and route recipients; they do not assign services.
 groups:
   - id: production

@@ -22,11 +22,12 @@ recipients: [operations@example.invalid]
 includes: [checks.yaml, hosts/east.yaml, hosts/west.yaml]
 ```
 
-An included fragment can contain only `commands`, `bundles`, `groups`, and
-`hosts`. Nested includes, globs, directory discovery, and multiple YAML documents
-in a file are not supported. Include paths resolve beside the root YAML file.
-The same canonical file path cannot be included twice, including through a
-symlink or by including the root itself. Missing or malformed files reject the whole fleet.
+An included fragment can contain only `commands`, `bundles`, `groups`,
+`check_windows`, and `hosts`. Nested includes, globs, directory discovery,
+and multiple YAML documents in a file are not supported. Include paths resolve
+beside the root YAML file. The same canonical file path cannot be included
+twice, including through a symlink or by including the root itself. Missing or
+malformed files reject the whole fleet.
 
 Definitions append in root-then-include-list order. References may point forward
 or across files; file order never grants override priority. Duplicate command,
@@ -201,8 +202,9 @@ For each timing setting, precedence is:
 4. Root default.
 
 `overrides` is a map keyed by an existing service ID on that host. Its only fields
-are `name`, `args`, `interval_seconds`, and `timeout_seconds`. It cannot create or
-rename an identity, change an executable, or hide a bundle collision. Argument
+are `name`, `args`, `interval_seconds`, `timeout_seconds`, and `check_window`.
+It cannot create or rename an identity, change an executable, or hide a bundle
+collision. Argument
 overrides replace the entire argument list; `args: []` removes all arguments.
 Omitted fields retain their resolved values. Explicit `null` is invalid, not an
 instruction to inherit. There are no inherited template chains.
@@ -210,6 +212,69 @@ instruction to inherit. There are no inherited template chains.
 Intervals and deadlines are whole seconds from 1 through 4,294,967,295. All
 provided settings are validated, even if a more specific setting would replace
 them. Invalid unused commands or bundles also reject the configuration.
+
+## Check windows
+
+A check window is a named recurring weekly period during which checks may
+start. Without one, a check runs at any time.
+
+```yaml
+check_window: work-hours        # optional root default
+
+check_windows:
+  - id: work-hours
+    timezone: Europe/London     # IANA name; defaults to UTC
+    ranges:
+      - {days: [mon, tue, wed, thu, fri], start: "09:00", end: "17:30"}
+  - id: weekday-mornings
+    ranges:
+      - {days: [mon, tue, wed, thu, fri], start: "06:00", end: "07:00"}
+
+hosts:
+  - id: web-01
+    name: Website
+    address: web-01.example.invalid
+    check_window: always        # opt out of the root default
+    services:
+      - id: certificate
+        name: Certificate expiry
+        executable: check_http
+        args: ["-H", "{{address}}", "-C", "30"]
+        interval_seconds: 86400
+        check_window: weekday-mornings
+```
+
+`check_window` follows the same precedence as the timing settings: host
+`overrides.<service ID>`, then the service definition, then the host, then the
+root. A reachability probe uses its own `check_window`, then the host's, then
+the root's. The reserved ID `always` lets a more specific level run at any time;
+it cannot be declared.
+
+Each range lists `days` (English names such as `mon` or `Monday`, without
+repeats) and local `start` and `end` times as `HH:MM`. A range is open from
+`start` up to, but not including, `end`; `end: "24:00"` closes at midnight.
+Ranges cannot cross midnight: split an overnight period into two ranges. A
+window needs at least one range and can combine any number of them. Holidays
+and one-off dates are not supported.
+
+Times are local wall-clock times in the window's timezone, so `09:00` stays
+09:00 across daylight-saving changes. A range that starts in a skipped hour opens
+when local time resumes; a range in a repeated hour is open during both
+occurrences. Stored timestamps and the dashboard remain in UTC.
+
+A window controls when executions start. A check that starts inside its window
+runs to completion even if the window closes, and its result is saved normally.
+Normal and retry timing are unchanged while the window is open. A check due while
+its window is closed, including a retry or a newly added check, runs when the
+window next opens. Each check keeps its own interval, so a daily check limited to
+`weekday-mornings` runs once each weekday and resumes on Monday after a Friday
+run. A closed window does not make a check overdue; see "Restarts and freshness"
+in the README.
+
+Unknown window references, duplicate window IDs, invalid timezones, malformed or
+empty ranges, and ranges whose start is not before their end reject startup,
+validation, and reload, even when nothing uses the window. Window changes apply
+on reload without resetting results or problem state.
 
 ## Primary groups and recipients
 

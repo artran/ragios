@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use ragios::{
     config::{Check, Config},
     runner::{self, CheckResult},
@@ -19,6 +19,11 @@ use tokio::{
 };
 
 pub type Key = (String, String);
+
+/// The longest the scheduler sleeps before recomputing start times from the
+/// wall clock. Shorter than the shortest check window (one minute), so a
+/// wall-clock step during a long wait cannot skip a window entirely.
+const WALL_CLOCK_RECHECK: Duration = Duration::from_secs(30);
 
 /// A failure that stops monitoring from making recorded progress. It persists
 /// until every check whose result could not be saved has saved one again.
@@ -55,6 +60,15 @@ impl ScheduledCheck {
                     self.check.interval_seconds
                 })
         })
+    }
+
+    /// When the check may next start: its deadline, or later while its window
+    /// is closed. Catch-up after a restart therefore never runs through a
+    /// closed window.
+    fn start_at(&self, config: &Config, now: Instant, wall: DateTime<Utc>) -> Instant {
+        let deadline = self.deadline(config).max(now);
+        let at = wall + TimeDelta::from_std(deadline - now).expect("bounded deadline");
+        deadline + schedule::window_wait(&self.check, at)
     }
 }
 
@@ -146,7 +160,9 @@ impl Monitor {
 
     /// Resume the saved schedule instead of checking everything at once. Each
     /// check falls due one interval after its saved result; overdue checks are
-    /// spread across the startup period.
+    /// spread across the startup period. Windows are applied only when a check
+    /// is about to start, so a reloaded window change takes effect from the
+    /// preserved interval deadline.
     async fn restore(&mut self) -> Result<()> {
         let services = self.store.latest().await?;
         let hosts = self.store.latest_hosts().await?;
@@ -168,7 +184,7 @@ impl Monitor {
             .map(|(key, scheduled)| {
                 // A result without a known due time is checked like a new one.
                 let due = saved(key).and_then(|(result, problem)| {
-                    schedule::due_at(
+                    schedule::interval_due_at(
                         &scheduled.check,
                         self.config.retry_interval_seconds,
                         result.finished()?,
@@ -194,15 +210,27 @@ impl Monitor {
         if self.tasks.len() >= self.config.max_concurrent_checks {
             return None;
         }
+        let (now, wall) = (Instant::now(), Utc::now());
+        // Overdue checks share the current instant as their start time, so the
+        // oldest deadline goes first.
         self.checks
             .iter()
             .filter(|(key, _)| !self.running.contains(*key))
-            .map(|(key, check)| (key.clone(), check.deadline(&self.config)))
-            .min_by_key(|(_, deadline)| *deadline)
+            .map(|(key, check)| {
+                let start = check.start_at(&self.config, now, wall);
+                (key.clone(), start, check.deadline(&self.config))
+            })
+            .min_by_key(|&(_, start, deadline)| (start, deadline))
+            .map(|(key, start, _)| (key, start))
     }
 
     fn start(&mut self, key: Key) {
         let scheduled = &self.checks[&key];
+        // A long wait can outlast a wall-clock step. Re-check the window so a
+        // check never starts while it is closed; the next pass reschedules it.
+        if !schedule::window_wait(&scheduled.check, Utc::now()).is_zero() {
+            return;
+        }
         let generation = scheduled.generation;
         let check = scheduled.check.clone();
         let config = self.config.clone();
@@ -360,10 +388,17 @@ pub async fn run(
             }
             () = async {
                 match &next {
-                    Some((_, deadline)) => tokio::time::sleep_until(*deadline).await,
+                    Some((_, start)) => {
+                        tokio::time::sleep_until((*start).min(Instant::now() + WALL_CLOCK_RECHECK)).await
+                    }
                     None => std::future::pending().await,
                 }
-            } => monitor.start(next.expect("eligible check").0),
+            } => {
+                let (key, start) = next.expect("eligible check");
+                if start <= Instant::now() {
+                    monitor.start(key);
+                }
+            }
         }
     }
 }

@@ -2397,3 +2397,146 @@ fn checks_that_never_record_a_result_become_overdue_from_when_they_were_first_du
     let page = app.page("/status", "healthy");
     assert!(!page.contains("overdue"), "{page}");
 }
+
+#[test]
+fn checks_wait_for_closed_windows_without_becoming_overdue_even_after_a_restart() {
+    use chrono::{Datelike, Days, SecondsFormat, TimeDelta, Utc};
+    // Keep tomorrow's window closed for the whole test.
+    let midnight = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        + Days::new(1);
+    if midnight - Utc::now() < TimeDelta::minutes(1) {
+        thread::sleep(
+            (midnight - Utc::now() + TimeDelta::seconds(1))
+                .to_std()
+                .unwrap(),
+        );
+    }
+    let tomorrow = Utc::now().date_naive() + Days::new(1);
+    let opens = tomorrow.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let day = tomorrow.weekday().to_string().to_lowercase();
+    let dir = TempDir::new().unwrap();
+    plugin(
+        &dir,
+        "touch \"$1\"; printf 'ran %s\\n' \"$(basename \"$1\")\"",
+    );
+    let marker = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+    let path = dir.path().join("ragios.yaml");
+    fs::write(
+        &path,
+        format!(
+            r#"bind: 127.0.0.1:0
+plugin_dir: .
+database: state.sqlite3
+check_window: tomorrow
+check_windows:
+  - id: tomorrow
+    ranges: [{{days: [{day}], start: '00:00', end: '24:00'}}]
+hosts:
+  - id: local
+    name: Local host
+    services:
+      - {{id: open, name: Open window, executable: check, args: ['{open}'], check_window: always}}
+      - {{id: new, name: Never checked, executable: check, args: ['{new}']}}
+      - {{id: saved, name: Saved earlier, executable: check, args: ['{saved}']}}
+"#,
+            open = marker("open"),
+            new = marker("new"),
+            saved = marker("saved"),
+        ),
+    )
+    .unwrap();
+    // Saved an hour ago and due five minutes later, while the window was closed.
+    let earlier = (Utc::now() - TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    seed(&dir, "local", "saved", 0, &earlier, 3);
+    let due = format!("Due {}", opens.to_rfc3339_opts(SecondsFormat::Millis, true));
+
+    let mut app = Application::start(&path);
+    let page = app.page("/", "ran open");
+    assert!(row_for(&page, "Never checked").contains(&due), "{page}");
+    let saved = row_for(&page, "Saved earlier");
+    assert!(saved.contains(&due), "{saved}");
+    assert!(
+        saved.contains("class=\"OK\""),
+        "a closed window keeps results current: {saved}"
+    );
+    assert!(!page.contains("overdue"), "{page}");
+    let detail = app.page("/hosts/local/services/saved", "Result age");
+    assert!(detail.contains(&earlier));
+    drop(app);
+
+    // A restart outside the window resumes without catching up.
+    let mut restarted = Application::start(&path);
+    let page = restarted.page("/", "Saved earlier");
+    assert!(row_for(&page, "Saved earlier").contains(&due), "{page}");
+    thread::sleep(Duration::from_secs(1));
+    assert!(fs::exists(marker("open")).unwrap());
+    for name in ["new", "saved"] {
+        assert!(
+            !fs::exists(marker(name)).unwrap(),
+            "{name} ran in a closed window"
+        );
+    }
+
+    // Removing the window applies the interval deadline restored at startup.
+    update_config(&path, |yaml| yaml["check_window"] = "always".into());
+    restarted.reload("Configuration reloaded");
+    restarted.page_where("/", "both released checks", |page| {
+        page.contains("ran saved") && page.contains("ran new")
+    });
+}
+
+#[test]
+fn checks_waiting_for_a_free_slot_start_oldest_deadline_first() {
+    use chrono::{SecondsFormat, TimeDelta, Utc};
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("order.log");
+    plugin(
+        &dir,
+        &format!(
+            "printf '%s\\n' \"$1\" >> '{}'\n[ \"$1\" = blocker ] && sleep 2\nexit 0",
+            log.display()
+        ),
+    );
+    let path = dir.path().join("ragios.yaml");
+    fs::write(
+        &path,
+        "bind: 127.0.0.1:0
+plugin_dir: .
+database: state.sqlite3
+max_concurrent_checks: 1
+startup_spread_seconds: 1
+hosts:
+  - id: local
+    name: Local host
+    services:
+      - {id: blocker, name: Blocker, executable: check, args: [blocker]}
+      - {id: z-older, name: Older, executable: check, args: [z-older]}
+      - {id: a-newer, name: Newer, executable: check, args: [a-newer]}
+",
+    )
+    .unwrap();
+    let ago = |minutes| {
+        (Utc::now() - TimeDelta::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Millis, true)
+    };
+    seed(&dir, "local", "z-older", 0, &ago(20), 3);
+    seed(&dir, "local", "a-newer", 0, &ago(10), 3);
+    // Both restored checks fall due while the never-checked blocker holds the
+    // only slot, so they compete for it when it frees.
+    let _app = Application::start(&path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let order = loop {
+        let order = fs::read_to_string(&log).unwrap_or_default();
+        if order.lines().count() >= 3 || Instant::now() > deadline {
+            break order;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        order.lines().collect::<Vec<_>>(),
+        ["blocker", "z-older", "a-newer"]
+    );
+}
