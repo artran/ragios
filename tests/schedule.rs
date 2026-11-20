@@ -350,3 +350,26 @@ fn a_window_reopens_when_clocks_go_back_into_the_middle_of_its_range() {
         at("2026-10-25T01:00:00Z")
     );
 }
+
+#[test]
+fn a_window_skipped_entirely_by_the_spring_clock_change_opens_the_following_week() {
+    let check = windowed(
+        check(300, 30),
+        "Europe/London",
+        &[Weekday::Sun],
+        "01:10",
+        "01:20",
+    );
+    // On 29 March 2026 local time jumps from 01:00 GMT to 02:00 BST.
+    for from in [
+        "2026-03-28T12:00:00Z",
+        "2026-03-29T00:30:00Z",
+        "2026-03-29T00:59:59Z",
+    ] {
+        assert_eq!(
+            eligible_from(&check, at(from)),
+            at("2026-04-05T00:10:00Z"),
+            "Sunday 5 April 01:10 BST"
+        );
+    }
+}
