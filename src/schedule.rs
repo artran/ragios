@@ -71,13 +71,14 @@ fn is_open(window: &CheckWindow, at: DateTime<Utc>) -> bool {
 /// A closed window next opens where a range starts, where a range starting
 /// inside a skipped daylight-saving hour first exists, or where clocks go back
 /// into the middle of a range. A repeated hour offers both of its instants.
-/// Validation guarantees a range, so one opens within a week.
+/// Validation guarantees a range, so one opens within a week, or within two
+/// when daylight saving skips an entire occurrence.
 fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
     if is_open(window, at) {
         return at;
     }
     let today = at.with_timezone(&window.timezone).date_naive();
-    let days: Vec<_> = (0..=8)
+    let days: Vec<_> = (0..=15)
         .filter_map(|offset| today.checked_add_days(Days::new(offset)))
         .collect();
     let starts = days.iter().flat_map(|&day| {
@@ -94,7 +95,7 @@ fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
         .chain(set_backs)
         .filter(|&instant| instant > at && is_open(window, instant))
         .min()
-        .expect("a validated window opens every week")
+        .expect("a validated window opens within two weeks")
 }
 
 /// When local clocks go back during `day`, if they do.

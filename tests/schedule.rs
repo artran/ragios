@@ -369,6 +369,7 @@ fn a_window_skipped_entirely_by_the_spring_clock_change_opens_the_following_week
     );
     // On 29 March 2026 local time jumps from 01:00 GMT to 02:00 BST.
     for from in [
+        "2026-03-23T12:00:00Z",
         "2026-03-28T12:00:00Z",
         "2026-03-29T00:30:00Z",
         "2026-03-29T00:59:59Z",
