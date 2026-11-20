@@ -587,3 +587,139 @@ hosts:
         ]
     );
 }
+
+const WINDOWS: &str = "check_windows:
+  - id: work-hours
+    timezone: Europe/London
+    ranges:
+      - {days: [mon, tue, wed, thu, fri], start: '09:00', end: '17:30'}
+  - id: sundays
+    ranges: [{days: [sun], start: '00:00', end: '24:00'}]
+";
+
+#[test]
+fn check_windows_resolve_with_the_same_precedence_as_timing_and_default_to_utc() {
+    let config = load(&format!(
+        "check_window: work-hours\n{WINDOWS}hosts:
+  - id: a
+    name: A
+    check_window: sundays
+    reachability: {{probe: ping, executable: check, check_window: always}}
+    overrides: {{overridden: {{check_window: always}}}}
+    services:
+      - {{id: host, name: Host, executable: check}}
+      - {{id: service, name: Service, executable: check, check_window: work-hours}}
+      - {{id: overridden, name: Overridden, executable: check, check_window: work-hours}}
+  - id: b
+    name: B
+    reachability: {{probe: tcp, executable: check}}
+    services: [{{id: root, name: Root, executable: check}}]
+"
+    ))
+    .unwrap();
+    fn window(check: &super::Check) -> Option<&str> {
+        check.window.as_ref().map(|w| w.id.as_str())
+    }
+    let [a, b] = &config.hosts[..] else { panic!() };
+    assert_eq!(window(&a.reachability.as_ref().unwrap().check), None);
+    assert_eq!(window(&a.services[0].check), Some("sundays"));
+    assert_eq!(window(&a.services[1].check), Some("work-hours"));
+    assert_eq!(window(&a.services[2].check), None, "always opts out");
+    assert_eq!(
+        window(&b.reachability.as_ref().unwrap().check),
+        Some("work-hours")
+    );
+    assert_eq!(window(&b.services[0].check), Some("work-hours"));
+    let work = b.services[0].check.window.as_ref().unwrap();
+    assert_eq!(work.timezone, chrono_tz::Europe::London);
+    assert_eq!(
+        work.ranges,
+        [super::WindowRange {
+            days: vec![
+                chrono::Weekday::Mon,
+                chrono::Weekday::Tue,
+                chrono::Weekday::Wed,
+                chrono::Weekday::Thu,
+                chrono::Weekday::Fri,
+            ],
+            start_minute: 9 * 60,
+            end_minute: 17 * 60 + 30,
+        }]
+    );
+    let sundays = a.services[0].check.window.as_ref().unwrap();
+    assert_eq!(sundays.timezone, chrono_tz::UTC);
+    assert_eq!(sundays.ranges[0].end_minute, 24 * 60);
+    let unwindowed =
+        load("hosts: [{id: a, name: A, services: [{id: s, name: S, executable: check}]}]").unwrap();
+    assert_eq!(unwindowed.hosts[0].services[0].check.window, None);
+}
+
+#[test]
+fn invalid_check_windows_and_unknown_references_reject_the_whole_fleet() {
+    let service = "hosts: [{id: a, name: A, services: [{id: s, name: S, executable: check}]}]\n";
+    let window = |range: &str| format!("check_windows: [{{id: w, ranges: [{range}]}}]\n{service}");
+    for (yaml, expected) in [
+        (format!("check_window: absent\n{service}"), "unknown check window \"absent\""),
+        (
+            "hosts: [{id: a, name: A, check_window: absent, services: [{id: s, name: S, executable: check}]}]\n".into(),
+            "unknown check window \"absent\"",
+        ),
+        (
+            "hosts: [{id: a, name: A, services: [{id: s, name: S, executable: check, check_window: absent}]}]\n".into(),
+            "unknown check window \"absent\"",
+        ),
+        (
+            "hosts: [{id: a, name: A, overrides: {s: {check_window: absent}}, services: [{id: s, name: S, executable: check}]}]\n".into(),
+            "unknown check window \"absent\"",
+        ),
+        (
+            "hosts: [{id: a, name: A, reachability: {probe: ping, executable: check, check_window: absent}, services: [{id: s, name: S, executable: check}]}]\n".into(),
+            "unknown check window \"absent\"",
+        ),
+        (
+            format!("bundles: [{{id: unused, services: [{{id: s, name: S, executable: check, check_window: absent}}]}}]\n{service}"),
+            "unknown check window \"absent\"",
+        ),
+        (
+            format!("check_windows: [{{id: w, timezone: Mars/Olympus, ranges: [{{days: [mon], start: '09:00', end: '17:00'}}]}}]\n{service}"),
+            "invalid timezone \"Mars/Olympus\"",
+        ),
+        (window("{days: [mon], start: '17:00', end: '09:00'}"), "start must be before end"),
+        (window("{days: [mon], start: '09:00', end: '09:00'}"), "start must be before end"),
+        (window("{days: [mon], start: '09:00', end: '24:01'}"), "HH:MM"),
+        (window("{days: [mon], start: '24:00', end: '24:00'}"), "HH:MM"),
+        (window("{days: [mon], start: '9:00', end: '17:00'}"), "HH:MM"),
+        (window("{days: [mon], start: '09:60', end: '17:00'}"), "HH:MM"),
+        (window("{days: [], start: '09:00', end: '17:00'}"), "days must not be empty"),
+        (window("{days: [mon, mon], start: '09:00', end: '17:00'}"), "duplicate day"),
+        (window("{days: [monday], start: '09:00', end: '17:00'}"), "unknown variant"),
+        (format!("check_windows: [{{id: w, ranges: []}}]\n{service}"), "ranges must not be empty"),
+        (
+            format!("check_windows: [{{id: always, ranges: [{{days: [mon], start: '09:00', end: '17:00'}}]}}]\n{service}"),
+            "check window ID always is reserved",
+        ),
+        (
+            format!("check_windows:\n  - {{id: w, ranges: [{{days: [mon], start: '09:00', end: '17:00'}}]}}\n  - {{id: w, ranges: [{{days: [tue], start: '09:00', end: '17:00'}}]}}\n{service}"),
+            "duplicate check window ID",
+        ),
+    ] {
+        let error = format!("{:#}", load(&yaml).expect_err(&yaml));
+        assert!(error.contains(expected), "{yaml}\n{error}");
+        assert!(error.contains("ragios.yaml"), "{error}");
+    }
+}
+
+#[test]
+fn fragments_can_define_and_reference_check_windows() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("ragios.yaml");
+    fs::write(
+        &root,
+        "plugin_dir: .\ndatabase: state.sqlite3\ncheck_window: work-hours\nincludes: [windows.yaml]\nhosts: [{id: a, name: A, services: [{id: s, name: S, executable: check}]}]\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("windows.yaml"), WINDOWS).unwrap();
+    let config = Config::load(&root).unwrap();
+    let window = config.hosts[0].services[0].check.window.as_ref().unwrap();
+    assert_eq!(window.id, "work-hours");
+}

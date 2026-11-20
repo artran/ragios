@@ -170,6 +170,7 @@ impl Config {
             &mut file.bundles,
             &mut file.groups,
             &mut file.hosts,
+            &mut file.check_windows,
         );
         let base = path.parent().unwrap_or(Path::new("."));
         let mut included = HashSet::from([std::fs::canonicalize(path)?]);
@@ -196,11 +197,13 @@ impl Config {
                 &mut fragment.bundles,
                 &mut fragment.groups,
                 &mut fragment.hosts,
+                &mut fragment.check_windows,
             );
             file.commands.extend(fragment.commands);
             file.bundles.extend(fragment.bundles);
             file.hosts.extend(fragment.hosts);
             file.groups.extend(fragment.groups);
+            file.check_windows.extend(fragment.check_windows);
         }
         let mut config = Self::resolve(&file)
             .with_context(|| format!("resolve configuration {}", path.display()))?;
@@ -210,13 +213,23 @@ impl Config {
     }
 
     fn resolve(file: &source::File) -> Result<Self> {
+        let commands = index(&file.commands, |c| (&c.id, c.source.as_path()), "command")?;
+        let windows = index(
+            &file.check_windows,
+            |w| (&w.id, w.source.as_path()),
+            "check window",
+        )?;
+        file.validate(&commands, &windows)?;
         let resolver = Resolver {
             file,
-            commands: index(&file.commands, |c| (&c.id, c.source.as_path()), "command")?,
+            commands,
             bundles: index(&file.bundles, |b| (&b.id, b.source.as_path()), "bundle")?,
             groups: index(&file.groups, |g| (&g.id, g.source.as_path()), "group")?,
+            windows: windows
+                .into_iter()
+                .map(|(id, window)| Ok((id, window.resolve()?)))
+                .collect::<Result<_>>()?,
         };
-        file.validate(&resolver.commands)?;
         let hosts = file
             .hosts
             .iter()
@@ -263,9 +276,21 @@ struct Resolver<'a> {
     commands: BTreeMap<&'a str, &'a source::Command>,
     bundles: BTreeMap<&'a str, &'a source::Bundle>,
     groups: BTreeMap<&'a str, &'a source::Group>,
+    windows: BTreeMap<&'a str, CheckWindow>,
 }
 
 impl Resolver<'_> {
+    /// The first window set in `choices`, most specific first; `always` and
+    /// omission at every level leave the check unrestricted.
+    fn window<'b>(
+        &self,
+        choices: impl IntoIterator<Item = Option<&'b String>>,
+    ) -> Option<CheckWindow> {
+        let id = choices.into_iter().flatten().next()?;
+        // Source validation guarantees every reference is defined or reserved.
+        (id != source::ALWAYS).then(|| self.windows[id.as_str()].clone())
+    }
+
     fn host(&self, host: &source::Host) -> Result<Host> {
         let group = host
             .group
@@ -334,7 +359,11 @@ impl Resolver<'_> {
                                 .timeout_seconds
                                 .or(host.timeout_seconds)
                                 .unwrap_or(self.file.timeout_seconds),
-                            window: None,
+                            window: self.window([
+                                probe.check_window.as_ref(),
+                                host.check_window.as_ref(),
+                                self.file.check_window.as_ref(),
+                            ]),
                         },
                     })
                 })
@@ -395,7 +424,12 @@ impl Resolver<'_> {
                     .or(service.timeout_seconds)
                     .or(host.timeout_seconds)
                     .unwrap_or(self.file.timeout_seconds),
-                window: None,
+                window: self.window([
+                    overrides.and_then(|o| o.check_window.as_ref()),
+                    service.check_window.as_ref(),
+                    host.check_window.as_ref(),
+                    self.file.check_window.as_ref(),
+                ]),
             },
         })
     }
