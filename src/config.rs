@@ -1,4 +1,6 @@
+mod email;
 mod source;
+pub use email::Smtp;
 #[cfg(test)]
 mod tests;
 
@@ -23,6 +25,7 @@ pub struct Config {
     pub startup_spread_seconds: u64,
     pub hosts: Vec<Host>,
     pub groups: Vec<HostGroup>,
+    pub smtp: Option<Smtp>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -261,14 +264,14 @@ impl Config {
             file.groups.extend(fragment.groups);
             file.check_windows.extend(fragment.check_windows);
         }
-        let mut config = Self::resolve(&file)
+        let mut config = Self::resolve(&file, base)
             .with_context(|| format!("resolve configuration {}", path.display()))?;
         config.plugin_dir = base.join(&config.plugin_dir);
         config.database = base.join(&config.database);
         Ok(config)
     }
 
-    fn resolve(file: &source::File) -> Result<Self> {
+    fn resolve(file: &source::File, base: &Path) -> Result<Self> {
         let definitions = source::Definitions {
             commands: index(&file.commands, |c| (&c.id, c.source.as_path()), "command")?,
             windows: index(
@@ -312,7 +315,20 @@ impl Config {
                 name: "Ungrouped".into(),
             });
         }
+        let smtp = file.email.resolve(base)?;
+        if smtp.is_some() {
+            for host in &hosts {
+                ensure!(
+                    host.recipients
+                        .iter()
+                        .all(|address| address.parse::<lettre::Address>().is_ok()),
+                    "invalid SMTP recipient for host {:?}",
+                    host.id
+                );
+            }
+        }
         Ok(Self {
+            smtp,
             bind: file.bind,
             plugin_dir: file.plugin_dir.clone(),
             database: file.database.clone(),

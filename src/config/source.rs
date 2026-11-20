@@ -16,6 +16,8 @@ pub(super) struct File {
     pub bind: SocketAddr,
     pub plugin_dir: PathBuf,
     pub database: PathBuf,
+    #[serde(default)]
+    pub email: super::email::EmailSource,
     #[serde(default = "super::default_interval")]
     pub interval_seconds: u64,
     #[serde(default = "super::default_timeout")]
