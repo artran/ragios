@@ -302,13 +302,26 @@ impl Monitor {
         if let Some(scheduled) = self.checks.get_mut(&key)
             && scheduled.generation == generation
         {
+            let recipients = if self.config.smtp.is_some()
+                && matches!(scheduled.target, CheckTarget::Service(_))
+            {
+                self.config
+                    .hosts
+                    .iter()
+                    .find(|host| host.id == key.0)
+                    .map(|host| host.recipients.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let saved = self
                 .store
-                .save_check(
+                .save_with_notifications(
                     key.0.clone(),
                     scheduled.target.clone(),
                     result,
                     self.config.confirmation_attempts,
+                    recipients,
                 )
                 .await;
             scheduled.finished = Some(Instant::now());

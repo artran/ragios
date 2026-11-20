@@ -1,7 +1,8 @@
 # All paths below are relative to this configuration file (or may be absolute).
-# HTTP defaults to 127.0.0.1:8080; no email is sent.
+# HTTP defaults to 127.0.0.1:8080. Keep email disabled during evaluation.
 plugin_dir: plugins
 database: ../var/ragios.sqlite3
+email: {mode: disabled}
 
 # Optional; these are the defaults.
 interval_seconds: 300

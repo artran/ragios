@@ -146,7 +146,7 @@ probe and a service may test the same endpoint, but their outcomes remain
 independent. Service checks continue while the host is down or undetermined.
 Only confirmed down is eligible for later service-notification suppression;
 confirmed undetermined, pending failures, and degraded reachability are not.
-This version sends no notifications.
+Email delivery covers service problems; host reachability does not itself send email.
 
 Reachability is observed from the monitoring server's network location. A failed
 probe does not prove the machine is powered off; a reachable host does not prove
@@ -292,13 +292,49 @@ Recipient selection is:
 
 Each override **replaces**, never merges, the list. An explicit `[]` disables
 recipient selection at that level; omission inherits. Recipients must be nonempty
-strings. The resolved host exposes its group ID and effective recipient list for
-notification routing. This version still sends no email and has no recipient
-transport configuration.
+strings and, when email is enabled, each effective recipient must be a bare email
+address. Ragios sends one message per distinct recipient address.
 
-Do not put SMTP credentials, tokens, or other secrets in YAML or plugin output.
-Example recipient addresses use the reserved `.invalid` domain. No environment
-or secret expansion is performed by the configuration loader.
+## Email delivery
+
+Omit `email` or set `email: {mode: disabled}` for evaluation. To send email through
+an authenticated SMTP relay, set the following in the root configuration:
+
+```yaml
+email:
+  mode: smtp
+  server: smtp.example.invalid
+  tls: starttls
+  from: ragios@example.invalid
+  username_file: credentials/smtp-user
+  password_file: credentials/smtp-password
+```
+
+`tls: starttls` requires a successful TLS upgrade before authentication and
+defaults to port 587. Use `tls: implicit` for TLS from connection start (port 465).
+Set `port` to override the default. The relay certificate must match `server` and
+chain to a trusted root. For a private relay CA, set `ca_file` to its PEM
+certificate. Paths resolve relative to the root YAML file unless absolute.
+
+The credential files must be regular files readable by the Ragios account,
+with no group or other permissions (for example, `0600` or `0400`). Put one
+nonempty UTF-8 line in each file. Do not put the values in YAML or plugin output.
+`--validate` checks the settings and files without connecting to the relay.
+
+Confirmed service problems and severity changes create email intent in the same
+SQLite transaction as the check result. Pending-only failures do not send email.
+A recovery is sent only to still-configured recipients whose problem message
+was accepted by the relay during that confirmed problem. A newer confirmed
+state supersedes unsent messages. Disabling email discards queued deliveries;
+re-enabling does not replay transitions that occurred while it was disabled.
+
+Open **Email delivery** on the dashboard to see delivery state, attempts, and
+sanitized SMTP diagnostics. Temporary failures retry starting after three seconds,
+with exponential backoff up to five minutes. SMTP 5xx replies are not retried.
+Ragios does not resend a recorded delivery on restart. If the relay accepts a
+message but Ragios cannot record that outcome (for example, on a crash), the
+outcome is uncertain and a still-current message may be retried. A message
+already in flight at a state change or configuration reload may still arrive.
 
 ## Validation and runtime reload
 
@@ -334,8 +370,9 @@ applied, including when an error is in a later include.
 
 `bind` and the resolved `database` path cannot change at runtime. Changing either
 rejects the whole reload with a restart-required diagnostic. Monitoring settings,
-plugin paths, commands, bundles, groups, and resolved recipients are reloadable.
-Recipient changes update routing definitions only; email remains disabled.
+plugin paths, commands, bundles, groups, resolved recipients, and SMTP settings
+and credential files are reloadable. Queued email to removed recipients or for
+removed checks is discarded rather than rerouted.
 
 ### Checks and retained state
 
