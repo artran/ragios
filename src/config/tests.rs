@@ -170,6 +170,8 @@ fn shipped_inline_and_split_fleet_examples_load_without_secrets_or_external_serv
     assert_eq!(fleet.hosts[0].recipients, ["production@example.invalid"]);
     assert_eq!(fleet.hosts[1].recipients, ["website-owner@example.invalid"]);
     assert!(fleet.hosts[2].recipients.is_empty());
+    let lab_hours = fleet.hosts[2].services[0].check.window.as_ref().unwrap();
+    assert_eq!(lab_hours.id, "lab-hours");
     assert_eq!(
         fleet.hosts[1].services[0].check.args,
         ["--target", "web-02.example.invalid", "--port", "8443"]

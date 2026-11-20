@@ -22,6 +22,7 @@ hosts:
     name: Lab website
     address: lab-01.example.invalid
     group: lab
+    check_window: lab-hours
     bundles: [web]
     vars: {port: "443"}
     # Explicitly disable recipient selection for this host.

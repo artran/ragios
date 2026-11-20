@@ -133,6 +133,13 @@ wait for their due time. Concurrency, no-overlap, and backlog limits still
 apply. A saved result's schedule follows the configuration loaded at startup,
 even if the check's command changed while Ragios was stopped.
 
+Checks with a [check window](docs/configuration.md#check-windows) start only
+while it is open. A check due while its window is closed falls due when the
+window next opens, so a restart outside the window resumes without catching up,
+and the dashboard shows that opening time instead of an overdue warning. A check
+that fell due while its window was open but did not run, for example because
+Ragios was stopped, is still overdue; it runs when the window next opens.
+
 Freshness comes from when a check is due, not from the plugin status. A check
 with no saved result is due from when it was first configured in the running
 server. A check is overdue once its due time, its own timeout, and 30 seconds
