@@ -233,6 +233,7 @@ check_windows:
 hosts:
   - id: web-01
     name: Website
+    address: web-01.example.invalid
     check_window: always        # opt out of the root default
     services:
       - id: certificate
