@@ -2,7 +2,7 @@ use chrono::{DateTime, TimeDelta, Utc, Weekday};
 use ragios::{
     config::{Check, CheckWindow, WindowRange},
     runner::Status,
-    schedule::{due_at, eligible_from, is_overdue, startup_delays},
+    schedule::{due_at, eligible_from, interval_due_at, is_overdue, startup_delays, window_wait},
     store::ProblemState,
 };
 use std::time::Duration;
@@ -235,18 +235,25 @@ fn a_restart_outside_the_window_waits_for_it_to_open_instead_of_catching_up() {
     let check = windowed(check(300, 30), "UTC", &WEEKDAYS, "09:00", "17:30");
     let saturday = at("2026-11-21T12:00:00Z");
     let monday = at("2026-11-23T09:00:00Z");
-    let due = due_at(
-        &check,
-        60,
-        at("2026-11-20T17:28:00Z"),
-        ProblemState::default(),
-        saturday,
-    );
-    assert_eq!(due, Some(monday));
+    let finished = at("2026-11-20T17:28:00Z");
+    let state = ProblemState::default();
+    assert_eq!(due_at(&check, 60, finished, state, saturday), Some(monday));
     assert!(!is_overdue(&check, monday, saturday));
+    // The restored schedule keeps the interval deadline; the window defers the
+    // start, so a later window change still applies from that deadline.
+    let interval_due = interval_due_at(&check, 60, finished, state, saturday);
+    assert_eq!(interval_due, Some(at("2026-11-20T17:33:00Z")));
     assert_eq!(
-        startup_delays(vec![("work", due)], saturday, Duration::from_secs(60)),
-        [("work", (monday - saturday).to_std().unwrap())]
+        startup_delays(
+            vec![("work", interval_due)],
+            saturday,
+            Duration::from_secs(60)
+        ),
+        [("work", Duration::ZERO)]
+    );
+    assert_eq!(
+        window_wait(&check, saturday),
+        (monday - saturday).to_std().unwrap()
     );
 }
 

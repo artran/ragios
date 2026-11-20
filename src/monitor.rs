@@ -155,7 +155,9 @@ impl Monitor {
 
     /// Resume the saved schedule instead of checking everything at once. Each
     /// check falls due one interval after its saved result; overdue checks are
-    /// spread across the startup period.
+    /// spread across the startup period. Windows are applied only when a check
+    /// is about to start, so a reloaded window change takes effect from the
+    /// preserved interval deadline.
     async fn restore(&mut self) -> Result<()> {
         let services = self.store.latest().await?;
         let hosts = self.store.latest_hosts().await?;
@@ -177,7 +179,7 @@ impl Monitor {
             .map(|(key, scheduled)| {
                 // A result without a known due time is checked like a new one.
                 let due = saved(key).and_then(|(result, problem)| {
-                    schedule::due_at(
+                    schedule::interval_due_at(
                         &scheduled.check,
                         self.config.retry_interval_seconds,
                         result.finished()?,

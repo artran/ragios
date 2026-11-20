@@ -15,10 +15,22 @@ use std::time::Duration;
 pub const OVERDUE_GRACE: TimeDelta = TimeDelta::seconds(30);
 
 /// When a check is next due and allowed to run after the result that finished
-/// at `finished`. Pending problems use retry timing, and a check due while its
-/// window is closed falls due when the window next opens. A result that claims to
-/// finish after `now` means the clock moved back, so its due time is unknown.
+/// at `finished`: its interval deadline, deferred while its window is closed.
 pub fn due_at(
+    check: &Check,
+    retry_interval_seconds: u64,
+    finished: DateTime<Utc>,
+    problem: ProblemState,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    interval_due_at(check, retry_interval_seconds, finished, problem, now)
+        .map(|due| eligible_from(check, due))
+}
+
+/// When a check is next due after the result that finished at `finished`,
+/// ignoring its window. Pending problems use retry timing. A result that claims
+/// to finish after `now` means the clock moved back, so its due time is unknown.
+pub fn interval_due_at(
     check: &Check,
     retry_interval_seconds: u64,
     finished: DateTime<Utc>,
@@ -33,7 +45,7 @@ pub fn due_at(
     } else {
         check.interval_seconds
     };
-    Some(eligible_from(check, finished + seconds(interval)))
+    Some(finished + seconds(interval))
 }
 
 /// The earliest instant at or after `at` when `check` may start.
