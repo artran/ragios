@@ -4,20 +4,38 @@ A Rust monitoring server that runs installed service-check plugins from YAML,
 stores their latest results in SQLite, and serves an HTML dashboard with HTMX
 updates. Email is disabled: this version has no email transport.
 
-## Build and run
+## Development setup
 
-Requires Rust 1.90 or newer, Cargo, and a C compiler/linker. SQLite is compiled
-into the binary; a system SQLite installation is not required. Linux and macOS
-are the supported development targets; this change was validated on macOS.
-Installed plugins still need their own
-interpreters, libraries, permissions, and network access. Run as an unprivileged
-user, not root.
+Install Devbox and enable the direnv hook for your shell. From the project
+root, approve `.envrc` once:
 
 ```sh
-cargo build --locked --release
-mkdir -p var
-./target/release/ragios --config examples/ragios.yaml
+direnv allow
+just
 ```
+
+Direnv activates Devbox when you enter the project. Devbox provides `just`,
+`prek`, and Rustup, which installs the pinned Rust toolchain (including rustfmt
+and Clippy) on first use.
+
+Devbox installs the `prek` pre-commit hook on activation if there is no existing
+hook or custom `core.hooksPath`. The hook is shared by all Git worktrees. Commit
+from the Devbox environment so it can find the Rust tools. The hook checks
+staged files for common problems and runs rustfmt and Clippy when relevant Rust
+files change. Run `prek run --all-files` to check the entire project.
+
+## Build and run
+
+```sh
+just build  # Build the release binary at target/release/ragios
+just run    # Run the example server using a debug build
+```
+
+Without Devbox, you need Rust 1.90 or newer, Cargo, and a C compiler/linker.
+SQLite is compiled into the binary; a system SQLite installation is not
+required. Linux and macOS are the supported development targets. Installed
+plugins still need their own interpreters, libraries, permissions, and network
+access. Run as an unprivileged user, not root.
 
 Open <http://127.0.0.1:8080>. The example executes a local demonstration plugin,
 not a real remote probe. The dashboard updates every two seconds; without
@@ -97,10 +115,8 @@ existing Nagios server or configuration is modified.
 ## Checks
 
 ```sh
-cargo fmt --check
-cargo check --locked --all-targets
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+just check  # Formatting, type checking, Clippy, and tests
+just test   # Tests only
 ```
 
 Process/HTTP integration tests use temporary YAML, SQLite files, and local shell

@@ -1,0 +1,28 @@
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      # Preserve the upstream bytes of the bundled HTMX asset.
+      - id: end-of-file-fixer
+        exclude: '^assets/htmx\.min\.js$'
+      - id: trailing-whitespace
+        exclude: '^assets/htmx\.min\.js$'
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --check
+        language: system
+        pass_filenames: false
+        files: '\.rs$|(^|/)(Cargo\.toml|rust-toolchain\.toml|rustfmt\.toml|\.rustfmt\.toml)$'
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --locked --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        files: '\.rs$|(^|/)(Cargo\.(toml|lock)|rust-toolchain\.toml|clippy\.toml|\.clippy\.toml)$'

@@ -1,0 +1,151 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-11-12T14:50:34Z",
+      "resolved": "github:NixOS/nixpkgs/2074cc672349f14240fb7ea90d509e0b643e9dd4?lastModified=1794495034&narHash=sha256-E0hYoioqUtM2XmPPvYYpJgdADF5AW9oOoPSEiM9dTHQ%3D"
+    },
+    "just@latest": {
+      "last_modified": "2026-11-19T13:46:25Z",
+      "resolved": "github:NixOS/nixpkgs/19cfded70b91ca0981373973c5b1efffdd4d6647#just",
+      "source": "devbox-search",
+      "version": "1.59.0",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/y1wvz83bxiz9dl9p09hlzx05hja6dyhn-just-1.59.0",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/wv3dad8h7805i2vczhd7ybzrchvwckna-just-1.59.0-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/wjpr2k8iypg8i4h98hybk6hrjpyh9da8-just-1.59.0-doc"
+            }
+          ],
+          "store_path": "/nix/store/y1wvz83bxiz9dl9p09hlzx05hja6dyhn-just-1.59.0"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/nrzhq5cx5gc66196bkn5gzx8wh85vfm9-just-1.59.0",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/y9kwv0d200h1qi9qmyllq5cxdhaph795-just-1.59.0-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/shz6kwwi0daj3a4pwi97c090ihynilji-just-1.59.0-doc"
+            }
+          ],
+          "store_path": "/nix/store/nrzhq5cx5gc66196bkn5gzx8wh85vfm9-just-1.59.0"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/l06kipfars48zblhrh93h28vy4myrfid-just-1.59.0",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/wn9a9rdc6l4ggl14y8x2dca4j2lzpnpj-just-1.59.0-man",
+              "default": true
+            },
+            {
+              "name": "doc",
+              "path": "/nix/store/64pxnfc5dq04p5vzizkh8j10jkhy5rk6-just-1.59.0-doc"
+            }
+          ],
+          "store_path": "/nix/store/l06kipfars48zblhrh93h28vy4myrfid-just-1.59.0"
+        }
+      }
+    },
+    "prek@latest": {
+      "last_modified": "2026-11-19T13:46:25Z",
+      "resolved": "github:NixOS/nixpkgs/19cfded70b91ca0981373973c5b1efffdd4d6647#prek",
+      "source": "devbox-search",
+      "version": "0.5.10",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/6pm5spmwvz7dny2h0lpyjgslmx7lhy32-prek-0.5.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/6pm5spmwvz7dny2h0lpyjgslmx7lhy32-prek-0.5.10"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/y950210rhfi28jkcg4hjx3f6rab755xp-prek-0.5.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/y950210rhfi28jkcg4hjx3f6rab755xp-prek-0.5.10"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/0h7crssrl7jvf3v8wa7bqjx4pa9i164w-prek-0.5.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/0h7crssrl7jvf3v8wa7bqjx4pa9i164w-prek-0.5.10"
+        }
+      }
+    },
+    "rustup@latest": {
+      "last_modified": "2026-11-19T13:46:25Z",
+      "plugin_version": "0.0.1",
+      "resolved": "github:NixOS/nixpkgs/19cfded70b91ca0981373973c5b1efffdd4d6647#rustup",
+      "source": "devbox-search",
+      "version": "1.29.3",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/w3q1hf6kfp306pxjs3giam5k1ijy69bj-rustup-1.29.3",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/w3q1hf6kfp306pxjs3giam5k1ijy69bj-rustup-1.29.3"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/h29ixnbbrnkypwfyn9jph1g3q2k26zmm-rustup-1.29.3",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/h29ixnbbrnkypwfyn9jph1g3q2k26zmm-rustup-1.29.3"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/pm6k2422m2xk520jf3rza89q4azjj64n-rustup-1.29.3",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/pm6k2422m2xk520jf3rza89q4azjj64n-rustup-1.29.3"
+        }
+      }
+    }
+  }
+}

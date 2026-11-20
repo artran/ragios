@@ -1,3 +1,7 @@
+# Local Devbox and direnv state
+/.devbox/
+/.direnv/
+
 # Local example monitoring state
 /var/
 
