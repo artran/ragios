@@ -44,7 +44,20 @@ is needed. Stop with Ctrl-C.
 
 ## Configuration
 
-`--config` is required. YAML is file-owned; this version loads it at startup.
+`--config` is required. YAML is file-owned; Ragios loads it at startup and on
+explicit `SIGHUP` reloads. Validate without starting the server:
+
+```sh
+target/release/ragios --config examples/ragios.yaml --validate
+```
+
+Validation exits zero on success and nonzero with diagnostics on failure. It
+opens no database, binds no listener, and runs no plugins. To reload a running
+server after saving all configuration files, use `kill -HUP <ragios-pid>` and
+check its log for `Configuration reloaded` or `Configuration reload rejected`.
+Invalid reloads leave all active definitions and checks untouched. Runtime
+changes to `bind` or `database` require a restart and reject the entire reload.
+See [reload semantics](docs/configuration.md#validation-and-runtime-reload).
 Unknown keys, malformed YAML, empty definitions, duplicate identities, unknown
 references, invalid overrides, and invalid intervals/deadlines fail before any
 check starts or the database is opened. IDs identify persisted results; display
@@ -179,8 +192,9 @@ server must be able to read configuration/plugins and write its data directory.
 This includes service monitoring ([#1](https://github.com/artran/ragios/issues/1)),
 bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)),
 problem confirmation ([#3](https://github.com/artran/ragios/issues/3)), host
-reachability ([#4](https://github.com/artran/ragios/issues/4)), and fleet
-configuration ([#5](https://github.com/artran/ragios/issues/5)). Reload, history
+reachability ([#4](https://github.com/artran/ragios/issues/4)), fleet
+configuration ([#5](https://github.com/artran/ragios/issues/5)), and atomic
+configuration reload ([#6](https://github.com/artran/ragios/issues/6)). History
 browsing, freshness assessment, and notifications are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
@@ -209,6 +223,10 @@ persisted host/service state, legacy database upgrades, shared execution limits,
 and continuing service checks while the host is down or undetermined.
 Fleet tests also cover multi-file resolution, command/bundle reuse, primary groups,
 recipient precedence, host overrides, identity collisions, and display-name changes.
+Running-application reload tests cover validation-only operation, add/change/remove,
+interval updates, invalid multi-file reload rejection, restart-only settings,
+state/history retention, and obsolete in-flight results, including removal and
+re-addition of an ID before its old execution finishes.
 
 ## Bundled asset
 

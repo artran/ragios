@@ -2,7 +2,8 @@
 
 Pass a root YAML file with `--config`. Ragios resolves and validates the whole
 fleet at startup, before opening SQLite or running plugins. Configuration remains
-file-owned; there is no reload or browser editing in this version.
+file-owned; operators can validate it separately and explicitly reload it with
+`SIGHUP`. There is no browser editing.
 
 See [`examples/fleet/`](../examples/fleet/) for a runnable, multi-file example.
 It runs a local demonstration plugin, not remote probes. The older
@@ -234,11 +235,64 @@ Do not put SMTP credentials, tokens, or other secrets in YAML or plugin output.
 Example recipient addresses use the reserved `.invalid` domain. No environment
 or secret expansion is performed by the configuration loader.
 
-## Validation errors
+## Validation and runtime reload
+
+```sh
+ragios --config /etc/ragios/ragios.yaml --validate
+kill -HUP <ragios-pid>
+```
+
+`--validate` loads and resolves the complete root file and every include. It
+prints `Configuration valid` and exits zero on success, or reports diagnostics
+and exits nonzero on failure. It does not open SQLite, bind HTTP, or execute
+plugins. Validation checks configuration structure and references, not whether
+plugins are executable, remote targets are reachable, or SQLite is writable.
+
+Save all files before sending `SIGHUP` to the running server. Ragios rereads its
+original root path and includes, validates the complete candidate while existing
+checks continue running and saving results, then publishes one resolved
+configuration for monitoring and the dashboard. There is no file
+watcher, automatic reload, or browser mutation endpoint. Concurrent reload
+requests may coalesce; check the server log for the outcome:
+
+- `Configuration reloaded`: the complete candidate is active.
+- `Configuration reload rejected: ...`: nothing changed; fix the reported error
+  and send `SIGHUP` again.
 
 Unknown YAML fields, duplicate map keys, duplicate IDs, unknown references,
 ambiguous command definitions, invalid overrides, empty definitions, and invalid
-timing settings reject startup. Diagnostics identify the configuration file and
-the host, service, bundle, group, or command involved as applicable. Definitions
-retain their source paths; duplicate IDs report both files. Parsing an included
-file also reports its path. Nothing is partially applied.
+timing settings reject startup, validation, and reload. Diagnostics identify the
+configuration file and the host, service, bundle, group, or command involved as
+applicable. Definitions retain their source paths; duplicate IDs report both
+files. Parsing an included file also reports its path. Nothing is partially
+applied, including when an error is in a later include.
+
+`bind` and the resolved `database` path cannot change at runtime. Changing either
+rejects the whole reload with a restart-required diagnostic. Monitoring settings,
+plugin paths, commands, bundles, groups, and resolved recipients are reloadable.
+Recipient changes update routing definitions only; email remains disabled.
+
+### Checks and retained state
+
+- New host/service ID pairs become eligible immediately. Removing a pair stops
+  scheduling it and hides it from the dashboard, but does not delete its latest
+  result, problem state, or lifecycle transitions. No retention pruning is added
+  by reload. Re-adding the pair reuses that retained state.
+- Display-name changes and group/bundle moves retain state under stable IDs.
+  Reload itself never resets confirmation streaks or confirmed problems.
+- Executable, argument, plugin-directory, timeout, or output-budget changes make
+  the replacement check eligible immediately. The previous latest result stays
+  visible until a current execution produces a new one.
+- An in-flight execution finishes under its original command, deadline, and
+  output budget. If its identity was removed or its execution settings changed,
+  its result is discarded without changing persisted state or history. A
+  replacement with the same IDs waits for that execution to finish, even after
+  removal and re-addition, so executions never overlap themselves.
+- Unchanged in-flight checks can still save results, using the active
+  confirmation threshold. Normal/retry interval changes recalculate waiting
+  deadlines from the last saved completion; overdue checks become eligible
+  without a catch-up queue. Changing confirmation settings affects subsequent
+  results, not previously stored state.
+- The active global concurrency limit controls new executions. Lowering it lets
+  existing executions drain before starting more; increasing it makes additional
+  slots available immediately.

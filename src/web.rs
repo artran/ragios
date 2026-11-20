@@ -11,16 +11,17 @@ use ragios::{
     store::{ProblemState, Store},
 };
 use std::{fmt::Write, sync::Arc};
+use tokio::sync::watch;
 
 #[derive(Clone)]
 struct Dashboard {
-    config: Arc<Config>,
+    config: watch::Receiver<Arc<Config>>,
     store: Store,
 }
 
 type WebResult = Result<Html<String>, (StatusCode, &'static str)>;
 
-pub fn router(config: Arc<Config>, store: Store) -> Router {
+pub fn router(config: watch::Receiver<Arc<Config>>, store: Store) -> Router {
     Router::new()
         .route("/", get(page))
         .route("/status", get(status))
@@ -71,18 +72,22 @@ fn load_error(error: anyhow::Error) -> (StatusCode, &'static str) {
 }
 
 async fn render(dashboard: &Dashboard) -> Result<String, (StatusCode, &'static str)> {
-    let latest = dashboard.store.latest().await.map_err(load_error)?;
-    let hosts = dashboard.store.latest_hosts().await.map_err(load_error)?;
+    // If a reload spans the database read, retry with the newly published
+    // definitions. Otherwise old names could be paired with new-command results
+    // that were never active together. Rendering below has no further awaits.
+    let (config, latest, hosts) = loop {
+        let config = dashboard.config.borrow().clone();
+        let latest = dashboard.store.latest().await.map_err(load_error)?;
+        let hosts = dashboard.store.latest_hosts().await.map_err(load_error)?;
+        if Arc::ptr_eq(&config, &dashboard.config.borrow()) {
+            break (config, latest, hosts);
+        }
+    };
     let mut html = String::from(
         "<div class=\"scroll\"><table><thead><tr><th>Group</th><th>Host</th><th>Check</th><th>Latest result</th><th>Confirmed problem</th><th>Pending problem / severity change</th><th>Output</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Duration</th></tr></thead><tbody>",
     );
-    for group in &dashboard.config.groups {
-        for host in dashboard
-            .config
-            .hosts
-            .iter()
-            .filter(|host| host.group == group.id)
-        {
+    for group in &config.groups {
+        for host in config.hosts.iter().filter(|host| host.group == group.id) {
             if let Some(probe) = &host.reachability {
                 row_start(
                     &mut html,
@@ -102,7 +107,7 @@ async fn render(dashboard: &Dashboard) -> Result<String, (StatusCode, &'static s
                             .map(|state| state.probe)
                             .unwrap_or(probe.probe),
                     ),
-                    dashboard.config.confirmation_attempts,
+                    config.confirmation_attempts,
                 );
             }
             for service in &host.services {
@@ -113,7 +118,7 @@ async fn render(dashboard: &Dashboard) -> Result<String, (StatusCode, &'static s
                         .get(&(host.id.clone(), service.id.clone()))
                         .map(|state| (&state.result, state.problem)),
                     CheckDisplay::Service,
-                    dashboard.config.confirmation_attempts,
+                    config.confirmation_attempts,
                 );
             }
         }

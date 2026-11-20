@@ -53,7 +53,7 @@ pub struct ReachabilityCheck {
     pub check: Check,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Probe {
     Ping,

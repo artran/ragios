@@ -168,7 +168,7 @@ pub struct Transition {
 pub struct Store(Arc<Mutex<Connection>>);
 
 // Host checks have their own namespace, never a reserved user service ID.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CheckTarget {
     Host(Probe),
     Service(String),

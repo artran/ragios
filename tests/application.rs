@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, Stdio},
@@ -17,6 +17,7 @@ struct Application {
     url: String,
     client: reqwest::blocking::Client,
     logs: Option<thread::JoinHandle<()>>,
+    stderr_lines: mpsc::Receiver<String>,
 }
 
 impl Application {
@@ -38,28 +39,62 @@ impl Application {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let (sender, receiver) = mpsc::channel();
         let mut app = Self {
             child,
             url: String::new(),
             client,
             logs: None,
+            stderr_lines: receiver,
         };
         let stderr = app.child.stderr.take().unwrap();
-        let (sender, receiver) = mpsc::channel();
         app.logs = Some(thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
-                if let Some(address) = line.strip_prefix("Ragios listening on ") {
-                    let _ = sender.send(address.split(';').next().unwrap().to_owned());
-                } else {
-                    eprintln!("{line}");
-                }
+                eprintln!("{line}");
+                let _ = sender.send(line);
             }
         }));
-        app.url = receiver
+        let announcement = app
+            .stderr_lines
             .recv_timeout(Duration::from_secs(5))
             .expect("server did not announce its bound listener");
+        app.url = announcement
+            .strip_prefix("Ragios listening on ")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
         app
+    }
+
+    fn request_reload(&mut self) {
+        while self.stderr_lines.try_recv().is_ok() {}
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id() as i32),
+            nix::sys::signal::Signal::SIGHUP,
+        )
+        .unwrap();
+    }
+
+    fn reload_outcome(&mut self, expected: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let line = self
+                .stderr_lines
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("server did not report reload outcome");
+            if line.starts_with("Configuration reload") {
+                assert!(line.contains(expected), "{line}");
+                return line;
+            }
+        }
+    }
+
+    fn reload(&mut self, expected: &str) -> String {
+        self.request_reload();
+        self.reload_outcome(expected)
     }
 
     fn page(&mut self, path: &str, expected: &str) -> String {
@@ -1069,6 +1104,529 @@ fn hung_plugin_becomes_unknown_with_a_deadline_diagnostic() {
     assert!(result.contains("waiting for remote endpoint"));
     assert!(!result.contains("class=\"OK\""));
     assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+fn update_config(path: &Path, update: impl FnOnce(&mut serde_yaml::Value)) {
+    let mut yaml = serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    update(&mut yaml);
+    fs::write(path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+}
+
+#[test]
+fn reload_adds_changes_and_removes_host_and_service_identities_without_erasing_history() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "echo \"$1\" >> \"$2\"; echo \"$1\"; exit 2");
+    let path = config(&dir, "confirmation_attempts: 1");
+    let old_log = dir.path().join("old-executions");
+    let added_log = dir.path().join("added-executions");
+    update_config(&path, |yaml| {
+        yaml["hosts"][0]["services"][0]["args"] =
+            serde_yaml::to_value(["original", old_log.to_str().unwrap()]).unwrap();
+    });
+    let mut app = Application::start(&path);
+    app.page("/status", "original\n</pre>");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let store = ragios::store::Store::open(&dir.path().join("state.sqlite3")).unwrap();
+    let before = runtime
+        .block_on(store.transitions("local".into(), "application".into()))
+        .unwrap();
+    assert_eq!(before.len(), 1);
+
+    update_config(&path, |yaml| {
+        let service = &mut yaml["hosts"][0]["services"][0];
+        service["args"][0] = "changed".into();
+        let mut added_service = service.clone();
+        added_service["id"] = "added-service".into();
+        added_service["name"] = "Added service".into();
+        added_service["interval_seconds"] = 1.into();
+        added_service["args"] =
+            serde_yaml::to_value(["added", added_log.to_str().unwrap()]).unwrap();
+        yaml["hosts"][0]["services"]
+            .as_sequence_mut()
+            .unwrap()
+            .push(added_service.clone());
+        let mut host = yaml["hosts"][0].clone();
+        host["id"] = "added-host".into();
+        host["name"] = "Added host".into();
+        host["services"] = vec![added_service].into();
+        yaml["hosts"].as_sequence_mut().unwrap().push(host);
+    });
+    app.reload("Configuration reloaded");
+    let added = app.page_where("/status", "all added checks", |page| {
+        page.contains("changed\n</pre>") && page.matches("added\n</pre>").count() == 2
+    });
+    assert!(added.contains("Added host"));
+    assert_eq!(added.matches("Confirmed problem: CRITICAL").count(), 3);
+
+    update_config(&path, |yaml| {
+        yaml["hosts"].as_sequence_mut().unwrap().truncate(1);
+        yaml["hosts"][0]["services"]
+            .as_sequence_mut()
+            .unwrap()
+            .truncate(1);
+    });
+    app.reload("Configuration reloaded");
+    let removed = app.page("/status", "changed\n</pre>");
+    assert!(!removed.contains("added-host"));
+    assert!(!removed.contains("added-service"));
+    let executions = fs::read_to_string(&added_log).unwrap();
+    thread::sleep(Duration::from_millis(1300));
+    assert_eq!(
+        fs::read_to_string(&added_log).unwrap(),
+        executions,
+        "removed checks kept running"
+    );
+    let history = runtime
+        .block_on(store.transitions("local".into(), "application".into()))
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, before[0].id);
+    let retained = runtime.block_on(store.latest()).unwrap();
+    assert_eq!(retained.len(), 3, "removal must retain stored state");
+    assert_eq!(
+        retained[&("added-host".into(), "added-service".into())]
+            .result
+            .output,
+        "added\n"
+    );
+    assert_eq!(
+        runtime
+            .block_on(store.transitions("added-host".into(), "added-service".into()))
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "plugin did not create {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn reload_during_executions_discards_obsolete_results_without_overlapping_replacements() {
+    for readd in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let gate = dir.path().join("release");
+        plugin(
+            &dir,
+            &format!(
+                r#"
+case "$1" in
+  blocked)
+    touch '{dir}/'"$2"'-started'
+    while [ ! -f '{gate}' ]; do [ -d '{dir}' ] || exit 3; sleep 0.02; done
+    echo obsolete-result; exit 1;;
+  fresh)
+    [ -f '{gate}' ] || touch '{dir}/overlap'
+    echo fresh-"$2"; exit 0;;
+  *) echo seed-"$2"; exit 2;;
+esac
+"#,
+                dir = dir.path().display(),
+                gate = gate.display()
+            ),
+        );
+        let path = config(&dir, "confirmation_attempts: 1\nmax_concurrent_checks: 2");
+        update_config(&path, |yaml| {
+            let service = &mut yaml["hosts"][0]["services"][0];
+            service["args"] = serde_yaml::to_value(["seed", "application"]).unwrap();
+            let mut removed = service.clone();
+            removed["id"] = "removed".into();
+            removed["name"] = "Removed service".into();
+            removed["args"][1] = "removed".into();
+            yaml["hosts"][0]["services"]
+                .as_sequence_mut()
+                .unwrap()
+                .push(removed);
+        });
+        let mut app = Application::start(&path);
+        app.page_where("/status", "both seeded results", |page| {
+            page.contains("seed-application") && page.contains("seed-removed")
+        });
+        update_config(&path, |yaml| {
+            for service in yaml["hosts"][0]["services"].as_sequence_mut().unwrap() {
+                service["args"][0] = "blocked".into();
+            }
+        });
+        app.reload("Configuration reloaded");
+        wait_for_file(&dir.path().join("application-started"));
+        wait_for_file(&dir.path().join("removed-started"));
+        let mut removed = None;
+        update_config(&path, |yaml| {
+            let services = yaml["hosts"][0]["services"].as_sequence_mut().unwrap();
+            removed = services.pop();
+            services[0]["args"][0] = "fresh".into();
+            // Lowering the global limit must not start replacements until the
+            // old executions drain below the new limit.
+            yaml["max_concurrent_checks"] = 1.into();
+        });
+        app.reload("Configuration reloaded");
+        let during = app.page("/status", "seed-application");
+        assert!(!during.contains("Removed service"));
+        assert!(!during.contains("fresh-application"));
+        if readd {
+            update_config(&path, |yaml| {
+                let mut service = removed.take().unwrap();
+                service["args"][0] = "fresh".into();
+                yaml["hosts"][0]["services"]
+                    .as_sequence_mut()
+                    .unwrap()
+                    .push(service);
+            });
+            app.reload("Configuration reloaded");
+        }
+        fs::write(&gate, "").unwrap();
+        let after = app.page_where("/status", "replacement results", |page| {
+            page.contains("fresh-application") && (!readd || page.contains("fresh-removed"))
+        });
+        assert!(!after.contains("obsolete-result"));
+        assert!(!dir.path().join("overlap").exists());
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let store = ragios::store::Store::open(&dir.path().join("state.sqlite3")).unwrap();
+        let saved = runtime.block_on(store.latest()).unwrap();
+        assert_eq!(
+            saved[&("local".into(), "removed".into())].result.output,
+            if readd {
+                "fresh-removed\n"
+            } else {
+                "seed-removed\n"
+            }
+        );
+        for id in ["application", "removed"] {
+            let history = runtime
+                .block_on(store.transitions("local".into(), id.into()))
+                .unwrap();
+            let expected = if id == "removed" && !readd { 1 } else { 2 };
+            assert_eq!(
+                history.len(),
+                expected,
+                "obsolete execution changed problem history"
+            );
+            assert!(
+                history
+                    .iter()
+                    .all(|transition| transition.result_status != ragios::runner::Status::Warning)
+            );
+        }
+    }
+}
+
+#[test]
+fn checks_keep_running_while_a_slow_reload_candidate_is_being_validated() {
+    let dir = TempDir::new().unwrap();
+    plugin(
+        &dir,
+        &format!(
+            "n=0; [ ! -f '{0}/count' ] || n=$(cat '{0}/count'); n=$((n+1)); echo $n > '{0}/count'; echo iteration-$n",
+            dir.path().display()
+        ),
+    );
+    let path = config(&dir, "interval_seconds: 1");
+    let mut app = Application::start(&path);
+    app.page("/status", "iteration-1");
+    let (release, writer) = block_reload(&dir, &path, &mut app);
+    // The reader is now blocked inside validation. Both execution and result
+    // publication must continue before the invalid candidate can be rejected.
+    app.page("/status", "iteration-2");
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    app.reload_outcome("Configuration reload rejected");
+    app.page("/status", "Local host");
+}
+
+#[test]
+fn ctrl_c_exits_even_while_a_reload_is_blocked_reading_configuration() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "echo ready");
+    let path = config(&dir, "");
+    let mut app = Application::start(&path);
+    app.page("/status", "ready");
+    let (release, writer) = block_reload(&dir, &path, &mut app);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(app.child.id() as i32),
+        nix::sys::signal::Signal::SIGINT,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = app.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl-C waited for the blocked reload reader"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success());
+    release.send(()).unwrap();
+    writer.join().unwrap();
+}
+
+fn block_reload(
+    dir: &TempDir,
+    path: &Path,
+    app: &mut Application,
+) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let fifo = dir.path().join("slow.yaml");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    update_config(path, |yaml| {
+        yaml["includes"] = serde_yaml::to_value(["slow.yaml"]).unwrap()
+    });
+    let (opened, reader_ready) = mpsc::channel();
+    let (release, writer_gate) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let mut file = fs::OpenOptions::new().write(true).open(fifo).unwrap();
+        opened.send(()).unwrap();
+        let _ = writer_gate.recv();
+        // A shutdown test closes the reader before releasing this writer.
+        let _ = file.write_all(b"hosts: [");
+    });
+    app.request_reload();
+    reader_ready
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reload never opened include");
+    (release, writer)
+}
+
+#[test]
+fn invalid_multifile_reload_leaves_active_definitions_and_checks_untouched() {
+    let dir = TempDir::new().unwrap();
+    let executions = dir.path().join("executions");
+    plugin(
+        &dir,
+        &format!("echo \"$1\" >> '{}'; echo \"$1\"", executions.display()),
+    );
+    let path = config(
+        &dir,
+        "interval_seconds: 1\nincludes: [commands.yaml, hosts.yaml]",
+    );
+    let commands = dir.path().join("commands.yaml");
+    let hosts = dir.path().join("hosts.yaml");
+    fs::write(
+        &commands,
+        "commands: [{id: probe, executable: check, args: [old-output]}]",
+    )
+    .unwrap();
+    fs::write(&hosts, "hosts: []").unwrap();
+    update_config(&path, |yaml| {
+        let service = yaml["hosts"][0]["services"][0].as_mapping_mut().unwrap();
+        service.remove(serde_yaml::Value::from("executable"));
+        service.remove(serde_yaml::Value::from("args"));
+        service.insert("command".into(), "probe".into());
+    });
+    let mut app = Application::start(&path);
+    let before = app.page("/status", "old-output");
+    fs::write(
+        &commands,
+        "commands: [{id: probe, executable: check, args: [new-output]}]",
+    )
+    .unwrap();
+    fs::write(&hosts, "hosts: [{id: added, name: Added host, services: [{id: new, name: New service, command: missing}]}]").unwrap();
+    let error = app.reload("Configuration reload rejected");
+    assert!(
+        error.contains("hosts.yaml")
+            && error.contains("unknown command")
+            && error.contains("missing"),
+        "{error}"
+    );
+    let unchanged = app.page_where("/status", "old checks continue after rejection", |page| {
+        page.contains("old-output") && page != before
+    });
+    assert!(!unchanged.contains("Added host"));
+    assert!(!unchanged.contains("new-output"));
+    let log = fs::read_to_string(&executions).unwrap();
+    assert!(log.lines().count() >= 2, "old checks stopped: {log}");
+    assert!(
+        log.lines().all(|line| line == "old-output"),
+        "partial reload: {log}"
+    );
+
+    fs::write(&hosts, "hosts: [{id: added, name: Added host, services: [{id: new, name: New service, command: probe}]}]").unwrap();
+    app.reload("Configuration reloaded");
+    app.page_where("/status", "both new command results", |page| {
+        page.contains("Added host") && page.matches("new-output").count() == 2
+    });
+}
+
+#[test]
+fn fleet_reload_applies_commands_bundles_groups_and_intervals_to_subsequent_work() {
+    let dir = TempDir::new().unwrap();
+    plugin(
+        &dir,
+        &format!(
+            r#"
+n=0
+[ ! -f '{dir}/'"$1" ] || n=$(cat '{dir}/'"$1")
+n=$((n+1))
+echo "$n" > '{dir}/'"$1"
+echo "$1 iteration $n"
+"#,
+            dir = dir.path().display()
+        ),
+    );
+    let path = dir.path().join("ragios.yaml");
+    let fragment = dir.path().join("fleet.yaml");
+    fs::write(&path, "bind: 127.0.0.1:0\nplugin_dir: .\ndatabase: state.sqlite3\nincludes: [fleet.yaml]\ninterval_seconds: 300\nrecipients: [old@example.invalid]\n").unwrap();
+    let fleet = "commands: [{id: probe, executable: check, args: [first]}]\nbundles: [{id: basic, services: [{id: application, name: Original service, command: probe}]}]\ngroups: [{id: old-group, name: Old group}]\nhosts: [{id: local, name: Local host, group: old-group, bundles: [basic]}]\n";
+    fs::write(&fragment, fleet).unwrap();
+    let mut app = Application::start(&path);
+    app.page("/status", "first iteration 1");
+    fs::write(
+        &fragment,
+        fleet
+            .replace("[first]", "[second]")
+            .replace("Original service", "Updated bundled service")
+            .replace("old-group", "new-group")
+            .replace("Old group", "New group")
+            .replace(
+                "name: New group",
+                "name: New group, recipients: [group@example.invalid]",
+            ),
+    )
+    .unwrap();
+    update_config(&path, |yaml| {
+        yaml["interval_seconds"] = 1.into();
+        yaml["recipients"] = serde_yaml::to_value(["new@example.invalid"]).unwrap();
+    });
+    app.reload("Configuration reloaded");
+    let updated = app.page("/status", "second iteration 2");
+    assert!(updated.contains("New group") && updated.contains("Updated bundled service"));
+    assert!(!updated.contains("Old group") && !updated.contains("Original service"));
+    assert!(!updated.contains("first iteration"));
+
+    // Change only the interval. This must wake a sleeping check without
+    // re-executing an otherwise unchanged command at reload time.
+    update_config(&path, |yaml| yaml["interval_seconds"] = 300.into());
+    app.reload("Configuration reloaded");
+    let paused = app.page("/status", "second iteration");
+    thread::sleep(Duration::from_millis(1300));
+    assert_eq!(app.page("/status", "second iteration"), paused);
+    update_config(&path, |yaml| yaml["interval_seconds"] = 1.into());
+    app.reload("Configuration reloaded");
+    app.page_where("/status", "interval-only update resumes checking", |page| {
+        page != paused
+    });
+}
+
+#[test]
+fn reload_rejects_bind_and_database_changes_without_partial_application() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "echo original");
+    let path = config(&dir, "");
+    let original = fs::read_to_string(&path).unwrap();
+    let mut app = Application::start(&path);
+    let before = app.page("/status", "original");
+    for (field, value) in [("bind", "127.0.0.1:1"), ("database", "other.sqlite3")] {
+        fs::write(&path, &original).unwrap();
+        update_config(&path, |yaml| {
+            yaml[field] = value.into();
+            yaml["hosts"][0]["name"] = "Must not appear".into();
+        });
+        let error = app.reload("Configuration reload rejected");
+        assert!(
+            error.contains(field) && error.contains("restart required"),
+            "{error}"
+        );
+        assert_eq!(app.page("/status", "original"), before);
+    }
+    assert!(!dir.path().join("other.sqlite3").exists());
+}
+
+#[test]
+fn reload_preserves_results_and_confirmed_problems_when_display_names_change() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "echo retained-problem; exit 2");
+    let path = config(&dir, "confirmation_attempts: 1");
+    let mut app = Application::start(&path);
+    let before = app.page("/status", "Confirmed problem: CRITICAL");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let store = ragios::store::Store::open(&dir.path().join("state.sqlite3")).unwrap();
+    let history = || {
+        runtime
+            .block_on(store.transitions("local".into(), "application".into()))
+            .unwrap()
+            .into_iter()
+            .map(|transition| {
+                (
+                    transition.id,
+                    transition.occurred_at,
+                    transition.result_status,
+                    transition.kind,
+                    transition.state,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let original_history = history();
+    assert_eq!(original_history.len(), 1);
+    let renamed = fs::read_to_string(&path)
+        .unwrap()
+        .replace("Local host", "Renamed host")
+        .replace("Application health", "Renamed service");
+    fs::write(&path, renamed).unwrap();
+    app.reload("Configuration reloaded");
+    let after = app.page("/status", "Renamed service");
+    assert_eq!(
+        after,
+        before
+            .replace("Local host", "Renamed host")
+            .replace("Application health", "Renamed service")
+    );
+    assert_eq!(history(), original_history);
+}
+
+#[test]
+fn validation_checks_all_files_without_starting_monitoring_or_opening_sqlite() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "touch started");
+    let path = config(&dir, "includes: [commands.yaml]");
+    let valid = fs::read_to_string(&path)
+        .unwrap()
+        .replace("executable: check", "command: probe");
+    fs::write(&path, valid).unwrap();
+    let fragment = dir.path().join("commands.yaml");
+    for (commands, expected) in [
+        ("commands: [{id: probe, executable: check}]", None),
+        (
+            "commands: [{id: other, executable: check}]",
+            Some("unknown command"),
+        ),
+        ("commands: [", Some("parse included configuration")),
+    ] {
+        fs::write(&fragment, commands).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_ragios"))
+            .args(["--validate", "--config"])
+            .arg(&path)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), expected.is_none(), "{output:?}");
+        if let Some(expected) = expected {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{output:?}"
+            );
+        } else {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("Configuration valid"));
+        }
+        assert!(!dir.path().join("started").exists());
+        assert!(!dir.path().join("state.sqlite3").exists());
+    }
 }
 
 #[test]
