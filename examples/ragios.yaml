@@ -1,0 +1,17 @@
+# All paths below are relative to this configuration file (or may be absolute).
+# HTTP defaults to 127.0.0.1:8080; no email is sent.
+plugin_dir: plugins
+database: ../var/ragios.sqlite3
+
+# Optional; these are the defaults.
+interval_seconds: 300
+timeout_seconds: 30
+
+hosts:
+  - id: example-host
+    name: Example host
+    services:
+      - id: example-service
+        name: Example service
+        executable: check_example
+        args: []

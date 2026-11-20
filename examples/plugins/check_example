@@ -1,0 +1,4 @@
+#!/bin/sh
+# Local demonstration only; replace with an installed monitoring plugin.
+printf '%s\n' 'OK - example service responds'
+exit 0
