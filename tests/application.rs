@@ -1782,3 +1782,338 @@ fn service_result_is_visible_in_the_page_and_htmx_fragment() {
     assert!(!fragment.contains("<!doctype html>"));
     app.page("/", "CRITICAL");
 }
+
+fn seed(dir: &TempDir, host: &str, service: &str, status: u8, finished_at: &str, attempts: u32) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let store = ragios::store::Store::open(&dir.path().join("state.sqlite3")).unwrap();
+    runtime
+        .block_on(store.save(
+            host.into(),
+            service.into(),
+            ragios::runner::CheckResult {
+                status: ragios::runner::Status::from_code(Some(status.into())),
+                output: format!("seeded {service} at {finished_at}"),
+                started_at: finished_at.into(),
+                finished_at: finished_at.into(),
+                duration_ms: 5,
+            },
+            attempts,
+        ))
+        .unwrap();
+}
+
+/// Plugins behave by their first argument; `hold` never finishes, so seeded
+/// results stay current for the duration of a test.
+fn browsing_fleet(dir: &TempDir, hosts: &str) -> std::path::PathBuf {
+    plugin(
+        dir,
+        &format!(
+            r#"case "$1" in
+  ok) printf 'all fine\n'; exit 0;;
+  broken) printf 'broken service\n'; exit 2;;
+  *) while [ -d '{}' ]; do sleep 0.05; done; exit 3;;
+esac"#,
+            dir.path().display()
+        ),
+    );
+    let path = dir.path().join("ragios.yaml");
+    fs::write(
+        &path,
+        format!(
+            r#"bind: 127.0.0.1:0
+plugin_dir: .
+database: state.sqlite3
+confirmation_attempts: 1
+commands:
+  - {{id: ok, executable: check, args: [ok]}}
+  - {{id: broken, executable: check, args: [broken]}}
+  - {{id: hold, executable: check, args: [hold]}}
+groups:
+  - {{id: prod, name: Production}}
+  - {{id: lab, name: "Lab <bench>"}}
+hosts:
+{hosts}"#
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn overview_filters_checks_by_host_group_and_problem_status() {
+    let dir = TempDir::new().unwrap();
+    let path = browsing_fleet(
+        &dir,
+        r#"  - id: alpha
+    name: Alpha
+    group: prod
+    services:
+      - {id: web-ok, name: Web front, command: ok}
+      - {id: web-broken, name: Web backend, command: broken}
+  - id: beta
+    name: Beta
+    group: lab
+    services:
+      - {id: lab-held, name: Lab queue, command: hold}
+      - {id: lab-ok, name: Lab cache, command: ok}
+  - id: gamma
+    name: Gamma
+    group: lab
+    services:
+      - {id: gamma-ok, name: Gamma disk, command: ok}
+"#,
+    );
+    // A pending problem from an earlier run, under a stricter threshold.
+    seed(&dir, "beta", "lab-held", 1, "2026-11-20T12:00:00.000Z", 3);
+    let mut app = Application::start(&path);
+    let all = app.page_where("/", "every result", |page| {
+        page.matches("all fine").count() == 3 && page.contains("broken service")
+    });
+    for name in [
+        "Web front",
+        "Web backend",
+        "Lab queue",
+        "Lab cache",
+        "Gamma disk",
+    ] {
+        assert!(all.contains(name), "missing {name}: {all}");
+    }
+    assert!(all.contains("Lab &lt;bench&gt;"));
+
+    for (query, shown, hidden) in [
+        (
+            "?group=lab",
+            &["Lab queue", "Lab cache", "Gamma disk"][..],
+            &["Web front", "Web backend"][..],
+        ),
+        (
+            "?problem=any",
+            &["Web backend", "Lab queue"],
+            &["Web front", "Lab cache", "Gamma disk", "Gamma"],
+        ),
+        (
+            "?problem=confirmed",
+            &["Web backend"],
+            &["Web front", "Lab queue", "Lab cache", "Gamma disk"],
+        ),
+        (
+            "?problem=pending",
+            &["Lab queue"],
+            &["Web front", "Web backend", "Lab cache", "Gamma disk"],
+        ),
+        (
+            "?group=lab&problem=any",
+            &["Lab queue"],
+            &["Web front", "Web backend", "Lab cache", "Gamma disk"],
+        ),
+    ] {
+        for path in ["/", "/status"] {
+            let page = app.page(&format!("{path}{query}"), shown[0]);
+            for name in shown {
+                assert!(page.contains(name), "{query}: missing {name}: {page}");
+            }
+            for name in hidden {
+                assert!(
+                    !page.contains(&format!(">{name}<")),
+                    "{query}: unexpected {name}: {page}"
+                );
+            }
+            assert!(!page.contains("No checks match"), "{page}");
+        }
+    }
+    let replaced = app
+        .client
+        .get(format!("{}/status?group=lab&problem=pending", app.url))
+        .header("HX-Trigger", "filters")
+        .send()
+        .unwrap();
+    assert_eq!(
+        replaced.headers()["hx-replace-url"],
+        "/?group=lab&problem=pending",
+        "a filter change keeps the address shareable"
+    );
+    let polled = app
+        .client
+        .get(format!("{}/status?group=lab", app.url))
+        .header("HX-Trigger", "status")
+        .send()
+        .unwrap();
+    assert!(!polled.headers().contains_key("hx-replace-url"));
+    let filtered = app.page("/?group=lab&problem=pending", "Lab queue");
+    assert!(
+        filtered.contains(r#"<option value="lab" selected>"#),
+        "{filtered}"
+    );
+    assert!(
+        filtered.contains(r#"<option value="pending" selected>"#),
+        "{filtered}"
+    );
+
+    let none = app.page("/?group=prod&problem=pending", "No checks match");
+    assert!(!none.contains("Web backend"));
+    assert!(none.contains(r#"href="/""#), "offers a way back: {none}");
+}
+
+fn link_to<'a>(html: &'a str, prefix: &str) -> &'a str {
+    let start = html
+        .find(&format!("href=\"{prefix}"))
+        .unwrap_or_else(|| panic!("no link to {prefix}: {html}"))
+        + "href=\"".len();
+    let end = start + html[start..].find('"').unwrap();
+    &html[start..end]
+}
+
+#[test]
+fn details_show_escaped_diagnostics_and_chronological_state_changes() {
+    let dir = TempDir::new().unwrap();
+    let counter = dir.path().join("counter");
+    plugin(
+        &dir,
+        &format!(
+            r#"if [ "$1" = host ]; then printf 'pong\n'; exit 0; fi
+n=0
+if [ -f '{counter}' ]; then n=$(cat '{counter}'); fi
+printf '%s' "$((n+1))" > '{counter}'
+printf '<img src=x onerror="alert(%s)"> & observation %s\n' "'x'" "$n"
+case "$n" in
+  0) exit 1;;
+  1|2) exit 2;;
+  *) exit 0;;
+esac"#,
+            counter = counter.display()
+        ),
+    );
+    let path = dir.path().join("ragios.yaml");
+    fs::write(
+        &path,
+        r#"bind: 127.0.0.1:0
+plugin_dir: .
+database: state.sqlite3
+interval_seconds: 1
+retry_interval_seconds: 1
+hosts:
+  - id: "edge/01 #1"
+    name: Edge router
+    reachability: {probe: ping, executable: check, args: [host]}
+    services:
+      - {id: "api?v=1", name: "API <v1>", executable: check, args: [service]}
+"#,
+    )
+    .unwrap();
+    let mut app = Application::start(&path);
+    let overview = app.page("/", "Edge router");
+    let host_url = link_to(row_for(&overview, "API &lt;v1&gt;"), "/hosts/").to_owned();
+    assert_eq!(host_url, "/hosts/edge%2F01%20%231");
+
+    let host = app.page(&host_url, "API &lt;v1&gt;");
+    assert!(host.contains("Edge router"));
+    assert!(host.contains(r#"href="/""#), "links back to the overview");
+    let service_url = link_to(&host, "/hosts/edge%2F01%20%231/services/").to_owned();
+    assert_eq!(service_url, "/hosts/edge%2F01%20%231/services/api%3Fv%3D1");
+    let reachability_url = link_to(&host, "/hosts/edge%2F01%20%231/reachability").to_owned();
+
+    let detail = app.page(&service_url, "Recovered");
+    assert!(detail.contains("API &lt;v1&gt;"));
+    assert!(
+        detail.contains(&format!(r#"href="{host_url}""#)),
+        "links back to the host"
+    );
+    assert!(
+        detail
+            .contains("&lt;img src=x onerror=&quot;alert(&#39;x&#39;)&quot;&gt; &amp; observation")
+    );
+    assert!(!detail.contains("<img"));
+    for label in [
+        "Started (UTC)",
+        "Finished (UTC)",
+        "Duration",
+        "Result age",
+        " ago",
+    ] {
+        assert!(detail.contains(label), "missing {label}: {detail}");
+    }
+    let history = &detail[detail.find("State changes").expect("history section")..];
+    let positions: Vec<_> = [
+        "Pending problem: WARNING (attempt 1)",
+        "Pending problem: CRITICAL (attempt 2)",
+        "Problem confirmed: CRITICAL",
+        "Recovered",
+    ]
+    .iter()
+    .map(|label| {
+        history
+            .find(label)
+            .unwrap_or_else(|| panic!("missing {label}: {history}"))
+    })
+    .collect();
+    assert!(positions.is_sorted(), "not chronological: {history}");
+
+    let reachability = app.page(&reachability_url, "pong");
+    assert!(reachability.contains("Reachable (OK)"), "{reachability}");
+    assert!(reachability.contains("No state changes in the last 30 days"));
+
+    for missing in [
+        "/hosts/nowhere",
+        "/hosts/edge%2F01%20%231/services/nothing",
+        "/hosts/nowhere/reachability",
+    ] {
+        let response = app
+            .client
+            .get(format!("{}{missing}", app.url))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 404, "{missing}");
+        assert!(response.text().unwrap().contains("Not configured"));
+    }
+}
+
+#[test]
+fn running_server_prunes_old_state_changes_but_keeps_current_problems_visible() {
+    let stamp = |days: i64| {
+        (chrono::Utc::now() - chrono::TimeDelta::days(days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    let dir = TempDir::new().unwrap();
+    let path = browsing_fleet(
+        &dir,
+        r#"  - id: alpha
+    name: Alpha
+    group: prod
+    services:
+      - {id: queue, name: Message queue, command: hold}
+"#,
+    );
+    let old = stamp(31);
+    for _ in 0..3 {
+        seed(&dir, "alpha", "queue", 1, &old, 3);
+    }
+    let recent = stamp(1);
+    seed(&dir, "alpha", "queue", 2, &recent, 3);
+    let mut app = Application::start(&path);
+
+    let detail = app.page_where("/hosts/alpha/services/queue", "pruned history", |page| {
+        !page.contains(&old)
+    });
+    assert!(
+        detail.contains(r#"<td class="CRITICAL">CRITICAL</td>"#),
+        "{detail}"
+    );
+    assert!(detail.contains("Confirmed problem: WARNING"), "{detail}");
+    assert!(
+        detail.contains("Pending severity change: CRITICAL (1/"),
+        "{detail}"
+    );
+    assert!(detail.contains("1 d 0 h ago"), "{detail}");
+    let history = &detail[detail.find("State changes").unwrap()..];
+    assert!(history.contains(&recent));
+    assert!(history.contains("Pending severity change: CRITICAL (attempt 1)"));
+    assert!(!history.contains("Problem confirmed"), "{history}");
+
+    let overview = app.page("/?problem=confirmed", "Message queue");
+    let row = row_for(&overview, "Message queue");
+    assert!(
+        row.contains(r#"<td class="CRITICAL">CRITICAL</td>"#),
+        "{row}"
+    );
+    assert!(row.contains("Confirmed problem: WARNING"), "{row}");
+}

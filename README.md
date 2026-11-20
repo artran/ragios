@@ -42,6 +42,14 @@ not a real remote probe. The dashboard updates every two seconds; without
 JavaScript, reload the page. HTMX is bundled, so no CDN access or frontend build
 is needed. Stop with Ctrl-C.
 
+The overview lists every host's checks by group. Filter it by host group and by
+problem status (any problem, confirmed problems, or pending problems and severity
+changes); filtered addresses such as `/?group=prod&problem=confirmed` can be
+shared. Host and check names link to detail pages at `/hosts/{host}`,
+`/hosts/{host}/services/{service}`, and `/hosts/{host}/reachability`, with IDs
+percent-encoded. A check's detail page shows its escaped output, start and finish
+times, duration, result age, and its state changes in chronological order.
+
 ## Configuration
 
 `--config` is required. YAML is file-owned; Ragios loads it at startup and on
@@ -174,9 +182,12 @@ still disabled.
 SQLite saves each result, problem state, and lifecycle transition in one
 transaction. Streaks and confirmed severity survive restarts. Transitions include
 pending progress, confirmation, candidate changes/cancellation, confirmed severity
-changes, and recovery; repeated stable results do not create transitions. There
-is no history page or notification delivery yet. Databases from before lifecycle
-support retain their results: an existing non-OK result seeds one pending failure,
+changes, and recovery; repeated stable results do not create transitions.
+State changes are kept for 30 days: Ragios prunes older ones at startup and
+hourly. The latest result and current problem state of every check are never
+pruned, so a long-standing confirmed problem stays visible after its
+confirmation leaves the history. There is no notification delivery yet.
+Databases from before lifecycle support retain their results: an existing non-OK result seeds one pending failure,
 not a confirmed problem or invented historical transitions. The host-reachability
 schema upgrade preserves existing service results, confirmation state, and
 transition IDs; it does not infer host reachability from service results.
@@ -194,8 +205,9 @@ bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)),
 problem confirmation ([#3](https://github.com/artran/ragios/issues/3)), host
 reachability ([#4](https://github.com/artran/ragios/issues/4)), fleet
 configuration ([#5](https://github.com/artran/ragios/issues/5)), and atomic
-configuration reload ([#6](https://github.com/artran/ragios/issues/6)). History
-browsing, freshness assessment, and notifications are later work.
+configuration reload ([#6](https://github.com/artran/ragios/issues/6)), and
+problem and history browsing ([#7](https://github.com/artran/ragios/issues/7)).
+Freshness assessment and notifications are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
 
@@ -227,6 +239,10 @@ Running-application reload tests cover validation-only operation, add/change/rem
 interval updates, invalid multi-file reload rejection, restart-only settings,
 state/history retention, and obsolete in-flight results, including removal and
 re-addition of an ID before its old execution finishes.
+Browsing tests cover group and problem filtering, no-match states, detail
+navigation with percent-encoded IDs, chronological history, hostile output
+escaping, and 30-day retention, both against an explicit clock in the store and
+end to end with backdated state changes.
 
 ## Bundled asset
 

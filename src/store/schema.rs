@@ -39,7 +39,8 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
             pending_attempts INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS transitions_by_check
-            ON check_transitions(check_kind, host_id, service_id, id);",
+            ON check_transitions(check_kind, host_id, service_id, id);
+         CREATE INDEX IF NOT EXISTS transitions_by_time ON check_transitions(occurred_at);",
     )?;
     let legacy: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'latest_results')",

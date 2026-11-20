@@ -276,8 +276,9 @@ Recipient changes update routing definitions only; email remains disabled.
 
 - New host/service ID pairs become eligible immediately. Removing a pair stops
   scheduling it and hides it from the dashboard, but does not delete its latest
-  result, problem state, or lifecycle transitions. No retention pruning is added
-  by reload. Re-adding the pair reuses that retained state.
+  result, problem state, or lifecycle transitions. Reload adds no pruning of its
+  own; transitions follow the normal 30-day retention. Re-adding the pair reuses
+  that retained state.
 - Display-name changes and group/bundle moves retain state under stable IDs.
   Reload itself never resets confirmation streaks or confirmed problems.
 - Executable, argument, plugin-directory, timeout, or output-budget changes make

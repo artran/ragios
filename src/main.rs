@@ -4,7 +4,7 @@ mod web;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ragios::{config::Config, store::Store};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::watch};
 
 #[derive(Parser)]
@@ -45,7 +45,20 @@ async fn main() -> Result<()> {
     let server = axum::serve(listener, web::router(active, store.clone()));
     tokio::select! {
         result = server => result.context("HTTP server failed"),
-        result = monitor::run(arguments.config, config, store, published, reloads) => result,
+        result = monitor::run(arguments.config, config, store.clone(), published, reloads) => result,
+        () = prune_history(store) => unreachable!("history pruning never stops"),
         result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C"),
+    }
+}
+
+/// Apply state-change retention at startup and hourly. A failed pass is retried
+/// on the next tick rather than stopping monitoring.
+async fn prune_history(store: Store) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        ticks.tick().await;
+        if let Err(error) = store.prune_transitions(chrono::Utc::now()).await {
+            eprintln!("prune state-change history: {error:#}");
+        }
     }
 }

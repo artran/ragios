@@ -5,6 +5,7 @@ use crate::{
     runner::{CheckResult, Reachability, Status},
 };
 use anyhow::{Context, Result, ensure};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rusqlite::{
     Connection, OptionalExtension, Row, params,
     types::{FromSql, FromSqlError, FromSqlResult, ValueRef},
@@ -17,6 +18,8 @@ use std::{
 
 pub type LatestResults = HashMap<(String, String), CheckState>;
 pub type LatestHosts = HashMap<String, HostState>;
+
+pub const TRANSITION_RETENTION: TimeDelta = TimeDelta::days(30);
 
 pub struct HostState {
     pub probe: Probe,
@@ -417,6 +420,26 @@ impl Store {
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+        .await?
+    }
+
+    /// Delete state changes older than the retention period before `now`.
+    /// Latest results and problem states are current state, never history,
+    /// so a long-standing problem survives even when all its changes are old.
+    pub async fn prune_transitions(&self, now: DateTime<Utc>) -> Result<usize> {
+        let cutoff = (now - TRANSITION_RETENTION).to_rfc3339_opts(SecondsFormat::Millis, true);
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            // Timestamps share one fixed-width UTC format, so text order is time order.
+            Ok(connection.execute(
+                "DELETE FROM check_transitions WHERE occurred_at < ?1",
+                [cutoff],
+            )?)
         })
         .await?
     }
