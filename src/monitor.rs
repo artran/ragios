@@ -20,6 +20,11 @@ use tokio::{
 
 pub type Key = (String, String);
 
+/// The longest the scheduler sleeps before recomputing start times from the
+/// wall clock. Shorter than the shortest check window (one minute), so a
+/// wall-clock step during a long wait cannot skip a window entirely.
+const WALL_CLOCK_RECHECK: Duration = Duration::from_secs(30);
+
 /// A failure that stops monitoring from making recorded progress. It persists
 /// until every check whose result could not be saved has saved one again.
 #[derive(Clone)]
@@ -383,10 +388,17 @@ pub async fn run(
             }
             () = async {
                 match &next {
-                    Some((_, deadline)) => tokio::time::sleep_until(*deadline).await,
+                    Some((_, start)) => {
+                        tokio::time::sleep_until((*start).min(Instant::now() + WALL_CLOCK_RECHECK)).await
+                    }
                     None => std::future::pending().await,
                 }
-            } => monitor.start(next.expect("eligible check").0),
+            } => {
+                let (key, start) = next.expect("eligible check");
+                if start <= Instant::now() {
+                    monitor.start(key);
+                }
+            }
         }
     }
 }

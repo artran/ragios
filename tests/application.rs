@@ -2484,8 +2484,9 @@ hosts:
     // Removing the window applies the interval deadline restored at startup.
     update_config(&path, |yaml| yaml["check_window"] = "always".into());
     restarted.reload("Configuration reloaded");
-    let page = restarted.page("/", "ran saved");
-    assert!(page.contains("ran new"), "{page}");
+    restarted.page_where("/", "both released checks", |page| {
+        page.contains("ran saved") && page.contains("ran new")
+    });
 }
 
 #[test]
