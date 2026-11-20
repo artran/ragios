@@ -5,7 +5,7 @@ use crate::{
     config::{Check, CheckWindow},
     store::ProblemState,
 };
-use chrono::{DateTime, Datelike, Days, NaiveDateTime, TimeDelta, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDateTime, Offset, TimeDelta, TimeZone, Timelike, Utc};
 use std::time::Duration;
 
 /// Slack beyond a due execution's own timeout before it counts as overdue.
@@ -52,9 +52,9 @@ fn is_open(window: &CheckWindow, at: DateTime<Utc>) -> bool {
     })
 }
 
-/// A closed window next opens where a range starts, or where a range starting
-/// inside a skipped daylight-saving hour first exists. A repeated hour offers
-/// both of its instants. Validation guarantees a range, so one opens within a
+/// A closed window next opens where a range starts, where a range starting
+/// inside a skipped daylight-saving hour first exists, or where clocks go back
+/// into the middle of a range. A repeated hour offers both of its instants. Validation guarantees a range, so one opens within a
 /// week.
 fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
     if is_open(window, at) {
@@ -74,9 +74,34 @@ fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
                 })
         })
         .flat_map(|start| instants(window.timezone, start))
+        .chain(
+            (0..=8)
+                .filter_map(|offset| today.checked_add_days(Days::new(offset)))
+                .filter_map(|day| clocks_go_back(window.timezone, day)),
+        )
         .filter(|&instant| instant > at && is_open(window, instant))
         .min()
         .expect("a validated window opens every week")
+}
+
+/// When local clocks go back during `day`, if they do.
+fn clocks_go_back(timezone: chrono_tz::Tz, day: chrono::NaiveDate) -> Option<DateTime<Utc>> {
+    let offset = |at: DateTime<Utc>| at.with_timezone(&timezone).offset().fix().local_minus_utc();
+    let start = *instants(timezone, day.and_time(chrono::NaiveTime::MIN)).first()?;
+    let (mut before, mut after) = (start, start + TimeDelta::days(1));
+    if offset(after) >= offset(before) {
+        return None;
+    }
+    // Transitions fall on whole seconds, so bisect down to one.
+    while after - before > TimeDelta::seconds(1) {
+        let middle = before + TimeDelta::seconds((after - before).num_seconds() / 2);
+        if offset(middle) == offset(start) {
+            before = middle;
+        } else {
+            after = middle;
+        }
+    }
+    Some(after)
 }
 
 fn instants(timezone: chrono_tz::Tz, local: NaiveDateTime) -> Vec<DateTime<Utc>> {

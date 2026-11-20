@@ -214,6 +214,12 @@ impl Monitor {
 
     fn start(&mut self, key: Key) {
         let scheduled = &self.checks[&key];
+        // A long wait can outlast a wall-clock step. Re-check the window so a
+        // check never starts while it is closed; the next pass reschedules it.
+        let now = Utc::now();
+        if schedule::eligible_from(&scheduled.check, now) > now {
+            return;
+        }
         let generation = scheduled.generation;
         let check = scheduled.check.clone();
         let config = self.config.clone();

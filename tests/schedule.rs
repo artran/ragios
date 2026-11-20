@@ -337,3 +337,20 @@ fn a_window_in_a_repeated_hour_opens_on_each_occurrence() {
         at("2026-10-25T01:30:00Z")
     );
 }
+
+#[test]
+fn a_window_reopens_when_clocks_go_back_into_the_middle_of_its_range() {
+    let check = windowed(
+        check(300, 30),
+        "Europe/London",
+        &[Weekday::Sun],
+        "00:30",
+        "01:30",
+    );
+    // 01:30 BST closes the range at 00:30 UTC; at 01:00 UTC clocks go back to
+    // 01:00 GMT, inside the range again, without passing its start.
+    assert_eq!(
+        eligible_from(&check, at("2026-10-25T00:40:00Z")),
+        at("2026-10-25T01:00:00Z")
+    );
+}
