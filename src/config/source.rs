@@ -112,6 +112,21 @@ pub(super) struct Host {
     pub bundles: Vec<String>,
     #[serde(default)]
     pub services: Vec<Service>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub reachability: Option<Reachability>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Reachability {
+    pub probe: super::Probe,
+    pub executable: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub interval_seconds: Option<u64>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -376,6 +391,18 @@ impl File {
                 }
                 if let Some(value) = host.timeout_seconds {
                     duration("timeout_seconds", value)?;
+                }
+                if let Some(probe) = &host.reachability {
+                    ensure!(
+                        !probe.executable.as_os_str().is_empty(),
+                        "reachability: executable must not be empty"
+                    );
+                    if let Some(value) = probe.interval_seconds {
+                        duration("reachability interval_seconds", value)?;
+                    }
+                    if let Some(value) = probe.timeout_seconds {
+                        duration("reachability timeout_seconds", value)?;
+                    }
                 }
                 for service in &host.services {
                     service

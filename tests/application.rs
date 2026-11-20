@@ -170,6 +170,303 @@ fn configure_concurrent_checks(
     fs::write(path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
 }
 
+fn with_reachability(path: &Path, probe: &str, executable: &str, args: &[&str]) {
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    yaml["hosts"][0]["reachability"] = serde_yaml::to_value(serde_yaml::Mapping::from_iter([
+        ("probe".into(), probe.into()),
+        ("executable".into(), executable.into()),
+        ("args".into(), serde_yaml::to_value(args).unwrap()),
+    ]))
+    .unwrap();
+    fs::write(path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+}
+
+fn row_for<'a>(page: &'a str, name: &str) -> &'a str {
+    page.split("<tr")
+        .skip(1)
+        .find(|row| row.contains(name))
+        .unwrap()
+        .split("</tr>")
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn reachable_host_and_broken_service_are_displayed_independently() {
+    let dir = TempDir::new().unwrap();
+    plugin(
+        &dir,
+        "if [ \"$1\" = host ]; then printf '<degraded probe> %s\\n' \"$2\"; exit 1; fi\nprintf 'broken service\\n'; exit 2",
+    );
+    let path = config(&dir, "confirmation_attempts: 1\nmax_concurrent_checks: 1");
+    with_reachability(&path, "tcp", "check", &["host", "target $(literal)"]);
+    let mut app = Application::start(&path);
+    let page = app.page_where("/", "reachable host and broken service", |page| {
+        page.contains("Reachable (degraded; WARNING)") && page.contains("broken service")
+    });
+    let host = row_for(&page, "Host reachability");
+    assert!(host.contains("tcp"));
+    assert!(host.contains("&lt;degraded probe&gt; target $(literal)"));
+    assert!(host.contains("No confirmed problem"));
+    assert!(host.contains("No pending problem"));
+    let service = row_for(&page, "Application health");
+    assert!(service.contains("Confirmed problem: CRITICAL"));
+    assert!(page.contains("does not prove the machine is powered off"));
+}
+
+#[test]
+fn host_status_mappings_and_runner_failures_never_gate_service_checks() {
+    for (name, body, assessment, confirmed, diagnostic) in [
+        ("ok", "exit 0", "Reachable (OK)", "No confirmed problem", ""),
+        (
+            "warning",
+            "exit 1",
+            "Reachable (degraded; WARNING)",
+            "No confirmed problem",
+            "",
+        ),
+        (
+            "critical",
+            "exit 2",
+            "Down (CRITICAL)",
+            "Confirmed problem: Down",
+            "",
+        ),
+        (
+            "unknown",
+            "exit 3",
+            "Undetermined (UNKNOWN)",
+            "Confirmed problem: Undetermined",
+            "",
+        ),
+        (
+            "unexpected",
+            "exit 42",
+            "Undetermined (UNKNOWN)",
+            "Confirmed problem: Undetermined",
+            "unexpected exit",
+        ),
+        (
+            "signal",
+            "kill -TERM $$",
+            "Undetermined (UNKNOWN)",
+            "Confirmed problem: Undetermined",
+            "unexpected exit",
+        ),
+        (
+            "missing",
+            "exit 0",
+            "Undetermined (UNKNOWN)",
+            "Confirmed problem: Undetermined",
+            "Runner failure:",
+        ),
+        (
+            "permission",
+            "exit 0",
+            "Undetermined (UNKNOWN)",
+            "Confirmed problem: Undetermined",
+            "Runner failure:",
+        ),
+        (
+            "timeout",
+            "exec sleep 20",
+            "Undetermined (UNKNOWN)",
+            "Confirmed problem: Undetermined",
+            "timed out after 1 seconds",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let counter = dir.path().join("service-counter");
+        plugin(
+            &dir,
+            &format!(
+                "if [ \"$1\" = host ]; then printf '<host probe>\\n'; {body}; fi\nn=0\nif [ -f '{counter}' ]; then n=$(cat '{counter}'); fi\nn=$((n+1))\nprintf '%s' \"$n\" > '{counter}'\nprintf 'service observation %s\\n' \"$n\"\nexit 0",
+                counter = counter.display()
+            ),
+        );
+        let path = config(
+            &dir,
+            "interval_seconds: 1\nretry_interval_seconds: 1\nconfirmation_attempts: 1\ntimeout_seconds: 1\nmax_concurrent_checks: 1",
+        );
+        let executable = match name {
+            "missing" => "not-installed",
+            "permission" => {
+                fs::write(dir.path().join("denied"), "#!/bin/sh\nexit 0").unwrap();
+                fs::set_permissions(dir.path().join("denied"), fs::Permissions::from_mode(0o644))
+                    .unwrap();
+                "denied"
+            }
+            _ => "check",
+        };
+        with_reachability(&path, "ping", executable, &["host"]);
+        let mut app = Application::start(&path);
+        let observed = app.page("/status", assessment);
+        let observed_service = row_for(&observed, "Application health");
+        let iteration = observed_service
+            .split("service observation ")
+            .nth(1)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let next_service = format!("service observation {}", iteration + 1);
+        let page = app.page_where("/status", name, |page| {
+            page.contains(assessment) && page.contains(&next_service)
+        });
+        let host = row_for(&page, "Host reachability");
+        assert!(host.contains(confirmed), "{name}: {host}");
+        assert!(host.contains(diagnostic), "{name}: {host}");
+        assert!(host.contains("No pending problem"), "{name}: {host}");
+        let service = row_for(&page, "Application health");
+        assert!(
+            service.contains("<td class=\"OK\">OK</td>"),
+            "{name}: {service}"
+        );
+        assert!(
+            service.contains("No confirmed problem"),
+            "{name}: {service}"
+        );
+    }
+}
+
+#[test]
+fn host_confirmation_and_pending_changes_survive_restart_beside_service_problems() {
+    let dir = TempDir::new().unwrap();
+    let counter = dir.path().join("host-counter");
+    let gate = dir.path().join("host-release");
+    plugin(
+        &dir,
+        &format!(
+            r#"if [ "$1" != host ]; then echo 'persistent broken service'; exit 2; fi
+n=0
+if [ -f '{counter}' ]; then n=$(cat '{counter}'); fi
+printf '%s' "$((n+1))" > '{counter}'
+while [ ! -f '{gate}-'"$n" ]; do [ -d '{directory}' ] || exit 3; sleep 0.02; done
+printf 'host observation %s complete\n' "$n"
+case "$n" in
+  1|4) exit 3;;
+  *) exit 2;;
+esac"#,
+            counter = counter.display(),
+            gate = gate.display(),
+            directory = dir.path().display()
+        ),
+    );
+    let path = config(
+        &dir,
+        "interval_seconds: 3\nretry_interval_seconds: 1\nconfirmation_attempts: 2",
+    );
+    with_reachability(&path, "ping", "check", &["host"]);
+    let mut app = Application::start(&path);
+    let initial = app.page("/status", "Host reachability");
+    assert!(row_for(&initial, "Host reachability").contains("Not yet checked"));
+    let mut saved_host = String::new();
+    for (n, confirmed, pending) in [
+        (0, "No confirmed problem", "Pending problem: Down (1/2)"),
+        (1, "Confirmed problem: Undetermined", "No pending problem"),
+        (
+            2,
+            "Confirmed problem: Undetermined",
+            "Pending severity change: Down (1/2)",
+        ),
+        (3, "Confirmed problem: Down", "No pending problem"),
+        (
+            4,
+            "Confirmed problem: Down",
+            "Pending severity change: Undetermined (1/2)",
+        ),
+    ] {
+        fs::write(format!("{}-{n}", gate.display()), "").unwrap();
+        let page = app.page("/status", &format!("host observation {n} complete"));
+        let host = row_for(&page, "Host reachability");
+        assert!(host.contains(confirmed), "{host}");
+        assert!(host.contains(pending), "{host}");
+        saved_host = host.to_owned();
+    }
+    let page = app.page("/status", "Confirmed problem: CRITICAL");
+    assert!(row_for(&page, "Application health").contains("persistent broken service"));
+    drop(app);
+
+    let release = dir.path().join("release-after-restart");
+    plugin(
+        &dir,
+        &format!(
+            r#"while [ ! -f '{release}' ]; do [ -d '{directory}' ] || exit 3; sleep 0.02; done
+if [ "$1" = host ]; then echo 'degraded host recovery'; exit 1; fi
+echo 'service still broken'; exit 2"#,
+            release = release.display(),
+            directory = dir.path().display()
+        ),
+    );
+    let mut restarted = Application::start(&path);
+    let restored = restarted.page("/status", "host observation 4 complete");
+    assert_eq!(row_for(&restored, "Host reachability"), saved_host);
+    assert!(row_for(&restored, "Application health").contains("Confirmed problem: CRITICAL"));
+    fs::write(release, "").unwrap();
+    let recovered = restarted.page("/status", "degraded host recovery");
+    let host = row_for(&recovered, "Host reachability");
+    assert!(host.contains("Reachable (degraded; WARNING)"));
+    assert!(host.contains("No confirmed problem"));
+    assert!(host.contains("No pending problem"));
+    assert!(row_for(&recovered, "Application health").contains("Confirmed problem: CRITICAL"));
+}
+
+#[test]
+fn saved_host_results_keep_their_probe_origin_after_selection_changes() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "echo 'saved ping assessment'; exit 2");
+    let path = config(&dir, "confirmation_attempts: 1");
+    with_reachability(&path, "ping", "check", &[]);
+    let mut first = Application::start(&path);
+    first.page("/status", "Confirmed problem: Down");
+    drop(first);
+    let release = dir.path().join("release");
+    plugin(
+        &dir,
+        &format!(
+            "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 3; sleep 0.02; done\necho 'new TCP assessment'; exit 0",
+            release.display(),
+            dir.path().display()
+        ),
+    );
+    with_reachability(&path, "tcp", "check", &[]);
+    let mut restarted = Application::start(&path);
+    let restored = restarted.page("/status", "saved ping assessment");
+    let host = row_for(&restored, "Host reachability");
+    assert!(host.contains("Configured probe: tcp"), "{host}");
+    assert!(host.contains("Latest probe: ping"), "{host}");
+    assert!(host.contains("Confirmed problem: Down"));
+    fs::write(release, "").unwrap();
+    let updated = restarted.page("/status", "new TCP assessment");
+    let host = row_for(&updated, "Host reachability");
+    assert!(host.contains("Latest probe: tcp"), "{host}");
+    assert!(host.contains("Reachable (OK)"));
+    assert!(host.contains("No confirmed problem"));
+}
+
+#[test]
+fn host_and_service_checks_share_the_same_global_execution_limit() {
+    let dir = TempDir::new().unwrap();
+    let path = config(&dir, "max_concurrent_checks: 2");
+    configure_concurrent_checks(&dir, &path, 4, 2, 0.5);
+    let endpoint = dir.path().join("endpoint-state");
+    with_reachability(
+        &path,
+        "tcp",
+        "check",
+        &[endpoint.to_str().unwrap(), "host-probe", "2", "0.5"],
+    );
+    let mut app = Application::start(&path);
+    let page = app.page_where("/status", "all host and service checks completed", |page| {
+        page.contains("completed=5 ") && !page.contains("Not yet checked")
+    });
+    assert!(page.contains("Reachable (OK)"));
+    assert!(page.contains("peak=2 "));
+    assert!(!page.contains("exceeded=True"));
+    assert!(!page.contains("overlap=True"));
+    assert_eq!(page.matches("class=\"OK\"").count(), 5);
+}
+
 #[test]
 fn global_concurrency_is_bounded_by_default_and_configured_limits() {
     for (limits, allowed, count) in [

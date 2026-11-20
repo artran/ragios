@@ -83,6 +83,75 @@ Services specify exactly one of `command` (a named command ID) or `executable`
 an explicit empty list. Named commands contain only `id`, `executable`, and
 optional `args`; they do not run checks by themselves.
 
+## Host reachability
+
+A host can optionally configure one reachability probe, independent of its
+services. Omission means **reachability not configured**, not reachable or down.
+Existing service-only configurations remain valid; hosts still require at least
+one service.
+
+```yaml
+hosts:
+  - id: web-01
+    name: Website
+    address: web-01.example.invalid
+    reachability:
+      probe: ping
+      executable: check_ping
+      args: ["-H", "{{address}}", "-w", "100.0,20%", "-c", "500.0,60%", "-p", "5"]
+      interval_seconds: 120
+      timeout_seconds: 10
+    services:
+      - {id: https, name: HTTPS, executable: check_http, args: ["-H", "{{address}}", "-S"]}
+```
+
+For TCP, replace the `reachability` block with, for example:
+
+```yaml
+    reachability:
+      probe: tcp
+      executable: check_tcp
+      args: ["-H", "{{address}}", "-p", "443"]
+```
+
+`probe` must be `ping` or `tcp`; `executable` is required. Use an installed
+Nagios-compatible plugin, unchanged, with the arguments its version requires.
+`probe` describes the configured measurement; it does not supply an executable
+or synthesize arguments. Raw system `ping` commands may use different exit-code
+semantics and must not be mistaken for a Nagios-compatible probe. `args` defaults
+to `[]`; host placeholders and literal-argument rules below apply. Reachability
+uses an explicit `executable`, not a named `command` or service bundle.
+Relative executable paths resolve inside `plugin_dir`, including for hosts in
+fragments. No implicit shell or PATH lookup is used.
+
+Reachability `interval_seconds` and `timeout_seconds` override the host settings,
+then fall back to the root defaults. The same timing validation applies as for
+services. Host-level service `overrides` do not affect the reachability probe.
+Host and service checks share the global concurrency limit, execution deadlines,
+and output capture budget. Each check has its own non-overlapping schedule.
+
+The latest reachability assessment is **reachable** for plugin OK or WARNING,
+**down** for CRITICAL, and **undetermined** for UNKNOWN or runner failure.
+WARNING is shown as degraded but still reachable. A reachable result clears a
+host problem immediately; down and undetermined use the configured confirmation
+threshold and retry timing. Mixed initial failures count together; changes to a
+confirmed assessment require consecutive matching results at the new assessment.
+See the [problem lifecycle](../README.md#problem-lifecycle).
+
+Host results and lifecycle state persist under the host ID in a separate check
+namespace from every service ID. Display-name changes preserve state. A TCP
+probe and a service may test the same endpoint, but their outcomes remain
+independent. Service checks continue while the host is down or undetermined.
+Only confirmed down is eligible for later service-notification suppression;
+confirmed undetermined, pending failures, and degraded reachability are not.
+This version sends no notifications.
+
+Reachability is observed from the monitoring server's network location. A failed
+probe does not prove the machine is powered off; a reachable host does not prove
+that its services are healthy. Install probe dependencies and grant any required
+ping permissions to the dedicated unprivileged server account, not root access
+to the Ragios server.
+
 ## Literal arguments and host values
 
 Ragios substitutes `{{address}}`, `{{host_id}}`, and keys from a host's string

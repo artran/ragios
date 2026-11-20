@@ -14,6 +14,13 @@ max_output_bytes: 65536
 hosts:
   - id: example-host
     name: Example host
+    # Optional real reachability probe (requires an installed Nagios plugin).
+    # address: example.invalid
+    # reachability:
+    #   probe: tcp
+    #   executable: /usr/lib/nagios/plugins/check_tcp
+    #   args: ["-H", "{{address}}", "-p", "443"]
+    #   timeout_seconds: 10
     services:
       - id: example-service
         name: Example service

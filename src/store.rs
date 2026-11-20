@@ -1,4 +1,9 @@
-use crate::runner::{CheckResult, Status};
+mod schema;
+
+use crate::{
+    config::Probe,
+    runner::{CheckResult, Reachability, Status},
+};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{
     Connection, OptionalExtension, Row, params,
@@ -10,9 +15,28 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub type LatestResults = HashMap<(String, String), ServiceState>;
+pub type LatestResults = HashMap<(String, String), CheckState>;
+pub type LatestHosts = HashMap<String, HostState>;
 
-pub struct ServiceState {
+pub struct HostState {
+    pub probe: Probe,
+    pub result: CheckResult,
+    pub problem: ProblemState,
+}
+
+impl HostState {
+    pub fn reachability(&self) -> Reachability {
+        Reachability::from_status(self.result.status)
+    }
+
+    /// Eligibility for future host-down notification suppression. Neither an
+    /// unconfirmed failure nor confirmed undetermined reachability qualifies.
+    pub fn is_confirmed_down(&self) -> bool {
+        self.problem.confirmed_severity == Some(Status::Critical)
+    }
+}
+
+pub struct CheckState {
     pub result: CheckResult,
     pub problem: ProblemState,
 }
@@ -143,51 +167,63 @@ pub struct Transition {
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
 
+// Host checks have their own namespace, never a reserved user service ID.
+#[derive(Clone)]
+pub enum CheckTarget {
+    Host(Probe),
+    Service(String),
+}
+
+#[derive(Clone, Copy)]
+enum CheckKind {
+    Host,
+    Service,
+}
+
+impl CheckKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Service => "service",
+        }
+    }
+}
+
+impl CheckTarget {
+    fn kind(&self) -> CheckKind {
+        match self {
+            Self::Host(_) => CheckKind::Host,
+            Self::Service(_) => CheckKind::Service,
+        }
+    }
+
+    fn service_id(&self) -> &str {
+        match self {
+            Self::Host(_) => "",
+            Self::Service(id) => id,
+        }
+    }
+
+    fn probe(&self) -> Option<Probe> {
+        match self {
+            Self::Host(probe) => Some(*probe),
+            Self::Service(_) => None,
+        }
+    }
+}
+
+struct StoredCheck {
+    host_id: String,
+    service_id: String,
+    state: CheckState,
+    probe: Option<Probe>,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let connection = Connection::open(path)
+        let mut connection = Connection::open(path)
             .with_context(|| format!("open SQLite database {}", path.display()))?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS latest_results (
-                host_id TEXT NOT NULL,
-                service_id TEXT NOT NULL,
-                status INTEGER NOT NULL,
-                output TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL,
-                duration_ms INTEGER NOT NULL,
-                PRIMARY KEY (host_id, service_id)
-             );
-             CREATE TABLE IF NOT EXISTS problem_states (
-                host_id TEXT NOT NULL,
-                service_id TEXT NOT NULL,
-                confirmed_severity INTEGER,
-                pending_severity INTEGER,
-                pending_attempts INTEGER NOT NULL,
-                PRIMARY KEY (host_id, service_id)
-             );
-             CREATE TABLE IF NOT EXISTS problem_transitions (
-                id INTEGER PRIMARY KEY,
-                host_id TEXT NOT NULL,
-                service_id TEXT NOT NULL,
-                occurred_at TEXT NOT NULL,
-                result_status INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                confirmed_severity INTEGER,
-                pending_severity INTEGER,
-                pending_attempts INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS transitions_by_service
-                ON problem_transitions(host_id, service_id, id);
-             INSERT INTO problem_states
-                SELECT host_id, service_id, NULL,
-                       CASE WHEN status = 0 THEN NULL ELSE status END,
-                       CASE WHEN status = 0 THEN 0 ELSE 1 END
-                FROM latest_results WHERE true
-                ON CONFLICT(host_id, service_id) DO NOTHING;",
-        )?;
+        schema::initialize(&mut connection)?;
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
@@ -197,6 +233,38 @@ impl Store {
         &self,
         host_id: String,
         service_id: String,
+        result: CheckResult,
+        confirmation_attempts: u32,
+    ) -> Result<ProblemState> {
+        self.save_check(
+            host_id,
+            CheckTarget::Service(service_id),
+            result,
+            confirmation_attempts,
+        )
+        .await
+    }
+
+    pub async fn save_host(
+        &self,
+        host_id: String,
+        probe: Probe,
+        result: CheckResult,
+        confirmation_attempts: u32,
+    ) -> Result<ProblemState> {
+        self.save_check(
+            host_id,
+            CheckTarget::Host(probe),
+            result,
+            confirmation_attempts,
+        )
+        .await
+    }
+
+    pub async fn save_check(
+        &self,
+        host_id: String,
+        target: CheckTarget,
         result: CheckResult,
         confirmation_attempts: u32,
     ) -> Result<ProblemState> {
@@ -211,22 +279,32 @@ impl Store {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
             let transaction = connection.transaction()?;
+            let kind = target.kind().as_str();
+            let service_id = target.service_id();
             let previous = transaction
                 .query_row(
                     "SELECT confirmed_severity, pending_severity, pending_attempts
-                     FROM problem_states WHERE host_id = ?1 AND service_id = ?2",
-                    params![host_id, service_id],
+                     FROM check_problems WHERE host_id = ?1 AND service_id = ?2 AND check_kind = ?3",
+                    params![host_id, service_id, kind],
                     |row| read_problem(row, 0),
                 )
                 .optional()?
                 .unwrap_or_default();
-            let state = previous.advance(result.status, confirmation_attempts);
+            let assessment = if matches!(target, CheckTarget::Host(_))
+                && Reachability::from_status(result.status) == Reachability::Reachable
+            {
+                Status::Ok
+            } else {
+                result.status
+            };
+            let state = previous.advance(assessment, confirmation_attempts);
             transaction.execute(
-                "INSERT INTO latest_results VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(host_id, service_id) DO UPDATE SET
+                "INSERT INTO check_results (host_id, service_id, status, output, started_at, finished_at, duration_ms, check_kind, probe)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(check_kind, host_id, service_id) DO UPDATE SET
                     status=excluded.status, output=excluded.output,
                     started_at=excluded.started_at, finished_at=excluded.finished_at,
-                    duration_ms=excluded.duration_ms",
+                    duration_ms=excluded.duration_ms, probe=excluded.probe",
                 params![
                     host_id,
                     service_id,
@@ -234,12 +312,15 @@ impl Store {
                     result.output,
                     result.started_at,
                     result.finished_at,
-                    result.duration_ms
+                    result.duration_ms,
+                    kind,
+                    target.probe().map(Probe::label)
                 ],
             )?;
             transaction.execute(
-                "INSERT INTO problem_states VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(host_id, service_id) DO UPDATE SET
+                "INSERT INTO check_problems (host_id, service_id, confirmed_severity, pending_severity, pending_attempts, check_kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(check_kind, host_id, service_id) DO UPDATE SET
                     confirmed_severity=excluded.confirmed_severity,
                     pending_severity=excluded.pending_severity,
                     pending_attempts=excluded.pending_attempts",
@@ -248,15 +329,16 @@ impl Store {
                     service_id,
                     state.confirmed_severity.map(status_code),
                     state.pending_severity.map(status_code),
-                    state.pending_attempts
+                    state.pending_attempts,
+                    kind
                 ],
             )?;
             if let Some(kind) = state.transition_from(previous) {
                 transaction.execute(
-                    "INSERT INTO problem_transitions
+                    "INSERT INTO check_transitions
                      (host_id, service_id, occurred_at, result_status, kind,
-                      confirmed_severity, pending_severity, pending_attempts)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                      confirmed_severity, pending_severity, pending_attempts, check_kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         host_id,
                         service_id,
@@ -265,7 +347,8 @@ impl Store {
                         kind.as_str(),
                         state.confirmed_severity.map(status_code),
                         state.pending_severity.map(status_code),
-                        state.pending_attempts
+                        state.pending_attempts,
+                        target.kind().as_str()
                     ],
                 )?;
             }
@@ -276,8 +359,34 @@ impl Store {
     }
 
     pub async fn latest(&self) -> Result<LatestResults> {
+        Ok(self
+            .latest_checks(CheckKind::Service)
+            .await?
+            .into_iter()
+            .map(|saved| ((saved.host_id, saved.service_id), saved.state))
+            .collect())
+    }
+
+    pub async fn latest_hosts(&self) -> Result<LatestHosts> {
+        self.latest_checks(CheckKind::Host)
+            .await?
+            .into_iter()
+            .map(|saved| {
+                Ok((
+                    saved.host_id,
+                    HostState {
+                        probe: saved.probe.context("host result missing probe origin")?,
+                        result: saved.state.result,
+                        problem: saved.state.problem,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn latest_checks(&self, kind: CheckKind) -> Result<Vec<StoredCheck>> {
         let store = self.clone();
-        tokio::task::spawn_blocking(move || -> Result<LatestResults> {
+        tokio::task::spawn_blocking(move || -> Result<Vec<StoredCheck>> {
             let connection = store
                 .0
                 .lock()
@@ -285,14 +394,16 @@ impl Store {
             let mut query = connection.prepare(
                 "SELECT r.host_id, r.service_id, r.status, r.output, r.started_at,
                         r.finished_at, r.duration_ms,
-                        p.confirmed_severity, p.pending_severity, p.pending_attempts
-                 FROM latest_results r JOIN problem_states p
-                    ON r.host_id = p.host_id AND r.service_id = p.service_id",
+                        p.confirmed_severity, p.pending_severity, p.pending_attempts, r.probe
+                 FROM check_results r JOIN check_problems p
+                    ON r.host_id = p.host_id AND r.service_id = p.service_id AND r.check_kind = p.check_kind
+                 WHERE r.check_kind = ?1",
             )?;
-            let rows = query.query_map([], |row| {
-                Ok((
-                    (row.get(0)?, row.get(1)?),
-                    ServiceState {
+            let rows = query.query_map([kind.as_str()], |row| {
+                Ok(StoredCheck {
+                    host_id: row.get(0)?,
+                    service_id: row.get(1)?,
+                    state: CheckState {
                         result: CheckResult {
                             status: Status::from_code(Some(row.get(2)?)),
                             output: row.get(3)?,
@@ -302,7 +413,8 @@ impl Store {
                         },
                         problem: read_problem(row, 7)?,
                     },
-                ))
+                    probe: row.get(10)?,
+                })
             })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
@@ -316,6 +428,21 @@ impl Store {
         host_id: String,
         service_id: String,
     ) -> Result<Vec<Transition>> {
+        self.check_transitions(host_id, CheckKind::Service, service_id)
+            .await
+    }
+
+    pub async fn host_transitions(&self, host_id: String) -> Result<Vec<Transition>> {
+        self.check_transitions(host_id, CheckKind::Host, String::new())
+            .await
+    }
+
+    async fn check_transitions(
+        &self,
+        host_id: String,
+        kind: CheckKind,
+        service_id: String,
+    ) -> Result<Vec<Transition>> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<Transition>> {
             let connection = store
@@ -325,9 +452,9 @@ impl Store {
             let mut query = connection.prepare(
                 "SELECT id, occurred_at, result_status, kind,
                         confirmed_severity, pending_severity, pending_attempts
-                 FROM problem_transitions WHERE host_id = ?1 AND service_id = ?2 ORDER BY id",
+                 FROM check_transitions WHERE host_id = ?1 AND service_id = ?2 AND check_kind = ?3 ORDER BY id",
             )?;
-            let rows = query.query_map(params![host_id, service_id], |row| {
+            let rows = query.query_map(params![host_id, service_id, kind.as_str()], |row| {
                 Ok(Transition {
                     id: row.get(0)?,
                     occurred_at: row.get(1)?,
@@ -339,6 +466,24 @@ impl Store {
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
         .await?
+    }
+}
+
+impl FromSql for Probe {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let label = value.as_str()?;
+        [Probe::Ping, Probe::Tcp]
+            .into_iter()
+            .find(|probe| probe.label() == label)
+            .ok_or_else(|| {
+                FromSqlError::Other(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown probe {label:?}"),
+                    )
+                    .into(),
+                )
+            })
     }
 }
 

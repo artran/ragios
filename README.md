@@ -1,7 +1,7 @@
 # Ragios
 
-A Rust monitoring server that runs installed service-check plugins from YAML,
-stores their latest results in SQLite, and serves an HTML dashboard with HTMX
+A Rust monitoring server that runs installed host reachability and service-check
+plugins from YAML, stores their latest results in SQLite, and serves an HTML dashboard with HTMX
 updates. Email is disabled: this version has no email transport.
 
 ## Development setup
@@ -111,6 +111,13 @@ syntax in arguments remain literal text. Shell behaviour requires deliberately
 configuring a shell executable; do not accept command definitions from untrusted
 users. Do not put credentials in committed YAML or plugin output.
 
+Hosts can optionally select a ping or TCP reachability probe with its own
+executable and argument list. See [host reachability](docs/configuration.md#host-reachability)
+for configuration examples. No probe is assumed for existing configurations.
+Reachability and service health are displayed and persisted independently;
+service checks continue even when a host is down or undetermined. A failed probe
+from this monitoring server does not prove that the machine is powered off.
+
 Exit codes 0/1/2/3 appear as OK/WARNING/CRITICAL/UNKNOWN. Missing executables,
 permission errors, signal deaths, unexpected exit codes, and timeouts appear as
 UNKNOWN with a runner diagnostic, never OK. Standard output and standard error
@@ -141,13 +148,25 @@ Confirmation, cancellation of a candidate change, and recovery restore the norma
 interval. Delays begin after the result is saved; restarting still checks
 immediately.
 
+For host reachability, OK and WARNING mean **reachable**; WARNING is displayed
+as degraded but still clears any host problem immediately. CRITICAL means
+**down**, and UNKNOWN or a runner failure means **undetermined**. Down and
+undetermined assessments share the initial failure streak. After confirmation,
+changing between down and undetermined requires the same matching-result streak
+as service severity changes. Host problems use the same configurable confirmation
+threshold and retry interval, independently of service problems. Only confirmed
+down is eligible for future service-notification suppression; notifications are
+still disabled.
+
 SQLite saves each result, problem state, and lifecycle transition in one
 transaction. Streaks and confirmed severity survive restarts. Transitions include
 pending progress, confirmation, candidate changes/cancellation, confirmed severity
 changes, and recovery; repeated stable results do not create transitions. There
 is no history page or notification delivery yet. Databases from before lifecycle
 support retain their results: an existing non-OK result seeds one pending failure,
-not a confirmed problem or invented historical transitions.
+not a confirmed problem or invented historical transitions. The host-reachability
+schema upgrade preserves existing service results, confirmation state, and
+transition IDs; it does not infer host reachability from service results.
 
 ## Access and current scope
 
@@ -159,10 +178,10 @@ server must be able to read configuration/plugins and write its data directory.
 
 This includes service monitoring ([#1](https://github.com/artran/ragios/issues/1)),
 bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)),
-problem confirmation ([#3](https://github.com/artran/ragios/issues/3)), and fleet
-configuration ([#5](https://github.com/artran/ragios/issues/5)). Independent host
-reachability, reload, history browsing, freshness assessment, and notifications
-are later work.
+problem confirmation ([#3](https://github.com/artran/ragios/issues/3)), host
+reachability ([#4](https://github.com/artran/ragios/issues/4)), and fleet
+configuration ([#5](https://github.com/artran/ragios/issues/5)). Reload, history
+browsing, freshness assessment, and notifications are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
 
@@ -184,6 +203,10 @@ through HTTP after restarting the application.
 Lifecycle tests cover mixed-severity failure streaks, interrupted candidate
 changes, immediate recovery, configurable thresholds/retry timing, and persisted
 state and transitions through the store API and rendered dashboard.
+Reachability tests cover ping/TCP selection, all exit-status mappings and runner
+failures, mixed failure confirmation, immediate degraded recovery, independently
+persisted host/service state, legacy database upgrades, shared execution limits,
+and continuing service checks while the host is down or undetermined.
 Fleet tests also cover multi-file resolution, command/bundle reuse, primary groups,
 recipient precedence, host overrides, identity collisions, and display-name changes.
 

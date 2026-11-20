@@ -14,6 +14,49 @@ fn load(yaml: &str) -> anyhow::Result<Config> {
 }
 
 #[test]
+fn hosts_select_ping_or_tcp_with_literal_arguments_and_resolved_timing() {
+    for probe in ["ping", "tcp"] {
+        let config = load(&format!(
+            "interval_seconds: 90\ntimeout_seconds: 20\nhosts:\n  - id: a\n    name: A\n    address: 'target $(literal)'\n    interval_seconds: 60\n    reachability:\n      probe: {probe}\n      executable: check_{probe}\n      args: ['-H', '{{{{address}}}}', '-p', '443']\n      timeout_seconds: 5\n    services: [{{id: check, name: Check, executable: check}}]\n"
+        )).unwrap();
+        let reachability = config.hosts[0].reachability.as_ref().unwrap();
+        assert_eq!(reachability.probe.label(), probe);
+        assert_eq!(
+            reachability.check.executable,
+            std::path::Path::new(&format!("check_{probe}"))
+        );
+        assert_eq!(
+            reachability.check.args,
+            ["-H", "target $(literal)", "-p", "443"]
+        );
+        assert_eq!(reachability.check.interval_seconds, 60);
+        assert_eq!(reachability.check.timeout_seconds, 5);
+    }
+}
+
+#[test]
+fn invalid_reachability_definitions_reject_the_whole_fleet() {
+    for definition in [
+        "{probe: udp, executable: check}",
+        "{executable: check}",
+        "{probe: ping}",
+        "{probe: ping, executable: ''}",
+        "{probe: tcp, executable: check, interval_seconds: 0}",
+        "{probe: tcp, executable: check, timeout_seconds: 4294967296}",
+        "{probe: ping, executable: check, args: ['{{unset}}']}",
+        "{probe: tcp, executable: check, port: 443}",
+        "null",
+    ] {
+        let error = load(&format!("hosts:\n  - id: a\n    name: A\n    reachability: {definition}\n    services: [{{id: check, name: Check, executable: check}}]\n")).expect_err(definition);
+        assert!(format!("{error:#}").contains("ragios.yaml"), "{error:#}");
+    }
+    let legacy =
+        load("hosts: [{id: a, name: A, services: [{id: check, name: Check, executable: check}]}]")
+            .unwrap();
+    assert!(legacy.hosts[0].reachability.is_none());
+}
+
+#[test]
 fn blank_override_maps_and_entries_are_rejected() {
     for value in [
         "overrides:",
@@ -74,7 +117,7 @@ fn null_or_blank_overrides_are_rejected_instead_of_silently_clearing_values() {
 fn escaped_opening_delimiters_reach_plugins_as_literal_braces() {
     let config = load("hosts:\n  - id: a\n    name: A\n    services:\n      - id: format\n        name: Format\n        executable: check\n        args: ['{{{{.Names}}', '{{{{', 'plain {braces}', '{{host_id}}/{{{{literal}}']\n").unwrap();
     assert_eq!(
-        config.hosts[0].services[0].args,
+        config.hosts[0].services[0].check.args,
         ["{{.Names}}", "{{", "plain {braces}", "a/{{literal}}"]
     );
 }
@@ -128,7 +171,7 @@ fn shipped_inline_and_split_fleet_examples_load_without_secrets_or_external_serv
     assert_eq!(fleet.hosts[1].recipients, ["website-owner@example.invalid"]);
     assert!(fleet.hosts[2].recipients.is_empty());
     assert_eq!(
-        fleet.hosts[1].services[0].args,
+        fleet.hosts[1].services[0].check.args,
         ["--target", "web-02.example.invalid", "--port", "8443"]
     );
 }
@@ -391,24 +434,39 @@ hosts:
     .unwrap();
     let alpha = &config.hosts[0].services;
     assert_eq!(
-        (alpha[0].interval_seconds, alpha[0].timeout_seconds),
+        (
+            alpha[0].check.interval_seconds,
+            alpha[0].check.timeout_seconds
+        ),
         (300, 30)
     );
     assert_eq!(
-        (alpha[1].interval_seconds, alpha[1].timeout_seconds),
+        (
+            alpha[1].check.interval_seconds,
+            alpha[1].check.timeout_seconds
+        ),
         (60, 10)
     );
-    assert_eq!(alpha[1].args, ["default"]);
+    assert_eq!(alpha[1].check.args, ["default"]);
     let beta = &config.hosts[1].services;
     assert_eq!(
-        (beta[0].interval_seconds, beta[0].timeout_seconds),
+        (
+            beta[0].check.interval_seconds,
+            beta[0].check.timeout_seconds
+        ),
         (120, 20)
     );
-    assert!(beta[0].args.is_empty());
-    assert_eq!((beta[1].interval_seconds, beta[1].timeout_seconds), (15, 5));
+    assert!(beta[0].check.args.is_empty());
+    assert_eq!(
+        (
+            beta[1].check.interval_seconds,
+            beta[1].check.timeout_seconds
+        ),
+        (15, 5)
+    );
     assert_eq!(beta[1].id, "tuned");
     assert_eq!(beta[1].name, "Host-specific label");
-    assert_eq!(beta[1].args, ["literal $(not-a-shell)", "beta"]);
+    assert_eq!(beta[1].check.args, ["literal $(not-a-shell)", "beta"]);
 }
 
 #[test]
@@ -512,15 +570,15 @@ hosts:
     .unwrap();
     assert_eq!(config.hosts[0].services[0].id, "https");
     assert_eq!(
-        config.hosts[0].services[0].executable.to_str(),
+        config.hosts[0].services[0].check.executable.to_str(),
         Some("check_http")
     );
     assert_eq!(
-        config.hosts[0].services[0].args,
+        config.hosts[0].services[0].check.args,
         ["-H", "alpha.invalid", "--label=alpha", "443"]
     );
     assert_eq!(
-        config.hosts[1].services[0].args,
+        config.hosts[1].services[0].check.args,
         [
             "-H",
             "beta.invalid; $(touch /tmp/no)",

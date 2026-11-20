@@ -30,6 +30,7 @@ pub struct Host {
     pub name: String,
     pub group: String,
     pub recipients: Vec<String>,
+    pub reachability: Option<ReachabilityCheck>,
     pub services: Vec<Service>,
 }
 
@@ -43,6 +44,33 @@ pub struct HostGroup {
 pub struct Service {
     pub id: String,
     pub name: String,
+    pub check: Check,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReachabilityCheck {
+    pub probe: Probe,
+    pub check: Check,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Probe {
+    Ping,
+    Tcp,
+}
+
+impl Probe {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Tcp => "tcp",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Check {
     pub executable: PathBuf,
     pub args: Vec<String>,
     pub interval_seconds: u64,
@@ -264,6 +292,32 @@ impl Resolver<'_> {
             name: host.name.clone(),
             group: host.group.clone().unwrap_or_else(|| "ungrouped".into()),
             recipients,
+            reachability: host
+                .reachability
+                .as_ref()
+                .map(|probe| -> Result<_> {
+                    Ok(ReachabilityCheck {
+                        probe: probe.probe,
+                        check: Check {
+                            executable: probe.executable.clone(),
+                            args: probe
+                                .args
+                                .iter()
+                                .map(|arg| expand(arg, host))
+                                .collect::<Result<_>>()?,
+                            interval_seconds: probe
+                                .interval_seconds
+                                .or(host.interval_seconds)
+                                .unwrap_or(self.file.interval_seconds),
+                            timeout_seconds: probe
+                                .timeout_seconds
+                                .or(host.timeout_seconds)
+                                .unwrap_or(self.file.timeout_seconds),
+                        },
+                    })
+                })
+                .transpose()
+                .context("reachability check")?,
             services,
         })
     }
@@ -306,18 +360,20 @@ impl Resolver<'_> {
                 .and_then(|o| o.name.as_ref())
                 .unwrap_or(&service.name)
                 .clone(),
-            executable,
-            args,
-            interval_seconds: overrides
-                .and_then(|o| o.interval_seconds)
-                .or(service.interval_seconds)
-                .or(host.interval_seconds)
-                .unwrap_or(self.file.interval_seconds),
-            timeout_seconds: overrides
-                .and_then(|o| o.timeout_seconds)
-                .or(service.timeout_seconds)
-                .or(host.timeout_seconds)
-                .unwrap_or(self.file.timeout_seconds),
+            check: Check {
+                executable,
+                args,
+                interval_seconds: overrides
+                    .and_then(|o| o.interval_seconds)
+                    .or(service.interval_seconds)
+                    .or(host.interval_seconds)
+                    .unwrap_or(self.file.interval_seconds),
+                timeout_seconds: overrides
+                    .and_then(|o| o.timeout_seconds)
+                    .or(service.timeout_seconds)
+                    .or(host.timeout_seconds)
+                    .unwrap_or(self.file.timeout_seconds),
+            },
         })
     }
 }

@@ -1,4 +1,4 @@
-use crate::config::Service;
+use crate::config::Check;
 use chrono::{SecondsFormat, Utc};
 use std::{
     path::Path,
@@ -38,6 +38,31 @@ impl Status {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reachability {
+    Reachable,
+    Down,
+    Undetermined,
+}
+
+impl Reachability {
+    pub fn from_status(status: Status) -> Self {
+        match status {
+            Status::Ok | Status::Warning => Self::Reachable,
+            Status::Critical => Self::Down,
+            Status::Unknown => Self::Undetermined,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Reachable => "Reachable",
+            Self::Down => "Down",
+            Self::Undetermined => "Undetermined",
+        }
+    }
+}
+
 pub struct CheckResult {
     pub status: Status,
     pub output: String,
@@ -46,15 +71,10 @@ pub struct CheckResult {
     pub duration_ms: u64,
 }
 
-pub async fn execute(
-    plugin_dir: &Path,
-    service: &Service,
-    timeout_seconds: u64,
-    max_output_bytes: usize,
-) -> CheckResult {
+pub async fn execute(plugin_dir: &Path, check: &Check, max_output_bytes: usize) -> CheckResult {
     let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let clock = Instant::now();
-    let (status, output) = run(plugin_dir, service, timeout_seconds, max_output_bytes).await;
+    let (status, output) = run(plugin_dir, check, max_output_bytes).await;
     CheckResult {
         status,
         output,
@@ -64,15 +84,11 @@ pub async fn execute(
     }
 }
 
-async fn run(
-    plugin_dir: &Path,
-    service: &Service,
-    timeout_seconds: u64,
-    max_output_bytes: usize,
-) -> (Status, String) {
-    let mut command = Command::new(plugin_dir.join(&service.executable));
+async fn run(plugin_dir: &Path, check: &Check, max_output_bytes: usize) -> (Status, String) {
+    let timeout_seconds = check.timeout_seconds;
+    let mut command = Command::new(plugin_dir.join(&check.executable));
     command
-        .args(&service.args)
+        .args(&check.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

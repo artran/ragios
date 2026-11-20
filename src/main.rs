@@ -2,12 +2,19 @@ mod web;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ragios::{config::Config, runner, store::Store};
+use ragios::{
+    config::Config,
+    runner,
+    store::{CheckTarget, Store},
+};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 
 #[derive(Parser)]
-#[command(version, about = "Monitor installed service-check plugins from YAML")]
+#[command(
+    version,
+    about = "Monitor host reachability and service health from YAML"
+)]
 struct Arguments {
     /// YAML configuration; relative paths inside it resolve beside this file.
     #[arg(long)]
@@ -25,9 +32,18 @@ async fn main() -> Result<()> {
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
     let executions = Arc::new(Semaphore::new(config.max_concurrent_checks));
     for host in &config.hosts {
-        for service in &host.services {
+        let checks = host
+            .reachability
+            .iter()
+            .map(|probe| (CheckTarget::Host(probe.probe), &probe.check))
+            .chain(
+                host.services
+                    .iter()
+                    .map(|service| (CheckTarget::Service(service.id.clone()), &service.check)),
+            );
+        for (target, check) in checks {
             let host_id = host.id.clone();
-            let service = service.clone();
+            let check = check.clone();
             let config = config.clone();
             let store = store.clone();
             let executions = executions.clone();
@@ -39,18 +55,13 @@ async fn main() -> Result<()> {
                         .acquire()
                         .await
                         .context("execution limiter closed")?;
-                    let result = runner::execute(
-                        &config.plugin_dir,
-                        &service,
-                        service.timeout_seconds,
-                        config.max_output_bytes,
-                    )
-                    .await;
+                    let result =
+                        runner::execute(&config.plugin_dir, &check, config.max_output_bytes).await;
                     drop(permit);
                     let problem = store
-                        .save(
+                        .save_check(
                             host_id.clone(),
-                            service.id.clone(),
+                            target.clone(),
                             result,
                             config.confirmation_attempts,
                         )
@@ -58,7 +69,7 @@ async fn main() -> Result<()> {
                     let delay = if problem.needs_retry() {
                         config.retry_interval_seconds
                     } else {
-                        service.interval_seconds
+                        check.interval_seconds
                     };
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                 }
