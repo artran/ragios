@@ -251,7 +251,10 @@ is queued. Try again after a slot frees up.
 There are no accounts. Check requests use POST and require a token from the
 dashboard to prevent cross-site requests. Keep the default loopback binding;
 private Tailscale access requires an explicit private address in `bind` and
-appropriate network policy. Do not expose this unauthenticated server publicly.
+appropriate network policy. Open the dashboard using its bound IP address and
+port (or `localhost` with the same port for a loopback bind). Other hostnames,
+including Tailscale DNS names, are rejected. Do not expose this unauthenticated
+server publicly.
 The SQLite database and configuration are separate from installed plugins; the
 server must be able to read configuration/plugins and write its data directory.
 

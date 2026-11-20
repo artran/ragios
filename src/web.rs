@@ -1,8 +1,9 @@
 use crate::monitor::{CheckRequest, CheckRequestOutcome, Key, SchedulerStatus};
 use axum::{
     Form, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
@@ -17,7 +18,7 @@ use ragios::{
     },
 };
 use serde::Deserialize;
-use std::{fmt::Write, sync::Arc};
+use std::{fmt::Write, net::SocketAddr, sync::Arc};
 use tokio::sync::{mpsc, oneshot, watch};
 
 #[derive(Clone)]
@@ -37,6 +38,7 @@ pub fn router(
     scheduler: watch::Receiver<SchedulerStatus>,
     store: Store,
     requests: mpsc::Sender<CheckRequest>,
+    listener: SocketAddr,
 ) -> anyhow::Result<Router> {
     let mut random = [0u8; 32];
     getrandom::fill(&mut random)
@@ -77,6 +79,10 @@ pub fn router(
                 )
             }),
         )
+        .layer(middleware::from_fn_with_state(
+            listener,
+            require_served_host,
+        ))
         .with_state(Dashboard {
             config,
             scheduler,
@@ -84,6 +90,45 @@ pub fn router(
             requests,
             csrf: csrf.into(),
         }))
+}
+
+async fn require_served_host(
+    State(listener): State<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Trust the actual bound socket, not proxy headers or DNS. Check both
+    // authority sources when present; one must not mask an unserved host.
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host = hosts.next();
+    let authority = request.uri().authority();
+    if (host.is_none() && authority.is_none())
+        || hosts.next().is_some()
+        || host.is_some_and(|host| !host.to_str().is_ok_and(|host| serves(listener, host)))
+        || authority.is_some_and(|authority| !serves(listener, authority.as_str()))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "Host is not served by this dashboard.",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn serves(listener: SocketAddr, host: &str) -> bool {
+    if host.parse::<SocketAddr>() == Ok(listener) {
+        return true;
+    }
+    let port = listener.port();
+    if listener.ip().is_loopback()
+        && (host.eq_ignore_ascii_case(&format!("localhost:{port}"))
+            || (port == 80 && host.eq_ignore_ascii_case("localhost")))
+    {
+        return true;
+    }
+    // A browser omits the default port from the HTTP authority.
+    port == 80 && format!("{host}:80").parse::<SocketAddr>() == Ok(listener)
 }
 
 #[derive(Default, Deserialize)]

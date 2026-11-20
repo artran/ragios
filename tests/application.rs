@@ -329,6 +329,50 @@ fn check_now_runs_outside_a_weekday_window_and_records_the_problem_lifecycle() {
 }
 
 #[test]
+fn dashboard_rejects_unserved_hosts_before_serving_forms_or_handling_check_requests() {
+    let dir = TempDir::new().unwrap();
+    let path = config(&dir, "interval_seconds: 3600");
+    plugin(&dir, "printf 'configured result\\n'");
+    with_reachability(&path, "tcp", "check", &[]);
+    let mut app = Application::start(&path);
+    let service = "/hosts/local/services/application";
+    let reachability = "/hosts/local/reachability";
+    let page = app.page(service, "configured result");
+    app.page(reachability, "Check now");
+    let port = app.url.rsplit_once(':').unwrap().1;
+    for path in ["/", service, reachability] {
+        let response = app
+            .client
+            .get(format!("{}{path}", app.url))
+            .header("Host", format!("unserved.invalid:{port}"))
+            .header("X-Forwarded-Host", format!("127.0.0.1:{port}"))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 403, "{path}");
+        assert!(!response.text().unwrap().contains("name=\"csrf\""));
+    }
+    let token = check_now_token(&page);
+    for path in [service, reachability] {
+        for host in [format!("unserved.invalid:{port}"), "127.0.0.1:0".into()] {
+            let response = app
+                .check_now(path, token)
+                .header("Host", host)
+                .send()
+                .unwrap();
+            assert_eq!(response.status(), 403, "{path}");
+        }
+    }
+    let response = app
+        .client
+        .get(format!("{}{service}", app.url))
+        .header("Host", format!("localhost:{port}"))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.text().unwrap().contains("Check now"));
+}
+
+#[test]
 fn check_now_rejects_cross_site_requests_and_only_accepts_active_check_ids() {
     let dir = TempDir::new().unwrap();
     let path = config(&dir, "interval_seconds: 3600");

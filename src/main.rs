@@ -43,11 +43,9 @@ async fn main() -> Result<()> {
     let (published, active) = watch::channel(config.clone());
     let (status, scheduler) = watch::channel(Default::default());
     let (request_check, requests) = mpsc::channel(1);
-    let router = web::router(active, scheduler, store.clone(), request_check)?;
-    eprintln!(
-        "Ragios listening on http://{}; email disabled",
-        listener.local_addr()?
-    );
+    let address = listener.local_addr().context("read bound HTTP address")?;
+    let router = web::router(active, scheduler, store.clone(), request_check, address)?;
+    eprintln!("Ragios listening on http://{address}; email disabled");
     let server = axum::serve(listener, router);
     tokio::select! {
         result = server => result.context("HTTP server failed"),
