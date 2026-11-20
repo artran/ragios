@@ -23,10 +23,11 @@ includes: [checks.yaml, hosts/east.yaml, hosts/west.yaml]
 ```
 
 An included fragment can contain only `commands`, `bundles`, `groups`,
-`check_windows`, and `hosts`. Nested includes, globs, directory discovery, and multiple YAML documents
-in a file are not supported. Include paths resolve beside the root YAML file.
-The same canonical file path cannot be included twice, including through a
-symlink or by including the root itself. Missing or malformed files reject the whole fleet.
+`check_windows`, and `hosts`. Nested includes, globs, directory discovery,
+and multiple YAML documents in a file are not supported. Include paths resolve
+beside the root YAML file. The same canonical file path cannot be included
+twice, including through a symlink or by including the root itself. Missing or
+malformed files reject the whole fleet.
 
 Definitions append in root-then-include-list order. References may point forward
 or across files; file order never grants override priority. Duplicate command,
@@ -201,8 +202,9 @@ For each timing setting, precedence is:
 4. Root default.
 
 `overrides` is a map keyed by an existing service ID on that host. Its only fields
-are `name`, `args`, `interval_seconds`, `timeout_seconds`, and `check_window`. It cannot create or
-rename an identity, change an executable, or hide a bundle collision. Argument
+are `name`, `args`, `interval_seconds`, `timeout_seconds`, and `check_window`.
+It cannot create or rename an identity, change an executable, or hide a bundle
+collision. Argument
 overrides replace the entire argument list; `args: []` removes all arguments.
 Omitted fields retain their resolved values. Explicit `null` is invalid, not an
 instruction to inherit. There are no inherited template chains.
@@ -247,11 +249,12 @@ root. A reachability probe uses its own `check_window`, then the host's, then
 the root's. The reserved ID `always` lets a more specific level run at any time;
 it cannot be declared.
 
-Each range lists `days` (`mon` through `sun`, no repeats) and local `start` and
-`end` times as `HH:MM`. A range is open from `start` up to, but not including,
-`end`; `end: "24:00"` closes at midnight. Ranges cannot cross midnight: split an
-overnight period into two ranges. A window needs at least one range and can
-combine any number of them. Holidays and one-off dates are not supported.
+Each range lists `days` (English names such as `mon` or `Monday`, without
+repeats) and local `start` and `end` times as `HH:MM`. A range is open from
+`start` up to, but not including, `end`; `end: "24:00"` closes at midnight.
+Ranges cannot cross midnight: split an overnight period into two ranges. A
+window needs at least one range and can combine any number of them. Holidays
+and one-off dates are not supported.
 
 Times are local wall-clock times in the window's timezone, so `09:00` stays
 09:00 across daylight-saving changes. A range that starts in a skipped hour opens

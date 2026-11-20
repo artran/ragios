@@ -88,13 +88,69 @@ pub struct CheckWindow {
     pub ranges: Vec<WindowRange>,
 }
 
-/// Local minutes of the day from `start_minute` up to, but excluding,
-/// `end_minute` (at most 1440) on each of `days`.
+/// Local time from `start` up to, but excluding, `end` on each of `days`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WindowRange {
     pub days: Vec<chrono::Weekday>,
-    pub start_minute: u32,
-    pub end_minute: u32,
+    pub start: TimeOfDay,
+    pub end: TimeOfDay,
+}
+
+impl WindowRange {
+    /// Whether the local date and time fall inside this range.
+    pub fn contains(&self, local: &(impl chrono::Datelike + chrono::Timelike)) -> bool {
+        self.days.contains(&local.weekday())
+            && (self.start..self.end).contains(&TimeOfDay::of(local))
+    }
+
+    /// When this range starts on `day`, if it covers that weekday.
+    pub fn start_on(&self, day: chrono::NaiveDate) -> Option<chrono::NaiveDateTime> {
+        use chrono::Datelike;
+        self.days.contains(&day.weekday()).then(|| {
+            day.and_time(chrono::NaiveTime::MIN) + chrono::TimeDelta::minutes(self.start.0.into())
+        })
+    }
+}
+
+/// A whole-minute local time written `HH:MM`, from 00:00 to 24:00, where 24:00
+/// is the end of the day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct TimeOfDay(u32);
+
+impl TimeOfDay {
+    pub const END_OF_DAY: Self = Self(24 * 60);
+
+    /// The time on a local clock, truncated to the minute.
+    pub fn of(local: &impl chrono::Timelike) -> Self {
+        Self(local.hour() * 60 + local.minute())
+    }
+}
+
+impl TryFrom<String> for TimeOfDay {
+    type Error = anyhow::Error;
+
+    fn try_from(text: String) -> Result<Self> {
+        text.parse()
+    }
+}
+
+impl std::str::FromStr for TimeOfDay {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let invalid = || anyhow::anyhow!("{text:?} is not HH:MM from 00:00 to 24:00");
+        let (hours, minutes) = text.split_once(':').ok_or_else(invalid)?;
+        let field = |field: &str| {
+            (field.len() == 2 && field.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| field.parse::<u32>().ok())
+                .flatten()
+        };
+        let (hours, minutes) = field(hours).zip(field(minutes)).ok_or_else(invalid)?;
+        let time = Self(hours * 60 + minutes);
+        ensure!(minutes < 60 && time <= Self::END_OF_DAY, invalid());
+        Ok(time)
+    }
 }
 
 fn index<'a, T>(
@@ -213,19 +269,22 @@ impl Config {
     }
 
     fn resolve(file: &source::File) -> Result<Self> {
-        let commands = index(&file.commands, |c| (&c.id, c.source.as_path()), "command")?;
-        let windows = index(
-            &file.check_windows,
-            |w| (&w.id, w.source.as_path()),
-            "check window",
-        )?;
-        file.validate(&commands, &windows)?;
+        let definitions = source::Definitions {
+            commands: index(&file.commands, |c| (&c.id, c.source.as_path()), "command")?,
+            windows: index(
+                &file.check_windows,
+                |w| (&w.id, w.source.as_path()),
+                "check window",
+            )?,
+        };
+        file.validate(&definitions)?;
         let resolver = Resolver {
             file,
-            commands,
+            commands: definitions.commands,
             bundles: index(&file.bundles, |b| (&b.id, b.source.as_path()), "bundle")?,
             groups: index(&file.groups, |g| (&g.id, g.source.as_path()), "group")?,
-            windows: windows
+            windows: definitions
+                .windows
                 .into_iter()
                 .map(|(id, window)| Ok((id, window.resolve()?)))
                 .collect::<Result<_>>()?,

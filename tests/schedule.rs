@@ -30,18 +30,14 @@ const WEEKDAYS: [Weekday; 5] = [
 ];
 
 fn windowed(check: Check, timezone: &str, days: &[Weekday], start: &str, end: &str) -> Check {
-    let minutes = |text: &str| {
-        let (hours, minutes) = text.split_once(':').unwrap();
-        hours.parse::<u32>().unwrap() * 60 + minutes.parse::<u32>().unwrap()
-    };
     Check {
         window: Some(CheckWindow {
             id: "window".into(),
             timezone: timezone.parse().unwrap(),
             ranges: vec![WindowRange {
                 days: days.to_vec(),
-                start_minute: minutes(start),
-                end_minute: minutes(end),
+                start: start.parse().unwrap(),
+                end: end.parse().unwrap(),
             }],
         }),
         ..check

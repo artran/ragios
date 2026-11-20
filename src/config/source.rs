@@ -43,7 +43,7 @@ pub(super) struct File {
     #[serde(default)]
     pub groups: Vec<Group>,
     #[serde(default)]
-    pub check_windows: Vec<Window>,
+    pub check_windows: Vec<CheckWindow>,
     #[serde(default, deserialize_with = "non_null")]
     pub check_window: Option<String>,
 }
@@ -61,52 +61,27 @@ pub(super) struct Fragment {
     #[serde(default)]
     pub hosts: Vec<Host>,
     #[serde(default)]
-    pub check_windows: Vec<Window>,
+    pub check_windows: Vec<CheckWindow>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Window {
+pub(super) struct CheckWindow {
     #[serde(skip)]
     pub source: PathBuf,
     pub id: String,
-    #[serde(default = "default_timezone", deserialize_with = "non_null_value")]
-    pub timezone: String,
+    /// An IANA name; omission means UTC.
+    #[serde(default, deserialize_with = "non_null")]
+    pub timezone: Option<String>,
     pub ranges: Vec<WindowRange>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct WindowRange {
-    pub days: Vec<Day>,
-    pub start: String,
-    pub end: String,
-}
-
-#[derive(Clone, Copy, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum Day {
-    Mon,
-    Tue,
-    Wed,
-    Thu,
-    Fri,
-    Sat,
-    Sun,
-}
-
-impl From<Day> for chrono::Weekday {
-    fn from(day: Day) -> Self {
-        match day {
-            Day::Mon => Self::Mon,
-            Day::Tue => Self::Tue,
-            Day::Wed => Self::Wed,
-            Day::Thu => Self::Thu,
-            Day::Fri => Self::Fri,
-            Day::Sat => Self::Sat,
-            Day::Sun => Self::Sun,
-        }
-    }
+    pub days: Vec<chrono::Weekday>,
+    pub start: super::TimeOfDay,
+    pub end: super::TimeOfDay,
 }
 
 #[derive(Deserialize)]
@@ -205,18 +180,6 @@ pub(super) struct Service {
     pub timeout_seconds: Option<u64>,
     #[serde(default, deserialize_with = "non_null")]
     pub check_window: Option<String>,
-}
-
-fn default_timezone() -> String {
-    "UTC".into()
-}
-
-fn non_null_value<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    non_null(deserializer).map(Option::unwrap)
 }
 
 // Missing means inherit; an explicit null must not silently erase an override.
@@ -342,7 +305,7 @@ pub(super) fn locate(
     bundles: &mut [Bundle],
     groups: &mut [Group],
     hosts: &mut [Host],
-    windows: &mut [Window],
+    windows: &mut [CheckWindow],
 ) {
     for window in windows {
         window.source = path.into();
@@ -370,46 +333,31 @@ pub(super) fn locate(
 /// The reserved window ID that lets a more specific level run at any time.
 pub(super) const ALWAYS: &str = "always";
 
-fn window_reference(windows: &BTreeMap<&str, &Window>, id: Option<&String>) -> Result<()> {
-    if let Some(id) = id {
-        ensure!(
-            id == ALWAYS || windows.contains_key(id.as_str()),
-            "unknown check window {id:?}"
-        );
-    }
-    Ok(())
+/// The named definitions that configuration elsewhere refers to by ID.
+pub(super) struct Definitions<'a> {
+    pub commands: BTreeMap<&'a str, &'a Command>,
+    pub windows: BTreeMap<&'a str, &'a CheckWindow>,
 }
 
-// Whole minutes of the day as "HH:MM"; 24:00 marks the end of a day.
-fn minute_of_day(text: &str, end: bool) -> Option<u32> {
-    let (hours, minutes) = text.split_once(':')?;
-    if hours.len() != 2 || minutes.len() != 2 {
-        return None;
+impl Definitions<'_> {
+    fn window(&self, id: Option<&String>) -> Result<()> {
+        if let Some(id) = id {
+            ensure!(
+                id == ALWAYS || self.windows.contains_key(id.as_str()),
+                "unknown check window {id:?}"
+            );
+        }
+        Ok(())
     }
-    let digits = |text: &str| {
-        text.bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| text.parse::<u32>().ok())?
-    };
-    let (hours, minutes) = (digits(hours)?, digits(minutes)?);
-    let minute = hours * 60 + minutes;
-    (minutes < 60
-        && if end {
-            (1..=24 * 60).contains(&minute)
-        } else {
-            minute < 24 * 60
-        })
-    .then_some(minute)
 }
 
-impl Window {
+impl CheckWindow {
     pub fn resolve(&self) -> Result<super::CheckWindow> {
         let resolve = || -> Result<_> {
-            ensure!(self.id != ALWAYS, "check window ID always is reserved");
-            let timezone = self.timezone.parse().map_err(|_| {
+            let timezone = self.timezone.as_deref().unwrap_or("UTC");
+            let timezone = timezone.parse().map_err(|_| {
                 anyhow::anyhow!(
-                    "invalid timezone {:?}; use an IANA name such as Europe/London",
-                    self.timezone
+                    "invalid timezone {timezone:?}; use an IANA name such as Europe/London"
                 )
             })?;
             ensure!(!self.ranges.is_empty(), "ranges must not be empty");
@@ -420,22 +368,17 @@ impl Window {
                     ensure!(!range.days.is_empty(), "days must not be empty");
                     let mut days = Vec::new();
                     for &day in &range.days {
-                        let day = chrono::Weekday::from(day);
                         ensure!(!days.contains(&day), "duplicate day {day}");
                         days.push(day);
                     }
-                    let start_minute = minute_of_day(&range.start, false)
-                        .context("start must be HH:MM from 00:00 to 23:59")?;
-                    let end_minute = minute_of_day(&range.end, true)
-                        .context("end must be HH:MM from 00:01 to 24:00")?;
                     ensure!(
-                        start_minute < end_minute,
+                        range.start < range.end,
                         "start must be before end; split ranges that cross midnight"
                     );
                     Ok(super::WindowRange {
                         days,
-                        start_minute,
-                        end_minute,
+                        start: range.start,
+                        end: range.end,
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -451,11 +394,7 @@ impl Window {
 }
 
 impl File {
-    pub fn validate(
-        &self,
-        commands: &BTreeMap<&str, &Command>,
-        windows: &BTreeMap<&str, &Window>,
-    ) -> Result<()> {
+    pub fn validate(&self, definitions: &Definitions) -> Result<()> {
         ensure!(
             !self.plugin_dir.as_os_str().is_empty(),
             "plugin_dir must not be empty"
@@ -496,7 +435,9 @@ impl File {
             isize::MAX
         );
         recipients(&self.recipients).context("global recipients")?;
-        window_reference(windows, self.check_window.as_ref()).context("global check_window")?;
+        definitions
+            .window(self.check_window.as_ref())
+            .context("global check_window")?;
         for command in &self.commands {
             ensure!(
                 !command.executable.as_os_str().is_empty(),
@@ -523,6 +464,13 @@ impl File {
                 })?;
             }
         }
+        for window in &self.check_windows {
+            ensure!(
+                window.id != ALWAYS,
+                "check window ID always is reserved (in {})",
+                window.source.display()
+            );
+        }
         for bundle in &self.bundles {
             ensure!(
                 !bundle.services.is_empty(),
@@ -537,7 +485,7 @@ impl File {
             )
             .with_context(|| format!("bundle {:?} in {}", bundle.id, bundle.source.display()))?;
             for service in &bundle.services {
-                service.validate(commands, windows).with_context(|| {
+                service.validate(definitions).with_context(|| {
                     format!(
                         "bundle {:?}, service {:?} in {}",
                         bundle.id,
@@ -557,7 +505,7 @@ impl File {
                 if let Some(values) = &host.recipients {
                     recipients(values)?;
                 }
-                window_reference(windows, host.check_window.as_ref())?;
+                definitions.window(host.check_window.as_ref())?;
                 if let Some(value) = host.interval_seconds {
                     duration("interval_seconds", value)?;
                 }
@@ -575,12 +523,13 @@ impl File {
                     if let Some(value) = probe.timeout_seconds {
                         duration("reachability timeout_seconds", value)?;
                     }
-                    window_reference(windows, probe.check_window.as_ref())
+                    definitions
+                        .window(probe.check_window.as_ref())
                         .context("reachability")?;
                 }
                 for service in &host.services {
                     service
-                        .validate(commands, windows)
+                        .validate(definitions)
                         .with_context(|| format!("service {:?}", service.id))?;
                 }
                 for (id, overrides) in &host.overrides {
@@ -598,7 +547,8 @@ impl File {
                         duration("timeout_seconds", value)
                             .with_context(|| format!("override {id:?}"))?;
                     }
-                    window_reference(windows, overrides.check_window.as_ref())
+                    definitions
+                        .window(overrides.check_window.as_ref())
                         .with_context(|| format!("override {id:?}"))?;
                 }
                 Ok(())
@@ -611,11 +561,7 @@ impl File {
 }
 
 impl Service {
-    fn validate(
-        &self,
-        commands: &BTreeMap<&str, &Command>,
-        windows: &BTreeMap<&str, &Window>,
-    ) -> Result<()> {
+    fn validate(&self, definitions: &Definitions) -> Result<()> {
         ensure!(!self.id.trim().is_empty(), "service ID must not be empty");
         ensure!(!self.name.trim().is_empty(), "name must not be empty");
         ensure!(
@@ -623,7 +569,10 @@ impl Service {
             "specify exactly one of command or executable"
         );
         if let Some(id) = &self.command {
-            ensure!(commands.contains_key(id.as_str()), "unknown command {id:?}");
+            ensure!(
+                definitions.commands.contains_key(id.as_str()),
+                "unknown command {id:?}"
+            );
         }
         if let Some(executable) = &self.executable {
             ensure!(
@@ -637,7 +586,7 @@ impl Service {
         if let Some(value) = self.timeout_seconds {
             duration("timeout_seconds", value)?;
         }
-        window_reference(windows, self.check_window.as_ref())
+        definitions.window(self.check_window.as_ref())
     }
 }
 

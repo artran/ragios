@@ -5,7 +5,10 @@ use crate::{
     config::{Check, CheckWindow},
     store::ProblemState,
 };
-use chrono::{DateTime, Datelike, Days, NaiveDateTime, Offset, TimeDelta, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Days, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeDelta, TimeZone, Utc,
+};
+use chrono_tz::Tz;
 use std::time::Duration;
 
 /// Slack beyond a due execution's own timeout before it counts as overdue.
@@ -41,53 +44,51 @@ pub fn eligible_from(check: &Check, at: DateTime<Utc>) -> DateTime<Utc> {
         .map_or(at, |window| next_open(window, at))
 }
 
+/// How long after `at` the check's window keeps it from starting.
+pub fn window_wait(check: &Check, at: DateTime<Utc>) -> Duration {
+    (eligible_from(check, at) - at).to_std().unwrap_or_default()
+}
+
 /// Whether local wall-clock time at `at` falls inside one of the window's
 /// ranges. Local time keeps the window fixed across daylight-saving changes.
 fn is_open(window: &CheckWindow, at: DateTime<Utc>) -> bool {
     let local = at.with_timezone(&window.timezone);
-    let minute = local.hour() * 60 + local.minute();
-    window.ranges.iter().any(|range| {
-        range.days.contains(&local.weekday())
-            && (range.start_minute..range.end_minute).contains(&minute)
-    })
+    window.ranges.iter().any(|range| range.contains(&local))
 }
 
 /// A closed window next opens where a range starts, where a range starting
 /// inside a skipped daylight-saving hour first exists, or where clocks go back
-/// into the middle of a range. A repeated hour offers both of its instants. Validation guarantees a range, so one opens within a
-/// week.
+/// into the middle of a range. A repeated hour offers both of its instants.
+/// Validation guarantees a range, so one opens within a week.
 fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
     if is_open(window, at) {
         return at;
     }
     let today = at.with_timezone(&window.timezone).date_naive();
-    (0..=8)
+    let days: Vec<_> = (0..=8)
         .filter_map(|offset| today.checked_add_days(Days::new(offset)))
-        .flat_map(|day| {
-            window
-                .ranges
-                .iter()
-                .filter(move |range| range.days.contains(&day.weekday()))
-                .map(move |range| {
-                    day.and_time(chrono::NaiveTime::MIN)
-                        + TimeDelta::minutes(range.start_minute.into())
-                })
-        })
-        .flat_map(|start| instants(window.timezone, start))
-        .chain(
-            (0..=8)
-                .filter_map(|offset| today.checked_add_days(Days::new(offset)))
-                .filter_map(|day| clocks_go_back(window.timezone, day)),
-        )
+        .collect();
+    let starts = days.iter().flat_map(|&day| {
+        window
+            .ranges
+            .iter()
+            .filter_map(move |range| range.start_on(day))
+            .flat_map(|start| resolve_local(window.timezone, start))
+    });
+    let set_backs = days
+        .iter()
+        .filter_map(|&day| clocks_go_back(window.timezone, day));
+    starts
+        .chain(set_backs)
         .filter(|&instant| instant > at && is_open(window, instant))
         .min()
         .expect("a validated window opens every week")
 }
 
 /// When local clocks go back during `day`, if they do.
-fn clocks_go_back(timezone: chrono_tz::Tz, day: chrono::NaiveDate) -> Option<DateTime<Utc>> {
+fn clocks_go_back(timezone: Tz, day: NaiveDate) -> Option<DateTime<Utc>> {
     let offset = |at: DateTime<Utc>| at.with_timezone(&timezone).offset().fix().local_minus_utc();
-    let start = *instants(timezone, day.and_time(chrono::NaiveTime::MIN)).first()?;
+    let start = *resolve_local(timezone, day.and_time(NaiveTime::MIN)).first()?;
     let (mut before, mut after) = (start, start + TimeDelta::days(1));
     if offset(after) >= offset(before) {
         return None;
@@ -104,8 +105,10 @@ fn clocks_go_back(timezone: chrono_tz::Tz, day: chrono::NaiveDate) -> Option<Dat
     Some(after)
 }
 
-fn instants(timezone: chrono_tz::Tz, local: NaiveDateTime) -> Vec<DateTime<Utc>> {
-    // Skipped local times resolve to the first minute that exists after them.
+/// The instants at which a local clock shows `local`: one normally, two in a
+/// repeated hour. A skipped local time resolves to the first minute after it
+/// that exists.
+fn resolve_local(timezone: Tz, local: NaiveDateTime) -> Vec<DateTime<Utc>> {
     (0..=24 * 60)
         .map(|minute| timezone.from_local_datetime(&(local + TimeDelta::minutes(minute))))
         .find_map(|times| times.earliest().map(|earliest| (earliest, times.latest())))

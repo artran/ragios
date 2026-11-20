@@ -63,8 +63,7 @@ impl ScheduledCheck {
     fn start_at(&self, config: &Config, now: Instant, wall: DateTime<Utc>) -> Instant {
         let deadline = self.deadline(config).max(now);
         let at = wall + TimeDelta::from_std(deadline - now).expect("bounded deadline");
-        let open = schedule::eligible_from(&self.check, at);
-        deadline + (open - at).to_std().unwrap_or_default()
+        deadline + schedule::window_wait(&self.check, at)
     }
 }
 
@@ -216,8 +215,7 @@ impl Monitor {
         let scheduled = &self.checks[&key];
         // A long wait can outlast a wall-clock step. Re-check the window so a
         // check never starts while it is closed; the next pass reschedules it.
-        let now = Utc::now();
-        if schedule::eligible_from(&scheduled.check, now) > now {
+        if !schedule::window_wait(&scheduled.check, Utc::now()).is_zero() {
             return;
         }
         let generation = scheduled.generation;

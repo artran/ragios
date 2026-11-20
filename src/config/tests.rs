@@ -596,7 +596,7 @@ const WINDOWS: &str = "check_windows:
     ranges:
       - {days: [mon, tue, wed, thu, fri], start: '09:00', end: '17:30'}
   - id: sundays
-    ranges: [{days: [sun], start: '00:00', end: '24:00'}]
+    ranges: [{days: [Sunday], start: '00:00', end: '24:00'}]
 ";
 
 #[test]
@@ -644,13 +644,13 @@ fn check_windows_resolve_with_the_same_precedence_as_timing_and_default_to_utc()
                 chrono::Weekday::Thu,
                 chrono::Weekday::Fri,
             ],
-            start_minute: 9 * 60,
-            end_minute: 17 * 60 + 30,
+            start: "09:00".parse().unwrap(),
+            end: "17:30".parse().unwrap(),
         }]
     );
     let sundays = a.services[0].check.window.as_ref().unwrap();
     assert_eq!(sundays.timezone, chrono_tz::UTC);
-    assert_eq!(sundays.ranges[0].end_minute, 24 * 60);
+    assert_eq!(sundays.ranges[0].end, super::TimeOfDay::END_OF_DAY);
     let unwindowed =
         load("hosts: [{id: a, name: A, services: [{id: s, name: S, executable: check}]}]").unwrap();
     assert_eq!(unwindowed.hosts[0].services[0].check.window, None);
@@ -689,12 +689,13 @@ fn invalid_check_windows_and_unknown_references_reject_the_whole_fleet() {
         (window("{days: [mon], start: '17:00', end: '09:00'}"), "start must be before end"),
         (window("{days: [mon], start: '09:00', end: '09:00'}"), "start must be before end"),
         (window("{days: [mon], start: '09:00', end: '24:01'}"), "HH:MM"),
-        (window("{days: [mon], start: '24:00', end: '24:00'}"), "HH:MM"),
+        (window("{days: [mon], start: '24:00', end: '24:00'}"), "start must be before end"),
+        (window("{days: [mon], start: '00:00', end: '00:00'}"), "start must be before end"),
         (window("{days: [mon], start: '9:00', end: '17:00'}"), "HH:MM"),
         (window("{days: [mon], start: '09:60', end: '17:00'}"), "HH:MM"),
         (window("{days: [], start: '09:00', end: '17:00'}"), "days must not be empty"),
         (window("{days: [mon, mon], start: '09:00', end: '17:00'}"), "duplicate day"),
-        (window("{days: [monday], start: '09:00', end: '17:00'}"), "unknown variant"),
+        (window("{days: [funday], start: '09:00', end: '17:00'}"), "days"),
         (format!("check_windows: [{{id: w, ranges: []}}]\n{service}"), "ranges must not be empty"),
         (
             format!("check_windows: [{{id: always, ranges: [{{days: [mon], start: '09:00', end: '17:00'}}]}}]\n{service}"),
