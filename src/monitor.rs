@@ -206,11 +206,17 @@ impl Monitor {
             return None;
         }
         let (now, wall) = (Instant::now(), Utc::now());
+        // Overdue checks share the current instant as their start time, so the
+        // oldest deadline goes first.
         self.checks
             .iter()
             .filter(|(key, _)| !self.running.contains(*key))
-            .map(|(key, check)| (key.clone(), check.start_at(&self.config, now, wall)))
-            .min_by_key(|(_, deadline)| *deadline)
+            .map(|(key, check)| {
+                let start = check.start_at(&self.config, now, wall);
+                (key.clone(), start, check.deadline(&self.config))
+            })
+            .min_by_key(|&(_, start, deadline)| (start, deadline))
+            .map(|(key, start, _)| (key, start))
     }
 
     fn start(&mut self, key: Key) {

@@ -2487,3 +2487,55 @@ hosts:
     let page = restarted.page("/", "ran saved");
     assert!(page.contains("ran new"), "{page}");
 }
+
+#[test]
+fn checks_waiting_for_a_free_slot_start_oldest_deadline_first() {
+    use chrono::{SecondsFormat, TimeDelta, Utc};
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("order.log");
+    plugin(
+        &dir,
+        &format!(
+            "printf '%s\\n' \"$1\" >> '{}'\n[ \"$1\" = blocker ] && sleep 2\nexit 0",
+            log.display()
+        ),
+    );
+    let path = dir.path().join("ragios.yaml");
+    fs::write(
+        &path,
+        "bind: 127.0.0.1:0
+plugin_dir: .
+database: state.sqlite3
+max_concurrent_checks: 1
+startup_spread_seconds: 1
+hosts:
+  - id: local
+    name: Local host
+    services:
+      - {id: blocker, name: Blocker, executable: check, args: [blocker]}
+      - {id: z-older, name: Older, executable: check, args: [z-older]}
+      - {id: a-newer, name: Newer, executable: check, args: [a-newer]}
+",
+    )
+    .unwrap();
+    let ago = |minutes| {
+        (Utc::now() - TimeDelta::minutes(minutes)).to_rfc3339_opts(SecondsFormat::Millis, true)
+    };
+    seed(&dir, "local", "z-older", 0, &ago(20), 3);
+    seed(&dir, "local", "a-newer", 0, &ago(10), 3);
+    // Both restored checks fall due while the never-checked blocker holds the
+    // only slot, so they compete for it when it frees.
+    let _app = Application::start(&path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let order = loop {
+        let order = fs::read_to_string(&log).unwrap_or_default();
+        if order.lines().count() >= 3 || Instant::now() > deadline {
+            break order;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(
+        order.lines().collect::<Vec<_>>(),
+        ["blocker", "z-older", "a-newer"]
+    );
+}
