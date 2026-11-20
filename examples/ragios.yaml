@@ -6,6 +6,8 @@ database: ../var/ragios.sqlite3
 # Optional; these are the defaults.
 interval_seconds: 300
 timeout_seconds: 30
+max_concurrent_checks: 20
+max_output_bytes: 65536
 
 hosts:
   - id: example-host

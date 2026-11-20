@@ -17,6 +17,10 @@ pub struct Config {
     pub interval_seconds: u64,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+    #[serde(default = "default_max_concurrent_checks")]
+    pub max_concurrent_checks: usize,
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
     pub hosts: Vec<Host>,
 }
 
@@ -46,6 +50,12 @@ fn default_interval() -> u64 {
 }
 fn default_timeout() -> u64 {
     30
+}
+fn default_max_concurrent_checks() -> usize {
+    20
+}
+fn default_max_output_bytes() -> usize {
+    64 * 1024
 }
 
 impl Config {
@@ -81,6 +91,16 @@ impl Config {
             (1..=u32::MAX as u64).contains(&self.timeout_seconds),
             "timeout_seconds must be between 1 and {}",
             u32::MAX
+        );
+        ensure!(
+            (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_concurrent_checks),
+            "max_concurrent_checks must be between 1 and {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        ensure!(
+            (1..=isize::MAX as usize).contains(&self.max_output_bytes),
+            "max_output_bytes must be between 1 and {}",
+            isize::MAX
         );
         ensure!(
             !self.hosts.is_empty(),

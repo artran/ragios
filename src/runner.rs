@@ -5,7 +5,10 @@ use std::{
     process::Stdio,
     time::{Duration, Instant},
 };
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::{
+    io::AsyncReadExt,
+    process::{ChildStderr, ChildStdout, Command},
+};
 
 #[derive(Clone, Copy)]
 pub enum Status {
@@ -43,10 +46,15 @@ pub struct CheckResult {
     pub duration_ms: u64,
 }
 
-pub async fn execute(plugin_dir: &Path, service: &Service, timeout_seconds: u64) -> CheckResult {
+pub async fn execute(
+    plugin_dir: &Path,
+    service: &Service,
+    timeout_seconds: u64,
+    max_output_bytes: usize,
+) -> CheckResult {
     let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let clock = Instant::now();
-    let (status, output) = run(plugin_dir, service, timeout_seconds).await;
+    let (status, output) = run(plugin_dir, service, timeout_seconds, max_output_bytes).await;
     CheckResult {
         status,
         output,
@@ -56,7 +64,12 @@ pub async fn execute(plugin_dir: &Path, service: &Service, timeout_seconds: u64)
     }
 }
 
-async fn run(plugin_dir: &Path, service: &Service, timeout_seconds: u64) -> (Status, String) {
+async fn run(
+    plugin_dir: &Path,
+    service: &Service,
+    timeout_seconds: u64,
+    max_output_bytes: usize,
+) -> (Status, String) {
     let mut command = Command::new(plugin_dir.join(&service.executable));
     command
         .args(&service.args)
@@ -74,17 +87,13 @@ async fn run(plugin_dir: &Path, service: &Service, timeout_seconds: u64) -> (Sta
     let process_group = child.id();
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut out = Vec::new();
-    let mut err = Vec::new();
+    let mut output = CapturedOutput::default();
     let outcome = tokio::time::timeout(Duration::from_secs(timeout_seconds), async {
-        let (exit, stdout, stderr) = tokio::join!(
+        let (exit, ()) = tokio::try_join!(
             child.wait(),
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err)
-        );
-        stdout?;
-        stderr?;
-        exit
+            output.drain(&mut stdout, &mut stderr, max_output_bytes)
+        )?;
+        Ok::<_, std::io::Error>(exit)
     })
     .await;
     let (status, diagnostic) = match outcome {
@@ -110,13 +119,61 @@ async fn run(plugin_dir: &Path, service: &Service, timeout_seconds: u64) -> (Sta
             (Status::Unknown, Some(diagnostic))
         }
     };
-    let mut text = String::from_utf8_lossy(&out).into_owned();
-    if !err.is_empty() {
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
         text.push_str("\n[stderr]\n");
-        text.push_str(&String::from_utf8_lossy(&err));
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    if output.truncated {
+        text.push_str(&format!("\n[output truncated at {max_output_bytes} bytes]"));
     }
     if let Some(diagnostic) = diagnostic {
         text.push_str(&format!("\nRunner failure: {diagnostic}"));
     }
     (status, text)
+}
+
+#[derive(Default)]
+struct CapturedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+impl CapturedOutput {
+    async fn drain(
+        &mut self,
+        stdout: &mut ChildStdout,
+        stderr: &mut ChildStderr,
+        limit: usize,
+    ) -> std::io::Result<()> {
+        let mut out_chunk = [0; 8192];
+        let mut err_chunk = [0; 8192];
+        let mut out_closed = false;
+        let mut err_closed = false;
+        while !out_closed || !err_closed {
+            let (count, is_stderr) = tokio::select! {
+                read = stdout.read(&mut out_chunk), if !out_closed => (read?, false),
+                read = stderr.read(&mut err_chunk), if !err_closed => (read?, true),
+            };
+            if count == 0 {
+                if is_stderr {
+                    err_closed = true;
+                } else {
+                    out_closed = true;
+                }
+                continue;
+            }
+            let retained = count.min(limit - self.stdout.len() - self.stderr.len());
+            self.truncated |= retained < count;
+            // Keep draining both pipes after the shared budget is exhausted so a
+            // noisy plugin cannot deadlock on a full pipe. Scratch space is fixed.
+            if is_stderr {
+                self.stderr.extend_from_slice(&err_chunk[..retained]);
+            } else {
+                self.stdout.extend_from_slice(&out_chunk[..retained]);
+            }
+        }
+        Ok(())
+    }
 }

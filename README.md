@@ -70,11 +70,17 @@ Optional settings:
 | --- | --- | --- |
 | `bind` | `127.0.0.1:8080` | Explicit HTTP socket address |
 | `interval_seconds` | `300` | Delay after each completed check before its next execution |
-| `timeout_seconds` | `30` | Execution deadline, including output collection |
+| `timeout_seconds` | `30` | Execution deadline, including output collection and excluding time waiting for a concurrency slot |
+| `max_concurrent_checks` | `20` | Global limit on running checks across all hosts |
+| `max_output_bytes` | `65536` | Combined stdout/stderr capture budget per execution, in bytes |
 
-Intervals and deadlines are whole seconds between 1 and 4,294,967,295. Checks
-start immediately, run independently, and never overlap themselves. There is no
-catch-up queue. On restart, stored results are visible while new checks run.
+Intervals and deadlines are whole seconds between 1 and 4,294,967,295. Concurrency
+and output limits must be positive whole numbers within the platform's semaphore
+and buffer size limits; invalid limits fail startup validation. Checks become
+eligible immediately and wait fairly for a concurrency slot. Each check has at
+most one waiting or running execution and never overlaps itself. The interval
+starts after its result is saved, so missed intervals do not form a catch-up
+queue. On restart, stored results are visible while new checks run.
 
 For an installed Nagios plugin, set `plugin_dir` to its actual installation
 directory, then replace the service definition, for example:
@@ -94,8 +100,13 @@ users. Do not put credentials in committed YAML or plugin output.
 Exit codes 0/1/2/3 appear as OK/WARNING/CRITICAL/UNKNOWN. Missing executables,
 permission errors, signal deaths, unexpected exit codes, and timeouts appear as
 UNKNOWN with a runner diagnostic, never OK. Standard output and standard error
-are retained and escaped as text. Timeout handling kills the execution process
-group on Unix and reaps the direct child.
+are captured together up to `max_output_bytes` and escaped as text. Excess output
+is drained and discarded until exit or timeout, with an explicit truncation
+marker in the result. Stream labels, truncation markers, runner diagnostics, and
+UTF-8 replacement characters may add display bytes beyond the raw capture budget.
+Truncation does not change a plugin's exit status. Timeout handling kills the
+execution process group on Unix and reaps the direct child. These limits are not
+a security sandbox for untrusted executables.
 
 ## Access and current scope
 
@@ -105,9 +116,9 @@ appropriate network policy. Do not expose this unauthenticated server publicly.
 The SQLite database and configuration are separate from installed plugins; the
 server must be able to read configuration/plugins and write its data directory.
 
-This is the first service-monitoring slice ([#1](https://github.com/artran/ragios/issues/1)),
-not the completed fleet runner. Global concurrency limits and bounded output
-capture follow in #2. Problem confirmation, independent host reachability,
+This includes the first service-monitoring slice ([#1](https://github.com/artran/ragios/issues/1))
+and bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)).
+Problem confirmation, independent host reachability,
 reload, history, freshness/overdue assessment, and notifications are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
@@ -119,11 +130,14 @@ just check  # Formatting, type checking, Clippy, and tests
 just test   # Tests only
 ```
 
-Process/HTTP integration tests use temporary YAML, SQLite files, and local shell
-plugins; no live customer endpoints, SMTP servers, or credentials are involved.
-They cover not-yet-checked results, all plugin status codes, literal arguments,
-periodic executions, escaped output, startup validation, timeout/error diagnostics,
-and persisted results observed through HTTP after restarting the application.
+Process/HTTP integration tests require `python3` on `PATH` and use temporary YAML,
+SQLite files, and local shell/Python plugins; no live customer endpoints, SMTP
+servers, or credentials are involved. They cover not-yet-checked results, all
+plugin status codes, literal arguments, inherited environments and Python
+dependencies, periodic executions without overlap or catch-up, global concurrency,
+bounded output, healthy progress under load, escaped output, startup validation,
+timeout/descendant cleanup and error diagnostics, and persisted results observed
+through HTTP after restarting the application.
 
 ## Bundled asset
 

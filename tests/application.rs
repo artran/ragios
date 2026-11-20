@@ -21,6 +21,10 @@ struct Application {
 
 impl Application {
     fn start(config: &Path) -> Self {
+        Self::start_with_env(config, &[])
+    }
+
+    fn start_with_env(config: &Path, environment: &[(&str, &str)]) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(1))
             .no_proxy()
@@ -29,6 +33,7 @@ impl Application {
         let child = Command::new(env!("CARGO_BIN_EXE_ragios"))
             .arg("--config")
             .arg(config)
+            .envs(environment.iter().copied())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -58,6 +63,10 @@ impl Application {
     }
 
     fn page(&mut self, path: &str, expected: &str) -> String {
+        self.page_where(path, expected, |page| page.contains(expected))
+    }
+
+    fn page_where(&mut self, path: &str, expected: &str, matches: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut last = String::new();
         loop {
@@ -65,7 +74,7 @@ impl Application {
             if let Ok(response) = self.client.get(format!("{}{path}", self.url)).send() {
                 assert!(response.status().is_success());
                 last = response.text().unwrap();
-                if last.contains(expected) {
+                if matches(&last) {
                     return last;
                 }
             }
@@ -77,6 +86,14 @@ impl Application {
 
 impl Drop for Application {
     fn drop(&mut self) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(self.child.id() as i32),
+            nix::sys::signal::Signal::SIGINT,
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(logs) = self.logs.take() {
@@ -101,6 +118,200 @@ fn config(dir: &TempDir, extra: &str) -> std::path::PathBuf {
     )
     .unwrap();
     path
+}
+
+fn configure_concurrent_checks(
+    dir: &TempDir,
+    path: &Path,
+    count: usize,
+    allowed: usize,
+    hold: f64,
+) {
+    let executable = dir.path().join("check");
+    fs::write(&executable, include_str!("fixtures/check_concurrency.py")).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let services: Vec<_> = (0..count)
+        .map(|index| {
+            let id = format!("check-{index}");
+            serde_yaml::to_value(serde_yaml::Mapping::from_iter([
+                ("id".into(), id.clone().into()),
+                ("name".into(), id.clone().into()),
+                ("executable".into(), "check".into()),
+                (
+                    "args".into(),
+                    serde_yaml::to_value([
+                        dir.path()
+                            .join("endpoint-state")
+                            .to_str()
+                            .unwrap()
+                            .to_owned(),
+                        id,
+                        allowed.to_string(),
+                        hold.to_string(),
+                    ])
+                    .unwrap(),
+                ),
+            ]))
+            .unwrap()
+        })
+        .collect();
+    let mut services = services;
+    if count > 1 {
+        let other_services = services.split_off(count / 2);
+        let mut other_host = yaml["hosts"][0].clone();
+        other_host["id"] = "other-host".into();
+        other_host["name"] = "Other host".into();
+        other_host["services"] = other_services.into();
+        yaml["hosts"].as_sequence_mut().unwrap().push(other_host);
+    }
+    yaml["hosts"][0]["services"] = services.into();
+    fs::write(path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+}
+
+#[test]
+fn global_concurrency_is_bounded_by_default_and_configured_limits() {
+    for (limits, allowed, count) in [
+        ("", 20, 24),
+        ("max_concurrent_checks: 2\ntimeout_seconds: 3", 2, 6),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, limits);
+        configure_concurrent_checks(&dir, &path, count, allowed, 1.5);
+        let mut app = Application::start(&path);
+        let completed = format!("completed={count} ");
+        let result = app.page_where("/status", "all checks completed", |page| {
+            page.contains(&completed) && !page.contains("Not yet checked")
+        });
+        assert!(!result.contains("exceeded=True"), "{result}");
+        assert!(!result.contains("overlap=True"), "{result}");
+        assert!(!result.contains("Not yet checked"), "{result}");
+        assert_eq!(result.matches("class=\"OK\"").count(), count);
+        assert!(result.contains(&format!("peak={allowed} ")), "{result}");
+    }
+}
+
+#[test]
+fn long_checks_never_overlap_or_catch_up_missed_intervals() {
+    let dir = TempDir::new().unwrap();
+    let path = config(&dir, "interval_seconds: 1");
+    configure_concurrent_checks(&dir, &path, 1, 1, 2.2);
+    let started = Instant::now();
+    let mut app = Application::start(&path);
+    let result = app.page("/status", "completed=2 ");
+    assert!(result.contains("peak=1 overlap=False exceeded=False"));
+    assert!(result.contains("class=\"OK\""));
+    assert!(started.elapsed() >= Duration::from_secs(5));
+    // The next interval is a delay after completion, not queued overdue work.
+    let stable = result.clone();
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(app.page("/status", "completed=2 "), stable);
+}
+
+#[test]
+fn healthy_checks_keep_progressing_alongside_hung_and_endlessly_noisy_plugins() {
+    let dir = TempDir::new().unwrap();
+    plugin(
+        &dir,
+        r#"case "$1" in
+  hung) exec sleep 20;;
+  noisy) exec yes noisy-output;;
+  *)
+    n=0
+    if [ -f "$1" ]; then n=$(cat "$1"); fi
+    n=$((n+1))
+    printf '%s' "$n" > "$1"
+    printf 'healthy iteration %s\n' "$n";;
+esac"#,
+    );
+    let path = config(
+        &dir,
+        "timeout_seconds: 1\ninterval_seconds: 1\nmax_concurrent_checks: 2\nmax_output_bytes: 128",
+    );
+    let mut yaml = fs::read_to_string(&path)
+        .unwrap()
+        .replace("args: []", "args: [hung]");
+    yaml.push_str(&format!(
+        "      - id: noisy\n        name: Noisy\n        executable: check\n        args: [noisy]\n      - id: healthy\n        name: Healthy\n        executable: check\n        args: ['{}']\n",
+        dir.path().join("iterations").display()
+    ));
+    fs::write(&path, yaml).unwrap();
+    let started = Instant::now();
+    let mut app = Application::start(&path);
+    let result = app.page("/status", "healthy iteration 2");
+    assert!(started.elapsed() < Duration::from_secs(7));
+    assert_eq!(result.matches("class=\"UNKNOWN\"").count(), 2);
+    assert_eq!(result.matches("class=\"OK\"").count(), 1);
+    assert!(result.contains("execution timed out after 1 seconds"));
+    assert!(result.contains("[output truncated at 128 bytes]"));
+    assert!(result.len() < 4000, "noisy output must stay bounded");
+}
+
+#[test]
+fn timeout_cleans_descendants_even_after_the_direct_plugin_has_exited() {
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("descendant-ran");
+    plugin(
+        &dir,
+        &format!(
+            r#"if [ "$1" = observer ]; then
+  sleep 2
+  if [ -f '{}' ]; then echo 'descendant leaked'; exit 2; fi
+  echo 'descendants stopped'; exit 0
+fi
+(sleep 2; touch '{}') &
+echo 'direct child finished'
+exit 0"#,
+            marker.display(),
+            marker.display()
+        ),
+    );
+    let path = config(&dir, "timeout_seconds: 1\nmax_concurrent_checks: 1");
+    // The observer needs a longer deadline than the plugin under test. It polls
+    // the marker after restart so both configurations retain the same limits.
+    let started = Instant::now();
+    let mut app = Application::start(&path);
+    let result = app.page("/status", "execution timed out after 1 seconds");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(result.contains("direct child finished"));
+    assert!(result.contains("class=\"UNKNOWN\""));
+    drop(app);
+    let yaml = fs::read_to_string(&path)
+        .unwrap()
+        .replace("timeout_seconds: 1", "timeout_seconds: 5")
+        .replace("args: []", "args: [observer]");
+    fs::write(&path, yaml).unwrap();
+    let mut app = Application::start(&path);
+    let result = app.page("/status", "descendants stopped");
+    assert!(result.contains("class=\"OK\""));
+}
+
+#[test]
+fn installed_python_plugins_keep_their_runtime_dependencies_and_environment() {
+    let dir = TempDir::new().unwrap();
+    let dependency_dir = dir.path().join("installed dependencies");
+    fs::create_dir(&dependency_dir).unwrap();
+    fs::write(
+        dependency_dir.join("probe_dependency.py"),
+        "MESSAGE = 'dependency available'\n",
+    )
+    .unwrap();
+    plugin(&dir, "exit 0");
+    fs::write(dir.path().join("check"), "#!/usr/bin/env python3\nimport os\nfrom probe_dependency import MESSAGE\nprint(MESSAGE + ': ' + os.environ['RAGIOS_TEST_VALUE'])\n").unwrap();
+    let path = config(&dir, "");
+    let mut app = Application::start_with_env(
+        &path,
+        &[
+            ("PYTHONPATH", dependency_dir.to_str().unwrap()),
+            ("RAGIOS_TEST_VALUE", "literal $value with spaces; intact"),
+        ],
+    );
+    let result = app.page(
+        "/status",
+        "dependency available: literal $value with spaces; intact",
+    );
+    assert!(result.contains("class=\"OK\""));
 }
 
 #[test]
@@ -159,6 +370,48 @@ esac"#,
         !injection_marker.exists(),
         "argument was interpreted by a shell"
     );
+}
+
+#[test]
+fn output_exactly_at_the_limit_is_not_marked_as_truncated() {
+    let dir = TempDir::new().unwrap();
+    plugin(&dir, "printf abc\nprintf de >&2");
+    let path = config(&dir, "max_output_bytes: 5");
+    let mut app = Application::start(&path);
+    let result = app.page("/status", "class=\"OK\"");
+    assert!(result.contains("<pre>abc\n[stderr]\nde</pre>"), "{result}");
+    assert!(!result.contains("truncated"));
+}
+
+#[test]
+fn noisy_plugins_complete_with_a_shared_stdout_stderr_capture_limit() {
+    for (limits, expected_bytes) in [("", 65_536), ("max_output_bytes: 1024", 1024)] {
+        let dir = TempDir::new().unwrap();
+        plugin(
+            &dir,
+            "head -c 100000 /dev/zero | tr '\\000' x\nhead -c 100000 /dev/zero | tr '\\000' y >&2\nexit 1",
+        );
+        let config = config(&dir, limits);
+        let mut app = Application::start(&config);
+        let result = app.page("/status", "class=\"WARNING\"");
+        let output = result
+            .split("<pre>")
+            .nth(1)
+            .unwrap()
+            .split("</pre>")
+            .next()
+            .unwrap();
+        let (captured, diagnostic) = output
+            .split_once("\n[output truncated")
+            .expect("truncation must be visible");
+        assert_eq!(
+            captured.matches('x').count() + captured.matches('y').count(),
+            expected_bytes
+        );
+        assert!(diagnostic.contains(&format!("at {expected_bytes} bytes]")));
+        assert!(output.len() <= expected_bytes + 100);
+        assert!(!result.contains("Runner failure"));
+    }
 }
 
 #[test]
@@ -251,6 +504,30 @@ fn invalid_configuration_fails_before_any_plugin_starts() {
         (format!("{valid}\nemail_enabled: true"), "unknown field"),
         (format!("{valid}\ninterval_seconds: 0"), "interval_seconds"),
         (format!("{valid}\ntimeout_seconds: 0"), "timeout_seconds"),
+        (
+            format!("{valid}\nmax_concurrent_checks: 0"),
+            "max_concurrent_checks must be",
+        ),
+        (
+            format!("{valid}\nmax_output_bytes: 0"),
+            "max_output_bytes must be",
+        ),
+        (
+            format!("{valid}\nmax_concurrent_checks: {}", usize::MAX),
+            "max_concurrent_checks must be",
+        ),
+        (
+            format!("{valid}\nmax_output_bytes: {}", usize::MAX),
+            "max_output_bytes must be",
+        ),
+        (
+            format!("{valid}\nmax_concurrent_checks: -1"),
+            "parse configuration",
+        ),
+        (
+            format!("{valid}\nmax_output_bytes: 1.5"),
+            "parse configuration",
+        ),
         (valid.replace("id: local", "id: ''"), "host ID"),
         (
             valid.replace("executable: check", "executable: ''"),

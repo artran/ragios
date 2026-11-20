@@ -8,7 +8,7 @@ use clap::Parser;
 use config::Config;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use store::Store;
-use tokio::{net::TcpListener, task::JoinSet};
+use tokio::{net::TcpListener, sync::Semaphore, task::JoinSet};
 
 #[derive(Parser)]
 #[command(version, about = "Monitor installed service-check plugins from YAML")]
@@ -27,16 +27,30 @@ async fn main() -> Result<()> {
         .await
         .context("bind HTTP listener")?;
     let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+    let executions = Arc::new(Semaphore::new(config.max_concurrent_checks));
     for host in &config.hosts {
         for service in &host.services {
             let host_id = host.id.clone();
             let service = service.clone();
             let config = config.clone();
             let store = store.clone();
+            let executions = executions.clone();
             tasks.spawn(async move {
+                // One loop per check means at most one waiting/running execution
+                // per check, with no interval ticks accumulating behind it.
                 loop {
-                    let result =
-                        runner::execute(&config.plugin_dir, &service, config.timeout_seconds).await;
+                    let permit = executions
+                        .acquire()
+                        .await
+                        .context("execution limiter closed")?;
+                    let result = runner::execute(
+                        &config.plugin_dir,
+                        &service,
+                        config.timeout_seconds,
+                        config.max_output_bytes,
+                    )
+                    .await;
+                    drop(permit);
                     store
                         .save(host_id.clone(), service.id.clone(), result)
                         .await?;
