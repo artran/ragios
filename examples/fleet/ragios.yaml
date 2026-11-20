@@ -1,0 +1,13 @@
+# Run from the repository root after `mkdir -p var`:
+# cargo run --locked -- --config examples/fleet/ragios.yaml
+# All executable/database/include paths are relative to this root YAML file.
+plugin_dir: ../plugins
+database: ../../var/fleet.sqlite3
+interval_seconds: 300
+timeout_seconds: 30
+
+# Routing only; this version does not send notifications.
+recipients: [operations@example.invalid]
+includes:
+  - checks.yaml
+  - hosts.yaml

@@ -45,19 +45,29 @@ is needed. Stop with Ctrl-C.
 ## Configuration
 
 `--config` is required. YAML is file-owned; this version loads it at startup.
-Unknown keys, malformed YAML, empty definitions, duplicate host IDs, duplicate
-service IDs within a host, and invalid intervals/deadlines fail before any
+Unknown keys, malformed YAML, empty definitions, duplicate identities, unknown
+references, invalid overrides, and invalid intervals/deadlines fail before any
 check starts or the database is opened. IDs identify persisted results; display
 names do not.
 
-See [`examples/ragios.yaml`](examples/ragios.yaml). Required settings:
+Fleets can use explicit YAML includes, named commands, reusable service bundles,
+primary host groups, and per-host overrides. Recipient selection is host, then
+group, then global; overrides replace lists rather than merging them. Email
+remains disabled. See [fleet configuration](docs/configuration.md) for the schema,
+precedence rules, and validation, and [`examples/fleet/`](examples/fleet/) for a
+runnable multi-file example.
+
+The inline format in [`examples/ragios.yaml`](examples/ragios.yaml) remains valid.
+Required settings:
 
 - `plugin_dir`: base directory for relative executable paths. Absolute executable
   paths are also allowed. Ragios does not search `PATH` for the executable.
 - `database`: SQLite file in a writable directory that already exists. SQLite's
   adjacent WAL/SHM files also need write access. Keep this file across restarts.
-- `hosts`: hosts with `id`, `name`, and one or more `services`. Each service has
-  `id`, `name`, `executable`, and an optional `args` list.
+- `hosts`: hosts with `id`, `name`, and one or more effective services from
+  `bundles` and/or inline `services`. Each inline service has `id`, `name`, either
+  `executable` or a named `command`, and an optional `args` list. Hosts may instead
+  be declared in explicitly included fragments.
 
 Relative plugin and database paths resolve beside the YAML file, not the current
 working directory. Plugin working directories and environment are inherited from
@@ -147,11 +157,12 @@ appropriate network policy. Do not expose this unauthenticated server publicly.
 The SQLite database and configuration are separate from installed plugins; the
 server must be able to read configuration/plugins and write its data directory.
 
-This includes the first service-monitoring slice ([#1](https://github.com/artran/ragios/issues/1)),
-bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)), and
-problem confirmation ([#3](https://github.com/artran/ragios/issues/3)). Independent
-host reachability, reload, history browsing, freshness/overdue assessment, and
-notifications are later work.
+This includes service monitoring ([#1](https://github.com/artran/ragios/issues/1)),
+bounded plugin execution ([#2](https://github.com/artran/ragios/issues/2)),
+problem confirmation ([#3](https://github.com/artran/ragios/issues/3)), and fleet
+configuration ([#5](https://github.com/artran/ragios/issues/5)). Independent host
+reachability, reload, history browsing, freshness assessment, and notifications
+are later work.
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
 
@@ -173,6 +184,8 @@ through HTTP after restarting the application.
 Lifecycle tests cover mixed-severity failure streaks, interrupted candidate
 changes, immediate recovery, configurable thresholds/retry timing, and persisted
 state and transitions through the store API and rendered dashboard.
+Fleet tests also cover multi-file resolution, command/bundle reuse, primary groups,
+recipient precedence, host overrides, identity collisions, and display-name changes.
 
 ## Bundled asset
 

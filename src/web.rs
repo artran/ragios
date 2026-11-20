@@ -65,58 +65,69 @@ async fn render(dashboard: &Dashboard) -> Result<String, (StatusCode, &'static s
         )
     })?;
     let mut html = String::from(
-        "<div class=\"scroll\"><table><thead><tr><th>Host</th><th>Service</th><th>Latest result</th><th>Confirmed problem</th><th>Pending problem / severity change</th><th>Output</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Duration</th></tr></thead><tbody>",
+        "<div class=\"scroll\"><table><thead><tr><th>Group</th><th>Host</th><th>Service</th><th>Latest result</th><th>Confirmed problem</th><th>Pending problem / severity change</th><th>Output</th><th>Started (UTC)</th><th>Finished (UTC)</th><th>Duration</th></tr></thead><tbody>",
     );
-    for host in &dashboard.config.hosts {
-        for service in &host.services {
-            let _ = write!(
-                html,
-                "<tr><td>{}<br><small>{}</small></td><td>{}<br><small>{}</small></td>",
-                escape(&host.name),
-                escape(&host.id),
-                escape(&service.name),
-                escape(&service.id)
-            );
-            if let Some(state) = latest.get(&(host.id.clone(), service.id.clone())) {
-                let result = &state.result;
-                let label = result.status.label();
-                let _ = write!(html, "<td class=\"{label}\">{label}</td>");
-                if let Some(severity) = state.problem.confirmed_severity {
-                    let label = severity.label();
-                    let _ = write!(
-                        html,
-                        "<td class=\"{label}\">Confirmed problem: {label}</td>"
-                    );
-                } else {
-                    html.push_str("<td>No confirmed problem</td>");
-                }
-                if let Some(severity) = state.problem.pending_severity {
-                    let label = severity.label();
-                    let kind = if state.problem.confirmed_severity.is_some() {
-                        "Pending severity change"
-                    } else {
-                        "Pending problem"
-                    };
-                    let _ = write!(
-                        html,
-                        "<td class=\"{label}\">{kind}: {label} ({}/{})</td>",
-                        state.problem.pending_attempts, dashboard.config.confirmation_attempts
-                    );
-                } else {
-                    html.push_str("<td>No pending problem</td>");
-                }
+    for group in &dashboard.config.groups {
+        for host in dashboard
+            .config
+            .hosts
+            .iter()
+            .filter(|host| host.group == group.id)
+        {
+            for service in &host.services {
                 let _ = write!(
                     html,
-                    "<td><pre>{}</pre></td><td>{}</td><td>{}</td><td>{} ms</td>",
-                    escape(&result.output),
-                    escape(&result.started_at),
-                    escape(&result.finished_at),
-                    result.duration_ms
+                    "<tr><td>{}<br><small>{}</small></td><td>{}<br><small>{}</small></td><td>{}<br><small>{}</small></td>",
+                    escape(&group.name),
+                    escape(&group.id),
+                    escape(&host.name),
+                    escape(&host.id),
+                    escape(&service.name),
+                    escape(&service.id)
                 );
-            } else {
-                html.push_str("<td>Not yet checked</td><td colspan=\"6\">No result available</td>");
+                if let Some(state) = latest.get(&(host.id.clone(), service.id.clone())) {
+                    let result = &state.result;
+                    let label = result.status.label();
+                    let _ = write!(html, "<td class=\"{label}\">{label}</td>");
+                    if let Some(severity) = state.problem.confirmed_severity {
+                        let label = severity.label();
+                        let _ = write!(
+                            html,
+                            "<td class=\"{label}\">Confirmed problem: {label}</td>"
+                        );
+                    } else {
+                        html.push_str("<td>No confirmed problem</td>");
+                    }
+                    if let Some(severity) = state.problem.pending_severity {
+                        let label = severity.label();
+                        let kind = if state.problem.confirmed_severity.is_some() {
+                            "Pending severity change"
+                        } else {
+                            "Pending problem"
+                        };
+                        let _ = write!(
+                            html,
+                            "<td class=\"{label}\">{kind}: {label} ({}/{})</td>",
+                            state.problem.pending_attempts, dashboard.config.confirmation_attempts
+                        );
+                    } else {
+                        html.push_str("<td>No pending problem</td>");
+                    }
+                    let _ = write!(
+                        html,
+                        "<td><pre>{}</pre></td><td>{}</td><td>{}</td><td>{} ms</td>",
+                        escape(&result.output),
+                        escape(&result.started_at),
+                        escape(&result.finished_at),
+                        result.duration_ms
+                    );
+                } else {
+                    html.push_str(
+                        "<td>Not yet checked</td><td colspan=\"6\">No result available</td>",
+                    );
+                }
+                html.push_str("</tr>\n");
             }
-            html.push_str("</tr>\n");
         }
     }
     html.push_str("</tbody></table></div>");

@@ -461,6 +461,144 @@ esac"#,
 }
 
 #[test]
+fn split_fleet_runs_resolved_checks_and_renders_stable_identities_by_primary_group() {
+    let dir = TempDir::new().unwrap();
+    plugin(
+        &dir,
+        "printf 'target=%s port=%s format=%s\\n' \"$1\" \"$2\" \"$3\"\nexit 0",
+    );
+    fs::create_dir(dir.path().join("fleet")).unwrap();
+    fs::write(
+        dir.path().join("fleet/checks.yaml"),
+        r#"
+commands:
+  - {id: probe, executable: check, args: ["{{address}}", "{{port}}", "{{{{.Names}}"]}
+bundles:
+  - id: web
+    services:
+      - {id: https, name: "HTTPS <response>", command: probe}
+groups:
+  - {id: prod, name: "Production <fleet>", recipients: [prod@example.invalid]}
+  - {id: lab, name: Lab}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("fleet/hosts.yaml"),
+        r#"
+hosts:
+  - id: alpha
+    name: Shared display name
+    address: alpha.invalid
+    group: prod
+    bundles: [web]
+    vars: {port: "443"}
+  - id: beta
+    name: Shared display name
+    address: "beta.invalid; $(touch must-not-exist) | <tag>"
+    group: lab
+    bundles: [web]
+    overrides:
+      https:
+        name: Custom HTTPS
+        args: ["{{address}}", "8443", "{{{{.Names}}"]
+"#,
+    )
+    .unwrap();
+    let path = dir.path().join("ragios.yaml");
+    fs::write(&path, "bind: 127.0.0.1:0\nplugin_dir: .\ndatabase: state.sqlite3\nrecipients: [global@example.invalid]\nincludes: [fleet/checks.yaml, fleet/hosts.yaml]\n").unwrap();
+    let mut app = Application::start(&path);
+    app.page("/status", "target=alpha.invalid port=443");
+    let fragment = app.page("/status", "port=8443");
+    assert!(fragment.contains("<th>Group</th>"));
+    assert!(fragment.contains("Production &lt;fleet&gt;"));
+    assert!(fragment.contains("<small>prod</small>"));
+    assert!(fragment.contains("<small>lab</small>"));
+    assert!(fragment.contains("<small>alpha</small>"));
+    assert!(fragment.contains("<small>beta</small>"));
+    assert_eq!(fragment.matches("<small>https</small>").count(), 2);
+    assert!(fragment.contains("HTTPS &lt;response&gt;"));
+    assert!(fragment.contains("Custom HTTPS"));
+    assert_eq!(fragment.matches("format={{.Names}}").count(), 2);
+    assert!(
+        fragment.contains("target=beta.invalid; $(touch must-not-exist) | &lt;tag&gt; port=8443")
+    );
+    assert_eq!(fragment.matches("class=\"OK\"").count(), 2);
+    drop(app);
+
+    // Display names and include layout may change without losing persisted identities.
+    let hosts = dir.path().join("fleet/hosts.yaml");
+    let yaml = fs::read_to_string(&hosts)
+        .unwrap()
+        .replace("Shared display name", "Renamed host");
+    fs::write(hosts, yaml).unwrap();
+    let gate = dir.path().join("release");
+    plugin(
+        &dir,
+        &format!(
+            "while [ ! -f '{}' ]; do [ -d '{}' ] || exit 3; sleep 0.02; done\nprintf 'new result\\n'",
+            gate.display(),
+            dir.path().display()
+        ),
+    );
+    let mut restarted = Application::start(&path);
+    let restored = restarted.page("/status", "target=alpha.invalid port=443");
+    assert!(restored.contains("Renamed host"));
+    assert!(restored.contains("port=8443"));
+    fs::write(gate, "").unwrap();
+    restarted.page("/status", "new result");
+}
+
+#[test]
+fn host_overrides_control_the_actual_execution_deadline_and_repeat_interval() {
+    let dir = TempDir::new().unwrap();
+    plugin(
+        &dir,
+        r#"counter="$1"
+n=0
+if [ -f "$counter" ]; then n=$(cat "$counter"); fi
+printf '%s' "$((n+1))" > "$counter"
+printf 'fleet iteration %s\n' "$n"
+exec sleep 20"#,
+    );
+    let path = dir.path().join("ragios.yaml");
+    let yaml = r#"
+bind: 127.0.0.1:0
+plugin_dir: .
+database: state.sqlite3
+interval_seconds: 300
+timeout_seconds: 30
+# Confirm the timeout immediately so repeats use the normal interval.
+confirmation_attempts: 1
+bundles:
+  - id: basic
+    services:
+      - {id: health, name: Health, executable: check}
+hosts:
+  - id: target
+    name: Target
+    bundles: [basic]
+    vars: {counter: '__COUNTER__'}
+    overrides:
+      health:
+        args: ['{{counter}}']
+        interval_seconds: 1
+        timeout_seconds: 1
+"#;
+    fs::write(
+        &path,
+        yaml.replace("__COUNTER__", dir.path().join("counter").to_str().unwrap()),
+    )
+    .unwrap();
+    let mut app = Application::start(&path);
+    let first = app.page("/status", "execution timed out after 1 seconds");
+    assert!(first.contains("fleet iteration 0"));
+    let repeated = app.page("/status", "fleet iteration 1");
+    assert!(repeated.contains("execution timed out after 1 seconds"));
+    assert!(repeated.contains("class=\"UNKNOWN\""));
+}
+
+#[test]
 fn operating_system_assigned_listener_serves_the_configured_check() {
     let dir = TempDir::new().unwrap();
     plugin(&dir, "printf 'ephemeral listener works\\n'\nexit 0");
@@ -689,6 +827,24 @@ fn invalid_configuration_fails_before_any_plugin_starts() {
         (
             format!("{valid}\nconfirmation_attempts: 4294967296"),
             "confirmation_attempts",
+        ),
+        (
+            valid.replace(
+                "    name: Local host",
+                "    name: Local host\n    group: absent",
+            ),
+            "unknown group",
+        ),
+        (
+            valid.replace(
+                "    name: Local host",
+                "    name: Local host\n    overrides: {absent: {args: []}}",
+            ),
+            "override refers to unknown service",
+        ),
+        (
+            valid.replace("        executable: check", "        command: absent"),
+            "unknown command",
         ),
         (valid.replace("id: local", "id: ''"), "host ID"),
         (

@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
                     let result = runner::execute(
                         &config.plugin_dir,
                         &service,
-                        config.timeout_seconds,
+                        service.timeout_seconds,
                         config.max_output_bytes,
                     )
                     .await;
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
                     let delay = if problem.needs_retry() {
                         config.retry_interval_seconds
                     } else {
-                        config.interval_seconds
+                        service.interval_seconds
                     };
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                 }

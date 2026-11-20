@@ -1,0 +1,20 @@
+# This is a local demonstration command, not a real remote probe.
+commands:
+  - id: demo-probe
+    executable: check_example
+    args: ["--target", "{{address}}", "--port", "{{port}}"]
+
+bundles:
+  - id: web
+    services:
+      - id: https
+        name: HTTPS response
+        command: demo-probe
+
+# Groups organise hosts and route recipients; they do not assign services.
+groups:
+  - id: production
+    name: Production
+    recipients: [production@example.invalid]
+  - id: lab
+    name: Lab

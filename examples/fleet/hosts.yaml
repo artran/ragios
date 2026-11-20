@@ -1,0 +1,28 @@
+hosts:
+  - id: web-01
+    name: Primary website
+    address: web-01.example.invalid
+    group: production
+    bundles: [web]
+    vars: {port: "443"}
+
+  - id: web-02
+    name: Secondary website
+    address: web-02.example.invalid
+    group: production
+    bundles: [web]
+    recipients: [website-owner@example.invalid]
+    overrides:
+      https:
+        args: ["--target", "{{address}}", "--port", "8443"]
+        interval_seconds: 60
+        timeout_seconds: 10
+
+  - id: lab-01
+    name: Lab website
+    address: lab-01.example.invalid
+    group: lab
+    bundles: [web]
+    vars: {port: "443"}
+    # Explicitly disable recipient selection for this host.
+    recipients: []

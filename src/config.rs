@@ -1,49 +1,103 @@
+mod source;
+#[cfg(test)]
+mod tests;
+
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    #[serde(default = "default_bind")]
     pub bind: SocketAddr,
     pub plugin_dir: PathBuf,
     pub database: PathBuf,
-    #[serde(default = "default_interval")]
     pub interval_seconds: u64,
-    #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
-    #[serde(default = "default_max_concurrent_checks")]
     pub max_concurrent_checks: usize,
-    #[serde(default = "default_max_output_bytes")]
     pub max_output_bytes: usize,
-    #[serde(default = "default_retry_interval")]
     pub retry_interval_seconds: u64,
-    #[serde(default = "default_confirmation_attempts")]
     pub confirmation_attempts: u32,
     pub hosts: Vec<Host>,
+    pub groups: Vec<HostGroup>,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Host {
     pub id: String,
     pub name: String,
+    pub group: String,
+    pub recipients: Vec<String>,
     pub services: Vec<Service>,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostGroup {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Service {
     pub id: String,
     pub name: String,
     pub executable: PathBuf,
-    #[serde(default)]
     pub args: Vec<String>,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+}
+
+fn index<'a, T>(
+    items: &'a [T],
+    identity: impl Fn(&T) -> (&String, &Path),
+    kind: &str,
+) -> Result<BTreeMap<&'a str, &'a T>> {
+    let mut result = BTreeMap::new();
+    for item in items {
+        let (key, source) = identity(item);
+        ensure!(
+            !key.trim().is_empty(),
+            "{kind} ID must not be empty (in {})",
+            source.display()
+        );
+        if let Some(previous) = result.insert(key.as_str(), item) {
+            anyhow::bail!(
+                "duplicate {kind} ID {key:?} in {} and {}",
+                identity(previous).1.display(),
+                source.display()
+            );
+        }
+    }
+    Ok(result)
+}
+
+// Substitute each token once, into one argument. Values are never parsed again or shell-evaluated.
+fn expand(arg: &str, host: &source::Host) -> Result<String> {
+    let mut rest = arg;
+    let mut output = String::new();
+    while let Some((prefix, token)) = rest.split_once("{{") {
+        output.push_str(prefix);
+        if let Some(suffix) = token.strip_prefix("{{") {
+            output.push_str("{{");
+            rest = suffix;
+            continue;
+        }
+        let (key, suffix) = token
+            .split_once("}}")
+            .context("unclosed argument placeholder")?;
+        let value = match key {
+            "host_id" => Some(&host.id),
+            "address" => host.address.as_ref(),
+            _ => host.vars.get(key),
+        }
+        .with_context(|| format!("unknown or unset argument placeholder {key:?}"))?;
+        output.push_str(value);
+        rest = suffix;
+    }
+    output.push_str(rest);
+    Ok(output)
 }
 
 fn default_bind() -> SocketAddr {
@@ -55,117 +109,215 @@ fn default_interval() -> u64 {
 fn default_timeout() -> u64 {
     30
 }
-fn default_max_concurrent_checks() -> usize {
-    20
-}
-fn default_max_output_bytes() -> usize {
-    64 * 1024
-}
-fn default_retry_interval() -> u64 {
-    60
-}
-fn default_confirmation_attempts() -> u32 {
-    3
-}
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read configuration {}", path.display()))?;
-        let mut config: Self = serde_yaml::from_str(&text)
+        let mut file: source::File = serde_yaml::from_str(&text)
             .with_context(|| format!("parse configuration {}", path.display()))?;
-        config
-            .validate()
-            .with_context(|| format!("validate configuration {}", path.display()))?;
+        source::locate(
+            path,
+            &mut file.commands,
+            &mut file.bundles,
+            &mut file.groups,
+            &mut file.hosts,
+        );
         let base = path.parent().unwrap_or(Path::new("."));
+        let mut included = HashSet::from([std::fs::canonicalize(path)?]);
+        for include in &file.includes {
+            ensure!(
+                !include.as_os_str().is_empty(),
+                "include path must not be empty"
+            );
+            let include = base.join(include);
+            let canonical = std::fs::canonicalize(&include)
+                .with_context(|| format!("read included configuration {}", include.display()))?;
+            ensure!(
+                included.insert(canonical),
+                "repeated included configuration {}",
+                include.display()
+            );
+            let text = std::fs::read_to_string(&include)
+                .with_context(|| format!("read included configuration {}", include.display()))?;
+            let mut fragment: source::Fragment = serde_yaml::from_str(&text)
+                .with_context(|| format!("parse included configuration {}", include.display()))?;
+            source::locate(
+                &include,
+                &mut fragment.commands,
+                &mut fragment.bundles,
+                &mut fragment.groups,
+                &mut fragment.hosts,
+            );
+            file.commands.extend(fragment.commands);
+            file.bundles.extend(fragment.bundles);
+            file.hosts.extend(fragment.hosts);
+            file.groups.extend(fragment.groups);
+        }
+        let mut config = Self::resolve(&file)
+            .with_context(|| format!("resolve configuration {}", path.display()))?;
         config.plugin_dir = base.join(&config.plugin_dir);
         config.database = base.join(&config.database);
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.plugin_dir.as_os_str().is_empty(),
-            "plugin_dir must not be empty"
-        );
-        ensure!(
-            !self.database.as_os_str().is_empty(),
-            "database must not be empty"
-        );
-        ensure!(
-            (1..=u32::MAX as u64).contains(&self.interval_seconds),
-            "interval_seconds must be between 1 and {}",
-            u32::MAX
-        );
-        ensure!(
-            (1..=u32::MAX as u64).contains(&self.timeout_seconds),
-            "timeout_seconds must be between 1 and {}",
-            u32::MAX
-        );
-        ensure!(
-            (1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&self.max_concurrent_checks),
-            "max_concurrent_checks must be between 1 and {}",
-            tokio::sync::Semaphore::MAX_PERMITS
-        );
-        ensure!(
-            (1..=isize::MAX as usize).contains(&self.max_output_bytes),
-            "max_output_bytes must be between 1 and {}",
-            isize::MAX
-        );
-        ensure!(
-            (1..=u32::MAX as u64).contains(&self.retry_interval_seconds),
-            "retry_interval_seconds must be between 1 and {}",
-            u32::MAX
-        );
-        ensure!(
-            self.confirmation_attempts > 0,
-            "confirmation_attempts must be positive"
-        );
-        ensure!(
-            !self.hosts.is_empty(),
-            "hosts must contain at least one host"
-        );
-        let mut hosts = HashSet::new();
-        for host in &self.hosts {
-            ensure!(!host.id.trim().is_empty(), "host ID must not be empty");
-            ensure!(hosts.insert(&host.id), "duplicate host ID {:?}", host.id);
-            ensure!(
-                !host.name.trim().is_empty(),
-                "host {:?}: name must not be empty",
-                host.id
-            );
-            ensure!(
-                !host.services.is_empty(),
-                "host {:?}: services must not be empty",
-                host.id
-            );
-            let mut services = HashSet::new();
-            for service in &host.services {
-                ensure!(
-                    !service.id.trim().is_empty(),
-                    "host {:?}: service ID must not be empty",
-                    host.id
-                );
-                ensure!(
-                    services.insert(&service.id),
-                    "host {:?}: duplicate service ID {:?}",
-                    host.id,
-                    service.id
-                );
-                ensure!(
-                    !service.name.trim().is_empty(),
-                    "service {:?}/{:?}: name must not be empty",
-                    host.id,
-                    service.id
-                );
-                ensure!(
-                    !service.executable.as_os_str().is_empty(),
-                    "service {:?}/{:?}: executable must not be empty",
-                    host.id,
-                    service.id
-                );
-            }
+    fn resolve(file: &source::File) -> Result<Self> {
+        let resolver = Resolver {
+            file,
+            commands: index(&file.commands, |c| (&c.id, c.source.as_path()), "command")?,
+            bundles: index(&file.bundles, |b| (&b.id, b.source.as_path()), "bundle")?,
+            groups: index(&file.groups, |g| (&g.id, g.source.as_path()), "group")?,
+        };
+        file.validate(&resolver.commands)?;
+        let hosts = file
+            .hosts
+            .iter()
+            .map(|host| {
+                resolver
+                    .host(host)
+                    .with_context(|| format!("host {:?} in {}", host.id, host.source.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut groups: Vec<_> = file
+            .groups
+            .iter()
+            .map(|group| HostGroup {
+                id: group.id.clone(),
+                name: group.name.clone(),
+            })
+            .collect();
+        if file.hosts.iter().any(|host| host.group.is_none()) {
+            groups.push(HostGroup {
+                id: "ungrouped".into(),
+                name: "Ungrouped".into(),
+            });
         }
-        Ok(())
+        Ok(Self {
+            bind: file.bind,
+            plugin_dir: file.plugin_dir.clone(),
+            database: file.database.clone(),
+            interval_seconds: file.interval_seconds,
+            timeout_seconds: file.timeout_seconds,
+            max_concurrent_checks: file.max_concurrent_checks,
+            max_output_bytes: file.max_output_bytes,
+            retry_interval_seconds: file.retry_interval_seconds,
+            confirmation_attempts: file.confirmation_attempts,
+            hosts,
+            groups,
+        })
+    }
+}
+
+// Raw definitions stay behind this boundary. Runtime consumers see only concrete checks and routing.
+struct Resolver<'a> {
+    file: &'a source::File,
+    commands: BTreeMap<&'a str, &'a source::Command>,
+    bundles: BTreeMap<&'a str, &'a source::Bundle>,
+    groups: BTreeMap<&'a str, &'a source::Group>,
+}
+
+impl Resolver<'_> {
+    fn host(&self, host: &source::Host) -> Result<Host> {
+        let group = host
+            .group
+            .as_ref()
+            .map(|id| {
+                self.groups
+                    .get(id.as_str())
+                    .copied()
+                    .with_context(|| format!("unknown group {id:?}"))
+            })
+            .transpose()?;
+        let recipients = host
+            .recipients
+            .as_ref()
+            .or_else(|| group.and_then(|g| g.recipients.as_ref()))
+            .unwrap_or(&self.file.recipients)
+            .clone();
+        let mut definitions = Vec::new();
+        for id in &host.bundles {
+            let bundle = self
+                .bundles
+                .get(id.as_str())
+                .with_context(|| format!("unknown bundle {id:?}"))?;
+            definitions.extend(&bundle.services);
+        }
+        definitions.extend(&host.services);
+        ensure!(!definitions.is_empty(), "services must not be empty");
+        let identities = index(&definitions, |s| (&s.id, s.source.as_path()), "service")?;
+        for id in host.overrides.keys() {
+            ensure!(
+                identities.contains_key(id.as_str()),
+                "override refers to unknown service {id:?}"
+            );
+        }
+        let services = definitions
+            .into_iter()
+            .map(|service| {
+                self.service(host, service).with_context(|| {
+                    format!("service {:?} in {}", service.id, service.source.display())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Host {
+            id: host.id.clone(),
+            name: host.name.clone(),
+            group: host.group.clone().unwrap_or_else(|| "ungrouped".into()),
+            recipients,
+            services,
+        })
+    }
+
+    fn service(&self, host: &source::Host, service: &source::Service) -> Result<Service> {
+        let overrides = host.overrides.get(&service.id);
+        // Source validation guarantees one executable source and valid command references.
+        let command = service
+            .command
+            .as_ref()
+            .map(|id| self.commands[id.as_str()]);
+        let executable = service
+            .executable
+            .clone()
+            .unwrap_or_else(|| command.unwrap().executable.clone());
+        let (args, origin): (&[String], String) =
+            if let Some(args) = overrides.and_then(|o| o.args.as_ref()) {
+                (args, format!("host override in {}", host.source.display()))
+            } else if let Some(args) = &service.args {
+                (
+                    args,
+                    format!("service {:?} in {}", service.id, service.source.display()),
+                )
+            } else if let Some(command) = command {
+                (
+                    &command.args,
+                    format!("command {:?} in {}", command.id, command.source.display()),
+                )
+            } else {
+                (&[], String::new())
+            };
+        let args = args
+            .iter()
+            .map(|arg| expand(arg, host))
+            .collect::<Result<Vec<_>>>()
+            .with_context(|| format!("arguments from {origin}"))?;
+        Ok(Service {
+            id: service.id.clone(),
+            name: overrides
+                .and_then(|o| o.name.as_ref())
+                .unwrap_or(&service.name)
+                .clone(),
+            executable,
+            args,
+            interval_seconds: overrides
+                .and_then(|o| o.interval_seconds)
+                .or(service.interval_seconds)
+                .or(host.interval_seconds)
+                .unwrap_or(self.file.interval_seconds),
+            timeout_seconds: overrides
+                .and_then(|o| o.timeout_seconds)
+                .or(service.timeout_seconds)
+                .or(host.timeout_seconds)
+                .unwrap_or(self.file.timeout_seconds),
+        })
     }
 }
