@@ -74,7 +74,11 @@ pub struct CheckResult {
 impl CheckResult {
     /// When the execution finished, if its stored timestamp is readable.
     pub fn finished(&self) -> Option<DateTime<Utc>> {
-        DateTime::parse_from_rfc3339(&self.finished_at)
+        Self::parse_finished_at(&self.finished_at)
+    }
+
+    pub(crate) fn parse_finished_at(finished_at: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(finished_at)
             .ok()
             .map(|finished| finished.to_utc())
     }

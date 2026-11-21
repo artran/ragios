@@ -3,7 +3,10 @@ mod notifications;
 mod schema;
 mod silences;
 
-pub use browsing::{CheckPath, CheckSnapshot, NotificationSnapshot, NotificationSuppression};
+pub use browsing::{
+    CheckDefinition, CheckDetailSnapshot, CheckId, CheckSnapshot, NotificationSnapshot,
+    NotificationSuppression,
+};
 
 pub use notifications::{DeliveryOutcome, Notification};
 pub use silences::{CreateSilence, Silence, SilenceScope};
@@ -45,8 +48,12 @@ impl HostState {
     /// Eligibility for host-down notification suppression. Neither an
     /// unconfirmed failure nor confirmed undetermined reachability qualifies.
     pub fn is_confirmed_down(&self) -> bool {
-        self.problem.confirmed_severity == Some(Status::Critical)
+        is_confirmed_down(self.problem.confirmed_severity)
     }
+}
+
+fn is_confirmed_down(severity: Option<Status>) -> bool {
+    severity == Some(Status::Critical)
 }
 
 pub struct CheckState {

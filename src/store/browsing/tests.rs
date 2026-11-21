@@ -1,4 +1,4 @@
-use super::{CheckPath, CheckSnapshot, NotificationSuppression, Store};
+use super::{CheckDetailSnapshot, CheckId, NotificationSuppression, Store};
 use crate::{
     config::{Config, Probe, ReachabilityCheck},
     runner::{CheckResult, Status},
@@ -83,12 +83,29 @@ async fn save(store: &Store, status: Status, output: &str) {
         .unwrap();
 }
 
-fn service_path() -> Option<CheckPath> {
-    Some(CheckPath::Service("host".into(), "service".into()))
+fn service_id() -> CheckId {
+    CheckId::Service {
+        host_id: "host".into(),
+        service_id: "service".into(),
+    }
 }
 
-fn service(snapshot: &CheckSnapshot) -> &CheckState {
-    &snapshot.services[&("host".into(), "service".into())]
+fn service(snapshot: &CheckDetailSnapshot) -> &CheckState {
+    snapshot.state.as_ref().unwrap()
+}
+
+async fn pause_detail(
+    store: &Store,
+    active: watch::Receiver<Arc<Config>>,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<Option<CheckDetailSnapshot>>>,
+    mpsc::Sender<()>,
+) {
+    let (reached, resume) = pause_before_read(store, "check_transitions");
+    let store = store.clone();
+    let browsing = tokio::spawn(async move { store.browse_check(active, service_id()).await });
+    tokio::time::timeout(LIMIT, reached).await.unwrap().unwrap();
+    (browsing, resume)
 }
 
 #[tokio::test]
@@ -99,7 +116,11 @@ async fn detail_does_not_mix_state_and_history_across_a_check_result_commit() {
     let writer = Store::open(&config.database).unwrap();
     let (_published, active) = watch::channel(Arc::new(config));
     save(&writer, Status::Critical, "failed").await;
-    let before = reader.browse_checks(active.clone(), None).await.unwrap();
+    let before = reader
+        .browse_check(active.clone(), service_id())
+        .await
+        .unwrap()
+        .unwrap();
     let token = service(&before).episode.as_ref().unwrap().token.clone();
     assert!(matches!(
         writer
@@ -109,14 +130,11 @@ async fn detail_does_not_mix_state_and_history_across_a_check_result_commit() {
         AcknowledgeOutcome::Acknowledged
     ));
 
-    let (reached, resume) = pause_before_read(&reader, "check_transitions");
-    let next = reader.clone();
-    let browsing = tokio::spawn(async move { next.browse_checks(active, service_path()).await });
-    tokio::time::timeout(LIMIT, reached).await.unwrap().unwrap();
+    let (browsing, resume) = pause_detail(&reader, active).await;
     save(&writer, Status::Ok, "recovered").await;
     resume.send(()).unwrap();
 
-    let detail = browsing.await.unwrap().unwrap();
+    let detail = browsing.await.unwrap().unwrap().unwrap();
     assert_eq!(service(&detail).result.output, "failed");
     assert_eq!(
         service(&detail).problem.confirmed_severity,
@@ -144,9 +162,7 @@ async fn detail_retries_if_configuration_is_published_during_the_history_read() 
     let (published, active) = watch::channel(Arc::new(original));
     save(&writer, Status::Critical, "old check result").await;
 
-    let (reached, resume) = pause_before_read(&reader, "check_transitions");
-    let browsing = tokio::spawn(async move { reader.browse_checks(active, service_path()).await });
-    tokio::time::timeout(LIMIT, reached).await.unwrap().unwrap();
+    let (browsing, resume) = pause_detail(&reader, active).await;
     writer
         .publish_notification_config(Arc::new(replacement), published)
         .await
@@ -154,8 +170,8 @@ async fn detail_retries_if_configuration_is_published_during_the_history_read() 
     save(&writer, Status::Ok, "reloaded check result").await;
     resume.send(()).unwrap();
 
-    let detail = browsing.await.unwrap().unwrap();
-    assert_eq!(detail.config.hosts[0].name, "Reloaded Host");
+    let detail = browsing.await.unwrap().unwrap().unwrap();
+    assert_eq!(detail.definition().0.name, "Reloaded Host");
     assert_eq!(service(&detail).result.output, "reloaded check result");
     assert_eq!(
         detail.transitions.last().unwrap().kind,

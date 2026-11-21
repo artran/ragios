@@ -15,9 +15,9 @@ use ragios::{
     runner::{CheckResult, Reachability, Status},
     schedule::{self, Freshness},
     store::{
-        AcknowledgeOutcome, CheckPath, CheckSnapshot, NotificationSnapshot,
-        NotificationSuppression, ProblemEpisode, ProblemState, Store, TRANSITION_RETENTION,
-        Transition, TransitionKind,
+        AcknowledgeOutcome, CheckDefinition, CheckDetailSnapshot, CheckId, CheckSnapshot,
+        NotificationSnapshot, NotificationSuppression, ProblemEpisode, ProblemState, Store,
+        TRANSITION_RETENTION, Transition, TransitionKind,
     },
 };
 use serde::Deserialize;
@@ -229,12 +229,12 @@ label{{display:grid;gap:.25rem}}select,button{{font:inherit;padding:.3rem}}
 }
 
 async fn page(State(dashboard): State<Dashboard>, Query(filters): Query<Filters>) -> WebResult {
-    let snapshot = snapshot(&dashboard, None).await?;
-    let fragment = overview(&snapshot, &filters);
+    let checks = load_checks(&dashboard, None).await?;
+    let fragment = overview(&Snapshot::new(&dashboard, &checks), &filters);
     let mut form = String::from(
         r##"<form id="filters" action="/" method="get" hx-get="/status" hx-target="#status" hx-trigger="change, submit" hx-sync="this:replace"><label>Host group <select name="group"><option value="">All groups</option>"##,
     );
-    for group in &snapshot.checks.config.groups {
+    for group in &checks.config.groups {
         let _ = write!(
             form,
             r#"<option value="{}"{}>{}</option>"#,
@@ -277,7 +277,8 @@ async fn status(
     Query(filters): Query<Filters>,
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
-    let fragment = overview(&snapshot(&dashboard, None).await?, &filters);
+    let checks = load_checks(&dashboard, None).await?;
+    let fragment = overview(&Snapshot::new(&dashboard, &checks), &filters);
     let mut response = Html(fragment).into_response();
     // A filter change keeps the address bar shareable; polling leaves it alone.
     if headers.get("hx-trigger").is_some_and(|id| id == "filters")
@@ -388,28 +389,31 @@ fn load_error(error: anyhow::Error) -> WebError {
     )
 }
 
-struct Snapshot {
-    checks: CheckSnapshot,
+struct Snapshot<'a> {
+    checks: &'a CheckSnapshot,
     // Live observation, not part of the durable snapshot.
     scheduler: SchedulerStatus,
     now: DateTime<Utc>,
 }
 
-impl Snapshot {
+impl<'a> Snapshot<'a> {
+    fn new(dashboard: &Dashboard, checks: &'a CheckSnapshot) -> Self {
+        Self {
+            checks,
+            scheduler: dashboard.scheduler.borrow().clone(),
+            now: Utc::now(),
+        }
+    }
+
     fn host(&self, id: &str) -> Option<&Host> {
         self.checks.config.hosts.iter().find(|host| host.id == id)
     }
 
-    fn freshness(
-        &self,
-        key: &Key,
-        check: &Check,
-        state: Option<(&CheckResult, ProblemState)>,
-    ) -> Freshness {
-        schedule::freshness(
+    fn freshness(&self, key: &Key, check: &Check) -> Freshness {
+        schedule::freshness_from_timing(
             check,
             self.checks.config.retry_interval_seconds,
-            state,
+            self.checks.timings.get(key).copied(),
             self.scheduler.unchecked_since.get(key).copied(),
             self.now,
         )
@@ -419,16 +423,12 @@ impl Snapshot {
         let mut count = 0;
         for host in &self.checks.config.hosts {
             if let Some(probe) = &host.reachability {
-                let state = self.checks.hosts.get(&host.id);
-                let state = state.map(|state| (&state.result, state.problem));
-                let freshness = self.freshness(&reachability_key(host), &probe.check, state);
+                let freshness = self.freshness(&reachability_key(host), &probe.check);
                 count += usize::from(freshness.is_overdue());
             }
             for service in &host.services {
                 let key = service_key(host, service);
-                let state = self.checks.services.get(&key);
-                let state = state.map(|state| (&state.result, state.problem));
-                count += usize::from(self.freshness(&key, &service.check, state).is_overdue());
+                count += usize::from(self.freshness(&key, &service.check).is_overdue());
             }
         }
         count
@@ -484,17 +484,15 @@ fn alerts(snapshot: &Snapshot) -> String {
     html
 }
 
-async fn snapshot(dashboard: &Dashboard, history: Option<CheckPath>) -> Result<Snapshot, WebError> {
-    let checks = dashboard
+async fn load_checks(
+    dashboard: &Dashboard,
+    host_id: Option<String>,
+) -> Result<CheckSnapshot, WebError> {
+    dashboard
         .store
-        .browse_checks(dashboard.config.clone(), history)
+        .browse_checks(dashboard.config.clone(), host_id)
         .await
-        .map_err(load_error)?;
-    Ok(Snapshot {
-        checks,
-        scheduler: dashboard.scheduler.borrow().clone(),
-        now: Utc::now(),
-    })
+        .map_err(load_error)
 }
 
 fn overview(snapshot: &Snapshot, filters: &Filters) -> String {
@@ -526,7 +524,7 @@ fn checks_table(
         services,
         hosts,
         ..
-    } = &snapshot.checks;
+    } = snapshot.checks;
     let mut rows = String::new();
     for group in &config.groups {
         for host in config
@@ -551,7 +549,7 @@ fn checks_table(
                         &mut rows,
                         state,
                         episode,
-                        snapshot.freshness(&reachability_key(host), &probe.check, state),
+                        snapshot.freshness(&reachability_key(host), &probe.check),
                         CheckDisplay::Reachability(
                             hosts.get(&host.id).map_or(probe.probe, |state| state.probe),
                         ),
@@ -577,7 +575,7 @@ fn checks_table(
                         &mut rows,
                         state,
                         episode,
-                        snapshot.freshness(&key, &service.check, state),
+                        snapshot.freshness(&key, &service.check),
                         CheckDisplay::Service,
                         config.confirmation_attempts,
                     );
@@ -796,7 +794,8 @@ async fn host_page(
     State(dashboard): State<Dashboard>,
     Path(host_id): Path<String>,
 ) -> Result<Response, WebError> {
-    let snapshot = snapshot(&dashboard, None).await?;
+    let checks = load_checks(&dashboard, Some(host_id.clone())).await?;
+    let snapshot = Snapshot::new(&dashboard, &checks);
     let Some(host) = snapshot.host(&host_id) else {
         return Ok(not_configured("host"));
     };
@@ -813,7 +812,8 @@ async fn host_status(
     State(dashboard): State<Dashboard>,
     Path(host_id): Path<String>,
 ) -> Result<Response, WebError> {
-    let snapshot = snapshot(&dashboard, None).await?;
+    let checks = load_checks(&dashboard, Some(host_id.clone())).await?;
+    let snapshot = Snapshot::new(&dashboard, &checks);
     Ok(match snapshot.host(&host_id) {
         Some(host) => Html(host_checks(&snapshot, host)).into_response(),
         None => not_configured("host"),
@@ -841,45 +841,40 @@ struct CheckDetail<'a> {
     state: Option<(&'a CheckResult, ProblemState)>,
     episode: Option<&'a ProblemEpisode>,
     freshness: Freshness,
+    transitions: &'a [Transition],
 }
 
 impl<'a> CheckDetail<'a> {
-    fn service(snapshot: &'a Snapshot, host_id: &str, service_id: &str) -> Option<Self> {
-        let host = snapshot.host(host_id)?;
-        let service = host
-            .services
-            .iter()
-            .find(|service| service.id == service_id)?;
-        let key = service_key(host, service);
-        let saved = snapshot.checks.services.get(&key);
-        let state = saved.map(|state| (&state.result, state.problem));
-        Some(Self {
+    fn new(snapshot: &Snapshot, detail: &'a CheckDetailSnapshot) -> Self {
+        let (host, definition) = detail.definition();
+        let (name, subtitle, url, display, freshness) = match definition {
+            CheckDefinition::Service(service) => (
+                service.name.as_str(),
+                service.id.clone(),
+                service_url(host, service),
+                CheckDisplay::Service,
+                snapshot.freshness(&service_key(host, service), &service.check),
+            ),
+            CheckDefinition::Reachability(probe) => (
+                "Host reachability",
+                format!("Configured probe: {}", probe.probe.label()),
+                reachability_url(host),
+                CheckDisplay::Reachability(detail.observed_probe.unwrap_or(probe.probe)),
+                snapshot.freshness(&reachability_key(host), &probe.check),
+            ),
+        };
+        let saved = detail.state.as_ref();
+        Self {
             host,
-            name: &service.name,
-            subtitle: service.id.clone(),
-            url: service_url(host, service),
-            display: CheckDisplay::Service,
-            state,
+            name,
+            subtitle,
+            url,
+            display,
+            freshness,
+            state: saved.map(|state| (&state.result, state.problem)),
             episode: saved.and_then(|state| state.episode.as_ref()),
-            freshness: snapshot.freshness(&key, &service.check, state),
-        })
-    }
-
-    fn reachability(snapshot: &'a Snapshot, host_id: &str) -> Option<Self> {
-        let host = snapshot.host(host_id)?;
-        let probe = host.reachability.as_ref()?;
-        let saved = snapshot.checks.hosts.get(&host.id);
-        let state = saved.map(|state| (&state.result, state.problem));
-        Some(Self {
-            host,
-            name: "Host reachability",
-            subtitle: format!("Configured probe: {}", probe.probe.label()),
-            url: reachability_url(host),
-            display: CheckDisplay::Reachability(saved.map_or(probe.probe, |state| state.probe)),
-            state,
-            episode: saved.and_then(|state| state.episode.as_ref()),
-            freshness: snapshot.freshness(&reachability_key(host), &probe.check, state),
-        })
+            transitions: &detail.transitions,
+        }
     }
 
     fn heading(&self) -> String {
@@ -894,7 +889,7 @@ impl<'a> CheckDetail<'a> {
     }
 
     fn fragment(&self, snapshot: &Snapshot, csrf: &str) -> String {
-        let transitions = &snapshot.checks.transitions;
+        let transitions = self.transitions;
         let confirmation_attempts = snapshot.checks.config.confirmation_attempts;
         let mut html = alerts(snapshot);
         html.push_str("<h2>Current state</h2><table class=\"facts\"><tbody>");
@@ -994,17 +989,19 @@ fn age(result: &CheckResult, now: DateTime<Utc>) -> String {
 
 async fn check_detail(
     dashboard: &Dashboard,
-    path: CheckPath,
+    id: CheckId,
     fragment_only: bool,
 ) -> Result<Response, WebError> {
-    let snapshot = snapshot(dashboard, Some(path.clone())).await?;
-    let detail = match &path {
-        CheckPath::Service(host, service) => CheckDetail::service(&snapshot, host, service),
-        CheckPath::Reachability(host) => CheckDetail::reachability(&snapshot, host),
-    };
-    let Some(detail) = detail else {
+    let Some(facts) = dashboard
+        .store
+        .browse_check(dashboard.config.clone(), id)
+        .await
+        .map_err(load_error)?
+    else {
         return Ok(not_configured("check"));
     };
+    let snapshot = Snapshot::new(dashboard, facts.checks());
+    let detail = CheckDetail::new(&snapshot, &facts);
     let fragment = detail.fragment(&snapshot, &dashboard.csrf);
     let mut response = if fragment_only {
         Html(fragment).into_response()
@@ -1027,28 +1024,44 @@ async fn service_page(
     State(dashboard): State<Dashboard>,
     Path((host, service)): Path<(String, String)>,
 ) -> Result<Response, WebError> {
-    check_detail(&dashboard, CheckPath::Service(host, service), false).await
+    check_detail(
+        &dashboard,
+        CheckId::Service {
+            host_id: host,
+            service_id: service,
+        },
+        false,
+    )
+    .await
 }
 
 async fn service_status(
     State(dashboard): State<Dashboard>,
     Path((host, service)): Path<(String, String)>,
 ) -> Result<Response, WebError> {
-    check_detail(&dashboard, CheckPath::Service(host, service), true).await
+    check_detail(
+        &dashboard,
+        CheckId::Service {
+            host_id: host,
+            service_id: service,
+        },
+        true,
+    )
+    .await
 }
 
 async fn reachability_page(
     State(dashboard): State<Dashboard>,
     Path(host): Path<String>,
 ) -> Result<Response, WebError> {
-    check_detail(&dashboard, CheckPath::Reachability(host), false).await
+    check_detail(&dashboard, CheckId::Reachability { host_id: host }, false).await
 }
 
 async fn reachability_status(
     State(dashboard): State<Dashboard>,
     Path(host): Path<String>,
 ) -> Result<Response, WebError> {
-    check_detail(&dashboard, CheckPath::Reachability(host), true).await
+    check_detail(&dashboard, CheckId::Reachability { host_id: host }, true).await
 }
 
 fn check_now_form(url: &str, csrf: &str) -> String {
@@ -1173,7 +1186,7 @@ struct AcknowledgeForm {
 
 async fn acknowledge(
     dashboard: &Dashboard,
-    path: CheckPath,
+    path: CheckId,
     uri: &Uri,
     headers: &HeaderMap,
     form: AcknowledgeForm,
@@ -1186,8 +1199,11 @@ async fn acknowledge(
         ));
     }
     let (host, service) = match path {
-        CheckPath::Service(host, service) => (host, Some(service)),
-        CheckPath::Reachability(host) => (host, None),
+        CheckId::Service {
+            host_id,
+            service_id,
+        } => (host_id, Some(service_id)),
+        CheckId::Reachability { host_id } => (host_id, None),
     };
     match dashboard
         .store
@@ -1219,7 +1235,10 @@ async fn service_acknowledge(
 ) -> Result<Response, WebError> {
     acknowledge(
         &dashboard,
-        CheckPath::Service(host, service),
+        CheckId::Service {
+            host_id: host,
+            service_id: service,
+        },
         &uri,
         &headers,
         form,
@@ -1236,7 +1255,7 @@ async fn reachability_acknowledge(
 ) -> Result<Response, WebError> {
     acknowledge(
         &dashboard,
-        CheckPath::Reachability(host),
+        CheckId::Reachability { host_id: host },
         &uri,
         &headers,
         form,
