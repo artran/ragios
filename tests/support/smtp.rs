@@ -47,6 +47,8 @@ fn shadow_mode_records_disabled_decisions_without_contacting_smtp_after_restart(
     check(&mut app, &dir, 0, "recovered in shadow mode");
     let history = app.page(SERVICE, "recovered in shadow mode");
     assert_eq!(history.matches("Email skipped: disabled").count(), 2);
+    check(&mut app, &dir, 2, "first sample of another shadow failure");
+    check(&mut app, &dir, 2, "shadow problem still open at enablement");
     app.page(DELIVERY, "No notification deliveries recorded");
     assert_eq!(relay.connections.load(Ordering::Relaxed), 0);
 
@@ -55,11 +57,147 @@ fn shadow_mode_records_disabled_decisions_without_contacting_smtp_after_restart(
     app.page(DELIVERY, "SMTP email enabled");
     relay.expect_quiet(Duration::from_millis(400));
     assert_eq!(relay.connections.load(Ordering::Relaxed), 0);
+    check(
+        &mut app,
+        &dir,
+        0,
+        "recovered from the unnotified shadow problem",
+    );
     check(&mut app, &dir, 2, "first active failure");
     check(&mut app, &dir, 2, "confirmed active failure");
     relay
         .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
         .respond(250);
+    app.page(DELIVERY, "<td>delivered</td><td>1</td>");
+}
+
+#[test]
+fn shadow_cutover_releases_only_eligible_mail_and_recovers_after_restart() {
+    use chrono::{Datelike, TimeDelta, Utc};
+
+    const PROBE: &str = "/hosts/local/reachability";
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "starttls");
+    // Make the window closed regardless of the day CI runs. A YAML reload,
+    // rather than waiting for a calendar boundary, opens it for the service.
+    let closed_day = (Utc::now() + TimeDelta::days(3)).weekday().to_string();
+    let path = notification_config(
+        &dir,
+        &relay,
+        &format!(
+            "confirmation_attempts: 2\nreminder_interval_seconds: 1\nnotification_window: staffed\n\
+             check_windows:\n  - id: staffed\n    ranges: [{{days: [{}], start: '00:00', end: '24:00'}}]",
+            closed_day.to_lowercase()
+        ),
+    );
+    install_probe(&dir, &path);
+    update_config(&path, |yaml| {
+        yaml["hosts"][0]["reachability"]["notification_window"] = "staffed".into();
+        yaml["groups"] =
+            serde_yaml::from_str("[{id: ops, name: Ops}, {id: web, name: Web}]").unwrap();
+        yaml["hosts"][0]["group"] = "ops".into();
+    });
+    host_observation(&dir, 0, "initial reachable host");
+    observation(&dir, 0, "initial healthy service");
+    let mut app = Application::start(&path);
+    app.page(PROBE, "initial reachable host");
+    app.page(SERVICE, "initial healthy service");
+
+    check(&mut app, &dir, 2, "first failing sample");
+    app.page(SERVICE, "Pending problem: CRITICAL (attempt 1)");
+    app.page(DELIVERY, "No notification deliveries recorded");
+    check(&mut app, &dir, 2, "confirmed failing sample");
+    app.page(
+        DELIVERY,
+        "local / application: Outside notification window (staffed)",
+    );
+    relay.expect_quiet(Duration::from_millis(350));
+
+    for text in ["first failed reachability", "confirmed failed reachability"] {
+        host_observation(&dir, 2, text);
+        request_check(&mut app, PROBE, text);
+    }
+    update_config(&path, |yaml| yaml["notification_window"] = "always".into());
+    app.reload("reloaded");
+    let delivery = app.page(DELIVERY, "Held: host confirmed down");
+    assert!(!delivery.contains("local / application: Outside notification window"));
+    relay.expect_quiet(Duration::from_millis(350));
+
+    let page = app.page("/silences", "Create silence");
+    let silence = |app: &Application, scope: &str, expires: TimeDelta, reason: &str| {
+        assert!(
+            app.client
+                .post(format!("{}/silences", app.url))
+                .form(&[
+                    ("csrf", check_now_token(&page)),
+                    ("scope", scope),
+                    ("expiry", &(Utc::now() + expires).to_rfc3339()),
+                    ("reason", reason),
+                ])
+                .send()
+                .unwrap()
+                .status()
+                .is_success()
+        );
+    };
+    silence(
+        &app,
+        r#"{"group":"ops"}"#,
+        TimeDelta::hours(1),
+        "group work",
+    );
+    host_observation(&dir, 0, "reachability recovered during maintenance");
+    request_check(&mut app, PROBE, "reachability recovered during maintenance");
+    app.page_where(DELIVERY, "host hold cleared", |page| {
+        !page.contains("Held: host confirmed down")
+    });
+
+    relay.expect_quiet(Duration::from_millis(350));
+    silence(
+        &app,
+        r#"{"service":{"host":"local","service":"application"}}"#,
+        TimeDelta::seconds(5),
+        "service work",
+    );
+    let silences = app.page("/silences/status", "service work");
+    assert_eq!(silences.matches("<td>Active</td>").count(), 2);
+    update_config(&path, |yaml| yaml["hosts"][0]["group"] = "web".into());
+    app.reload("reloaded");
+    // The group silence no longer applies, but the service silence still does.
+    relay.expect_quiet(Duration::from_millis(350));
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(451);
+    app.page("/silences/status", "<td>service work</td><td>Expired</td>");
+    app.page(DELIVERY, "<td>retrying</td><td>1</td>");
+    let page = app.page(SERVICE, "Acknowledge problem");
+    assert!(
+        acknowledge(&app, SERVICE, check_now_token(&page), episode_token(&page))
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    drop(app);
+
+    let mut app = Application::start(&path);
+    app.page(SERVICE, "Acknowledged");
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    app.page(DELIVERY, "<td>delivered</td><td>2</td>");
+    relay.expect_quiet(Duration::from_millis(1500));
+    check(&mut app, &dir, 0, "service recovered after restart");
+    relay
+        .receive("observer@example.invalid", "Recovery: OK")
+        .respond(250);
+    app.page_where(DELIVERY, "problem and recovery accepted", |page| {
+        page.matches("<td>delivered</td>").count() == 2
+    });
+    assert!(
+        !app.page(SERVICE, "No confirmed problem")
+            .contains("Acknowledged")
+    );
 }
 
 #[test]

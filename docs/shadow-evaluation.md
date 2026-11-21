@@ -2,6 +2,22 @@
 
 Run Ragios alongside Nagios, with email explicitly disabled. Nagios stays the alerting system of record throughout the comparison. All installation, credentials, relay changes, and eventual retirement are operator actions.
 
+## Run the local validation
+
+From the repository root, with Rust and Python 3 installed:
+
+```sh
+cargo run --locked -- --config examples/shadow/ragios.yaml --validate
+cargo test --locked --test application shadow_
+```
+
+The tests start Ragios on loopback with temporary files and local fixture
+plugins. They exercise 134 hosts and 537 services, disabled email after a
+restart, and a failure-to-recovery scenario with a loopback SMTP relay. They
+do not run the site-specific check scripts or contact customer services.
+`just check` also runs the fixed-time tests for calendar boundaries and
+notification eligibility.
+
 ## Prepare the new server
 
 1. Follow the [AL2023 installation guide](install-al2023.md) on the new server. Run its disposable smoke test before using a live fleet. Keep the dashboard private and reserve a separate database for the shadow fleet, such as `/var/lib/ragios/shadow.sqlite3`.
@@ -21,7 +37,7 @@ For each representative check, record the two check identities, both timestamps 
 | Custom and Tailnet checks | Verified executable and arguments, credential access, effective service identity, JSON field, threshold boundary, or expected version as applicable. |
 | Timing and freshness | Normal and retry intervals, deadlines, check-window timezone, weekday certificate runs, and next due times. Distinguish deliberately out-of-window checks from stale results. Check behavior after a restart. |
 | Problem handling | Pending versus confirmed status, recovery, and the difference between manual rechecks and scheduled execution. Do not induce failures on customer systems. |
-| Notification policy | Effective host/group/global recipients; staffed-hours window; confirmed host-down suppression; active silences and acknowledgements. Compare policy and visible state, not actual deliveries: disabled mode does not simulate SMTP or queue a replay of shadow transitions. |
+| Notification policy | Effective host/group/global recipients; staffed-hours window; confirmed host-down suppression; active silences and acknowledgements. Look for **Email skipped: disabled** in the check's state history. This records the policy, not a prediction of what SMTP would have sent. Shadow transitions do not queue mail for replay. |
 
 Observe at least one full relevant operating cycle, including a staffed-hours boundary and a weekday/weekend boundary if those windows apply. Resolve unexplained differences before cutover. Keep a dated sign-off and agreed rollback conditions (for example, missed critical checks, persistent stale results, or absent/duplicate alerts).
 
