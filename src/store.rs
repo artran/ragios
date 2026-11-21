@@ -195,6 +195,7 @@ pub struct Transition {
     pub result_status: Status,
     pub kind: TransitionKind,
     pub state: ProblemState,
+    pub email_disabled: bool,
 }
 
 #[derive(Clone)]
@@ -496,11 +497,17 @@ impl Store {
                         params![host_id, service_id],
                     )?;
                 }
+                let email_disabled = config.as_ref().is_some_and(|config| config.smtp.is_none())
+                    && match kind {
+                        TransitionKind::Confirmed | TransitionKind::SeverityChanged => true,
+                        TransitionKind::Recovery => previous.confirmed_severity.is_some(),
+                        _ => false,
+                    };
                 transaction.execute(
                     "INSERT INTO check_transitions
                      (host_id, service_id, occurred_at, result_status, kind,
-                      confirmed_severity, pending_severity, pending_attempts, check_kind)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                      confirmed_severity, pending_severity, pending_attempts, check_kind, email_disabled)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         host_id,
                         service_id,
@@ -510,7 +517,8 @@ impl Store {
                         state.confirmed_severity.map(status_code),
                         state.pending_severity.map(status_code),
                         state.pending_attempts,
-                        target.kind().as_str()
+                        target.kind().as_str(),
+                        email_disabled
                     ],
                 )?;
                 notifications::record(&transaction, (&host_id, &target), kind, previous.confirmed_severity, assessment, &result.finished_at, config.as_deref())?;
@@ -635,7 +643,7 @@ fn read_transitions(
 ) -> Result<Vec<Transition>> {
     let mut query = db.prepare(
         "SELECT id, occurred_at, result_status, kind,
-                confirmed_severity, pending_severity, pending_attempts
+                confirmed_severity, pending_severity, pending_attempts, email_disabled
          FROM check_transitions WHERE host_id = ?1 AND service_id = ?2 AND check_kind = ?3 ORDER BY id",
     )?;
     let rows = query.query_map(params![host_id, service_id, kind.as_str()], |row| {
@@ -645,6 +653,7 @@ fn read_transitions(
             result_status: Status::from_code(Some(row.get(2)?)),
             kind: row.get(3)?,
             state: read_problem(row, 4)?,
+            email_disabled: row.get(7)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

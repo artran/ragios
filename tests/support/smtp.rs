@@ -9,7 +9,7 @@ use std::{
     net::{TcpListener, TcpStream},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -17,6 +17,50 @@ const USER: &str = "fake-user";
 const PASSWORD: &str = "fake-password-never-in-diagnostics";
 const SERVICE: &str = "/hosts/local/services/application";
 const DELIVERY: &str = "/notifications/status";
+
+#[test]
+fn shadow_mode_records_disabled_decisions_without_contacting_smtp_after_restart() {
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 2");
+    let smtp_yaml = fs::read_to_string(&path).unwrap();
+    update_config(&path, |yaml| {
+        yaml["email"] = serde_yaml::from_str("{mode: disabled}").unwrap();
+    });
+    observation(&dir, 0, "healthy in shadow mode");
+    let mut app = Application::start(&path);
+    app.page(DELIVERY, "SMTP email disabled");
+    app.page(SERVICE, "healthy in shadow mode");
+    check(&mut app, &dir, 2, "first shadow failure");
+    assert!(
+        !app.page(SERVICE, "first shadow failure")
+            .contains("Email skipped: disabled")
+    );
+    check(&mut app, &dir, 2, "confirmed shadow failure");
+    app.page(SERVICE, "Email skipped: disabled");
+    drop(app);
+
+    let mut app = Application::start(&path);
+    let history = app.page(SERVICE, "confirmed shadow failure");
+    assert_eq!(history.matches("Email skipped: disabled").count(), 1);
+    app.page(DELIVERY, "SMTP email disabled");
+    check(&mut app, &dir, 0, "recovered in shadow mode");
+    let history = app.page(SERVICE, "recovered in shadow mode");
+    assert_eq!(history.matches("Email skipped: disabled").count(), 2);
+    app.page(DELIVERY, "No notification deliveries recorded");
+    assert_eq!(relay.connections.load(Ordering::Relaxed), 0);
+
+    fs::write(&path, smtp_yaml).unwrap();
+    app.reload("reloaded");
+    app.page(DELIVERY, "SMTP email enabled");
+    relay.expect_quiet(Duration::from_millis(400));
+    assert_eq!(relay.connections.load(Ordering::Relaxed), 0);
+    check(&mut app, &dir, 2, "first active failure");
+    check(&mut app, &dir, 2, "confirmed active failure");
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+}
 
 #[test]
 fn dashboard_silences_are_scoped_protected_and_survive_restart() {
@@ -2132,6 +2176,7 @@ struct TestRelay {
     port: u16,
     mode: &'static str,
     messages: mpsc::Receiver<Attempt>,
+    connections: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -2176,10 +2221,15 @@ impl TestRelay {
         let (events, messages) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let running = stop.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = connections.clone();
         let thread = thread::spawn(move || {
             while !running.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_smtp(stream, mode, tls.clone(), &events),
+                    Ok((stream, _)) => {
+                        accepted.fetch_add(1, Ordering::Relaxed);
+                        handle_smtp(stream, mode, tls.clone(), &events);
+                    }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5))
                     }
@@ -2191,6 +2241,7 @@ impl TestRelay {
             port,
             mode,
             messages,
+            connections,
             stop,
             thread: Some(thread),
         }

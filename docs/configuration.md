@@ -343,6 +343,10 @@ notifications against each service's current confirmed state and what each
 recipient already received. Failures that recovered without a delivered problem
 message don't send recovery email. While email is disabled, Ragios discards
 queued deliveries and cancels reminders; it does not replay disabled transitions.
+The check's **State changes** history marks confirmed problems, confirmed severity
+changes, and recoveries from confirmed problems as **Email skipped: disabled**.
+This records the disabled policy, not whether the message would otherwise have
+been sent. The label is retained with the state change across restarts.
 
 Open **Email delivery** on the dashboard to see which hosts are holding service
 email, which confirmed problems are outside their notification windows, reminder

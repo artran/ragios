@@ -940,9 +940,14 @@ impl<'a> CheckDetail<'a> {
             let result = transition.result_status;
             let _ = write!(
                 html,
-                "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td>{}</tr>",
+                "<tr><td>{}</td><td>{}{}</td><td class=\"{}\">{}</td>{}</tr>",
                 escape(&transition.occurred_at),
                 change_label(transition, self.display),
+                if transition.email_disabled {
+                    "<br><small>Email skipped: disabled</small>"
+                } else {
+                    ""
+                },
                 result.label(),
                 self.display.label(result),
                 confirmed_cell(transition.state, self.display, None)
