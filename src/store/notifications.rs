@@ -1,6 +1,6 @@
 use super::{Store, TransitionKind, silences, status_code};
 use crate::{
-    config::{CheckWindow, Config},
+    config::Config,
     runner::{Reachability, Status},
 };
 use anyhow::{Result, ensure};
@@ -98,7 +98,7 @@ fn host_is_down(db: &Connection, host: &str) -> Result<bool> {
 
 // This marker survives restarts and lets dispatch reconcile against what each
 // recipient actually saw. The host's current confirmed state gates dispatch.
-pub(super) fn hold_services(tx: &Transaction<'_>, host: &str) -> Result<()> {
+fn hold_services(tx: &Transaction<'_>, host: &str) -> Result<()> {
     tx.execute(
         "UPDATE notification_deliveries SET held = 1
          WHERE state IN ('queued', 'retrying', 'sending') AND event_id IN (
@@ -113,11 +113,55 @@ fn timestamp(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-#[derive(Default)]
-pub struct NotificationPolicy {
-    pub recipients: Vec<String>,
-    pub window: Option<CheckWindow>,
-    pub group: Option<String>,
+/// Owns phase-specific eligibility. Recording remembers suppression history;
+/// selection skips temporarily suppressed targets; dispatch revalidates current
+/// facts and reconciles held changes against each recipient's accepted mail.
+struct Eligibility<'a> {
+    config: &'a Config,
+    now: DateTime<Utc>,
+}
+
+impl<'a> Eligibility<'a> {
+    fn new(config: &'a Config, now: DateTime<Utc>) -> Self {
+        Self { config, now }
+    }
+
+    fn host(&self, host_id: &str) -> Option<&crate::config::Host> {
+        self.config.hosts.iter().find(|host| host.id == host_id)
+    }
+
+    fn window_closed(&self, host: &str, service: &str, at: DateTime<Utc>) -> bool {
+        self.host(host)
+            .and_then(|host| host.notification_window(service))
+            .is_some_and(|window| !window.is_open(at))
+    }
+
+    fn silenced(&self, db: &Connection, host: &str, service: &str) -> Result<bool> {
+        silences::is_silenced(
+            db,
+            (
+                host,
+                service,
+                self.host(host).map(|host| host.group.as_str()),
+            ),
+            self.now,
+        )
+    }
+
+    fn held_at_recording(
+        &self,
+        db: &Connection,
+        (host, service): (&str, &str),
+        kind: TransitionKind,
+        occurred_at: &str,
+    ) -> Result<bool> {
+        let observed_at = DateTime::parse_from_rfc3339(occurred_at)
+            .map(|at| at.with_timezone(&Utc))
+            .unwrap_or(self.now);
+        Ok(self.window_closed(host, service, observed_at)
+            || (!service.is_empty() && host_is_down(db, host)?)
+            || (kind == TransitionKind::SeverityChanged && self.silenced(db, host, service)?))
+    }
 }
 
 /// A confirmed problem begins an episode; subsequent severity changes and its
@@ -129,8 +173,20 @@ pub(super) fn record(
     previous_severity: Option<Status>,
     severity: Status,
     occurred_at: &str,
-    policy: &NotificationPolicy,
+    config: Option<&Config>,
 ) -> Result<()> {
+    let (host_id, service_id) = check;
+    // Even result-only writes must preserve host-down suppression history.
+    if service_id.is_empty()
+        && severity == Status::Critical
+        && previous_severity != Some(Status::Critical)
+        && matches!(
+            kind,
+            TransitionKind::Confirmed | TransitionKind::SeverityChanged
+        )
+    {
+        hold_services(tx, host_id)?;
+    }
     if !matches!(
         kind,
         TransitionKind::Confirmed | TransitionKind::SeverityChanged | TransitionKind::Recovery
@@ -138,7 +194,14 @@ pub(super) fn record(
     {
         return Ok(());
     }
-    let (host_id, service_id) = check;
+    let now = Utc::now();
+    let eligibility = config.map(|config| Eligibility::new(config, now));
+    let recipients = eligibility
+        .as_ref()
+        .filter(|policy| policy.config.smtp.is_some())
+        .and_then(|policy| policy.host(host_id))
+        .map(|host| host.recipients.as_slice())
+        .unwrap_or_default();
     let previous = tx
         .query_row(
             "SELECT id, COALESCE(episode_id, id), kind FROM notification_events
@@ -158,7 +221,7 @@ pub(super) fn record(
             kind != TransitionKind::Confirmed && *previous_kind != TransitionKind::Recovery
         })
         .map(|(_, episode, _)| episode);
-    if policy.recipients.is_empty() {
+    if recipients.is_empty() {
         match (kind, episode, previous) {
             // Keep one recovery marker to close an existing episode.
             (TransitionKind::Recovery, Some(_), _) => {}
@@ -173,7 +236,6 @@ pub(super) fn record(
             _ => return Ok(()),
         }
     }
-    let now = Utc::now();
     let updated_at = timestamp(now);
     if let Some((id, _, _)) = previous {
         tx.execute(
@@ -192,15 +254,11 @@ pub(super) fn record(
     )?;
     let event = tx.last_insert_rowid();
     let ready_at = now.timestamp_millis();
-    let held = policy.window.as_ref().is_some_and(|window| {
-        let observed_at = DateTime::parse_from_rfc3339(occurred_at)
-            .map(|at| at.with_timezone(&Utc))
-            .unwrap_or(now);
-        !window.is_open(observed_at)
-    }) || (!service_id.is_empty() && host_is_down(tx, host_id)?)
-        || (kind == TransitionKind::SeverityChanged
-            && silences::is_silenced(tx, (host_id, service_id, policy.group.as_deref()), now)?);
-    for recipient in &policy.recipients {
+    let held = match &eligibility {
+        Some(policy) => policy.held_at_recording(tx, check, kind, occurred_at)?,
+        None => !service_id.is_empty() && host_is_down(tx, host_id)?,
+    };
+    for recipient in recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
         if kind == TransitionKind::Recovery && !has_problem_delivery(tx, episode, recipient, true)?

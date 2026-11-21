@@ -923,7 +923,7 @@ fn current_notification_retries_after_smtp_credentials_are_corrected() {
 async fn silence_expiry_releases_only_current_eligible_notifications() {
     use chrono::{TimeDelta, Utc};
     use ragios::{
-        config::{Config, Probe},
+        config::Probe,
         runner::Status::{Critical, Ok as Healthy, Unknown, Warning},
         store::{CheckTarget, CreateSilence, DeliveryOutcome, Silence, SilenceScope, Store},
     };
@@ -940,7 +940,7 @@ async fn silence_expiry_releases_only_current_eligible_notifications() {
     );
     with_reachability(&path, "ping", "check", &[]);
     // Use the configured default group, whatever its internal ID is.
-    let config = Arc::new(Config::load(&path).unwrap());
+    let config = single_attempt_config(&path);
     let (_publisher, active) = tokio::sync::watch::channel(config.clone());
     let zero = Utc::now();
     let at = |minute| zero + TimeDelta::minutes(minute);
@@ -994,14 +994,14 @@ async fn silence_expiry_releases_only_current_eligible_notifications() {
         }
     };
     let store = Store::open_server(&config.database).unwrap();
-    save_observation(&store, service(), Critical, at(0)).await;
+    save_configured_observation(&store, config.clone(), service(), Critical, at(0)).await;
     deliver(store.clone(), 1, "Confirmed problem: CRITICAL").await;
     // Simulate a candidate picked immediately before a host silence was created.
-    save_observation(&store, host(), Unknown, at(1)).await;
+    save_configured_observation(&store, config.clone(), host(), Unknown, at(1)).await;
     let candidate = next(store.clone(), 2).await.unwrap();
     create(store.clone(), SilenceScope::Host("local".into()), 10).await;
     assert!(begin(store.clone(), candidate, 2).await.is_none());
-    save_observation(&store, service(), Warning, at(3)).await;
+    save_configured_observation(&store, config.clone(), service(), Warning, at(3)).await;
     assert!(next(store.clone(), 4).await.is_none());
 
     create(
@@ -1019,9 +1019,9 @@ async fn silence_expiry_releases_only_current_eligible_notifications() {
         70,
     )
     .await;
-    save_observation(&store, host(), Healthy, at(5)).await;
-    save_observation(&store, host(), Unknown, at(6)).await;
-    save_observation(&store, service(), Critical, at(7)).await;
+    save_configured_observation(&store, config.clone(), host(), Healthy, at(5)).await;
+    save_configured_observation(&store, config.clone(), host(), Unknown, at(6)).await;
+    save_configured_observation(&store, config.clone(), service(), Critical, at(7)).await;
     drop(store);
     let store = Store::open_server(&config.database).unwrap();
     store.resume_notifications().await.unwrap();
@@ -1045,7 +1045,7 @@ async fn silence_expiry_releases_only_current_eligible_notifications() {
         next(store.clone(), 70).await.is_none(),
         "no obsolete transitions or reminders"
     );
-    save_observation(&store, service(), Healthy, at(71)).await;
+    save_configured_observation(&store, config.clone(), service(), Healthy, at(71)).await;
     deliver(store.clone(), 72, "Recovery: OK").await;
 }
 
@@ -1053,7 +1053,7 @@ async fn silence_expiry_releases_only_current_eligible_notifications() {
 async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppression() {
     use chrono::{TimeDelta, Utc};
     use ragios::{
-        config::{Config, Probe},
+        config::Probe,
         runner::Status::{Critical, Ok as Healthy, Warning},
         store::{CheckTarget, DeliveryOutcome, Store},
     };
@@ -1068,14 +1068,14 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
         ),
     );
     with_reachability(&path, "ping", "check", &[]);
-    let config = Arc::new(Config::load(&path).unwrap());
+    let config = single_attempt_config(&path);
     let (_publisher, active) = tokio::sync::watch::channel(config.clone());
     let initial = Utc::now();
     let at = |seconds| initial + TimeDelta::seconds(seconds);
     let host = || CheckTarget::Host(Probe::Ping);
     let service = || CheckTarget::Service("application".into());
     let mut store = Store::open_server(&config.database).unwrap();
-    save_observation(&store, service(), Critical, initial).await;
+    save_configured_observation(&store, config.clone(), service(), Critical, initial).await;
 
     let deliver = |store: Store, seconds, label: &'static str| {
         let active = active.clone();
@@ -1128,7 +1128,7 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
         pending.event_id
     );
 
-    save_observation(&store, host(), Critical, at(3601)).await;
+    save_configured_observation(&store, config.clone(), host(), Critical, at(3601)).await;
     assert!(
         store
             .begin_notification(pending, active.clone(), config.clone())
@@ -1137,8 +1137,8 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
             .is_none()
     );
     deliver(store.clone(), 3602, "Confirmed problem: Down").await;
-    save_observation(&store, service(), Warning, at(3700)).await;
-    save_observation(&store, service(), Critical, at(3800)).await;
+    save_configured_observation(&store, config.clone(), service(), Warning, at(3700)).await;
+    save_configured_observation(&store, config.clone(), service(), Critical, at(3800)).await;
     deliver(store.clone(), 10_000, "Reminder: Down").await;
     assert!(
         store
@@ -1147,7 +1147,7 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
             .unwrap()
             .is_none()
     );
-    save_observation(&store, host(), Healthy, at(10_001)).await;
+    save_configured_observation(&store, config.clone(), host(), Healthy, at(10_001)).await;
     // Older released mail gets a dispatch turn before newer unheld mail.
     let due = store
         .next_notification_at(active.clone(), at(10_001))
@@ -1173,7 +1173,7 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
             .unwrap()
             .is_none()
     );
-    save_observation(&store, service(), Healthy, at(10_003)).await;
+    save_configured_observation(&store, config.clone(), service(), Healthy, at(10_003)).await;
     deliver(store.clone(), 10_003, "Recovery: OK").await;
     assert!(
         store
@@ -1195,12 +1195,19 @@ async fn recovery_during_rollback_clears_acknowledgement_before_reupgrade() {
 
     for confirmed_during_rollback in [false, true] {
         let dir = TempDir::new().unwrap();
-        let path = config(&dir, "");
+        let path = config(&dir, "confirmation_attempts: 1");
         let config = Arc::new(Config::load(&path).unwrap());
         let (_publisher, active) = tokio::sync::watch::channel(config.clone());
         let key = ("local".to_owned(), "application".to_owned());
         let store = Store::open(&config.database).unwrap();
-        save_observation(&store, application_target(), Critical, Utc::now()).await;
+        save_configured_observation(
+            &store,
+            config.clone(),
+            application_target(),
+            Critical,
+            Utc::now(),
+        )
+        .await;
         let original = store.latest().await.unwrap()[&key]
             .episode
             .as_ref()
@@ -1242,7 +1249,14 @@ async fn recovery_during_rollback_clears_acknowledgement_before_reupgrade() {
         let store = Store::open(&config.database).unwrap();
         if !confirmed_during_rollback {
             assert!(store.latest().await.unwrap()[&key].episode.is_none());
-            save_observation(&store, application_target(), Critical, Utc::now()).await;
+            save_configured_observation(
+                &store,
+                config.clone(),
+                application_target(),
+                Critical,
+                Utc::now(),
+            )
+            .await;
         }
         let latest = store.latest().await.unwrap();
         let successor = latest[&key].episode.as_ref().unwrap();
@@ -1255,7 +1269,6 @@ async fn recovery_during_rollback_clears_acknowledgement_before_reupgrade() {
 async fn acknowledgement_blocks_an_already_selected_reminder_at_dispatch() {
     use chrono::{TimeDelta, Utc};
     use ragios::{
-        config::Config,
         runner::Status::Critical,
         store::{AcknowledgeOutcome, DeliveryOutcome, Store},
     };
@@ -1270,11 +1283,18 @@ async fn acknowledgement_blocks_an_already_selected_reminder_at_dispatch() {
             smtp_yaml("127.0.0.1", 1, "implicit")
         ),
     );
-    let config = Arc::new(Config::load(&path).unwrap());
+    let config = single_attempt_config(&path);
     let (_publisher, active) = tokio::sync::watch::channel(config.clone());
     let store = Store::open_server(&config.database).unwrap();
     let observed_at = Utc::now();
-    save_observation(&store, application_target(), Critical, observed_at).await;
+    save_configured_observation(
+        &store,
+        config.clone(),
+        application_target(),
+        Critical,
+        observed_at,
+    )
+    .await;
     let delivered_at = observed_at + TimeDelta::seconds(1);
     let initial = store
         .next_notification_at(active.clone(), delivered_at)
@@ -1338,7 +1358,14 @@ async fn retry_rechecks_window_at_dispatch_across_the_spring_clock_change() {
     let (_publisher, active) = tokio::sync::watch::channel(config.clone());
     // 01:59:55 EST; the clock jumps from 01:59:59 EST to 03:00:00 EDT.
     let initial = utc("2099-03-08T06:59:55Z");
-    save_observation(&store, application_target(), Critical, initial).await;
+    save_configured_observation(
+        &store,
+        config.clone(),
+        application_target(),
+        Critical,
+        initial,
+    )
+    .await;
     let first = store
         .next_notification_at(active.clone(), initial)
         .await
@@ -1414,7 +1441,7 @@ async fn a_silence_releases_mail_only_when_the_notification_window_is_open() {
     let open = utc("2099-11-01T05:15:00Z");
     let expiry = utc("2099-11-01T05:50:00Z");
     let reopen = utc("2099-11-01T06:15:00Z");
-    save_observation(&store, application_target(), Critical, open).await;
+    save_configured_observation(&store, config.clone(), application_target(), Critical, open).await;
     let candidate = store
         .next_notification_at(active.clone(), open)
         .await
@@ -1474,20 +1501,15 @@ async fn reopening_reconciles_severity_reminders_and_recovery_during_fall_clock_
     use ragios::{
         config::Probe,
         runner::Status::{Critical, Ok as Healthy, Warning},
-        store::{CheckTarget, DeliveryOutcome, NotificationPolicy, Store},
+        store::{CheckTarget, DeliveryOutcome, Store},
     };
 
     let (_dir, store, config) = windowed_store("01:15", "01:45");
     let (_publisher, active) = tokio::sync::watch::channel(config.clone());
-    let window = config.hosts[0].notification_window("application").unwrap();
     let save_service = |store: Store, status, at| {
-        let policy = NotificationPolicy {
-            recipients: vec!["observer@example.invalid".into()],
-            window: Some(window.clone()),
-            group: None,
-        };
+        let config = config.clone();
         async move {
-            save_observation_with_policy(&store, application_target(), status, at, policy).await
+            save_configured_observation(&store, config, application_target(), status, at).await
         }
     };
     let next = |at| store.next_notification_at(active.clone(), at);
@@ -1546,10 +1568,17 @@ async fn reopening_reconciles_severity_reminders_and_recovery_during_fall_clock_
     // Even though the window is now open and the reminder is due, confirmed
     // host down holds service mail until reachability recovers.
     let host = || CheckTarget::Host(Probe::Ping);
-    save_observation(&store, host(), Critical, second_open).await;
+    save_configured_observation(&store, config.clone(), host(), Critical, second_open).await;
     deliver(store.clone(), second_open, "Confirmed problem: Down").await;
     assert!(next(second_open).await.unwrap().is_none());
-    save_observation(&store, host(), Healthy, second_open + TimeDelta::seconds(1)).await;
+    save_configured_observation(
+        &store,
+        config.clone(),
+        host(),
+        Healthy,
+        second_open + TimeDelta::seconds(1),
+    )
+    .await;
     deliver(
         store.clone(),
         second_open + TimeDelta::seconds(1),
@@ -1614,7 +1643,7 @@ fn windowed_store(
     ])
     .into();
     fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
-    let config = Arc::new(ragios::config::Config::load(&path).unwrap());
+    let config = single_attempt_config(&path);
     assert!(
         config.hosts[0]
             .reachability
@@ -1631,7 +1660,7 @@ fn windowed_store(
 async fn upgrade_reconciles_service_deliveries_for_a_host_already_confirmed_down() {
     use chrono::{TimeDelta, Utc};
     use ragios::{
-        config::{Config, Probe},
+        config::Probe,
         runner::Status::{Critical, Ok as Healthy, Unknown, Warning},
         store::{CheckTarget, DeliveryOutcome, Store},
     };
@@ -1648,12 +1677,12 @@ async fn upgrade_reconciles_service_deliveries_for_a_host_already_confirmed_down
             ),
         );
         with_reachability(&path, "ping", "check", &[]);
-        let config = Arc::new(Config::load(&path).unwrap());
+        let config = single_attempt_config(&path);
         let (_publisher, active) = tokio::sync::watch::channel(config.clone());
         let store = Store::open_server(&config.database).unwrap();
         let at = Utc::now() + TimeDelta::minutes(1);
         let service = || CheckTarget::Service("application".into());
-        save_observation(&store, service(), Critical, at).await;
+        save_configured_observation(&store, config.clone(), service(), Critical, at).await;
         let initial = store
             .next_notification_at(active.clone(), at)
             .await
@@ -1668,15 +1697,17 @@ async fn upgrade_reconciles_service_deliveries_for_a_host_already_confirmed_down
             .finish_notification_at(sending, DeliveryOutcome::Delivered, at)
             .await
             .unwrap();
-        save_observation(&store, service(), Warning, at).await;
-        save_observation(&store, service(), final_severity, at).await;
+        save_configured_observation(&store, config.clone(), service(), Warning, at).await;
+        save_configured_observation(&store, config.clone(), service(), final_severity, at).await;
         // The old version persisted host state without enqueuing host mail.
-        save_observation_for(
+        let mut without_mail = (*config).clone();
+        without_mail.smtp = None;
+        save_configured_observation(
             &store,
+            Arc::new(without_mail),
             CheckTarget::Host(Probe::Ping),
             Critical,
             at,
-            Vec::new(),
         )
         .await;
         drop(store);
@@ -1693,7 +1724,14 @@ async fn upgrade_reconciles_service_deliveries_for_a_host_already_confirmed_down
 
         let store = Store::open_server(&config.database).unwrap();
         // Recovery can be recorded before the delivery worker polls at startup.
-        save_observation(&store, CheckTarget::Host(Probe::Ping), Healthy, at).await;
+        save_configured_observation(
+            &store,
+            config.clone(),
+            CheckTarget::Host(Probe::Ping),
+            Healthy,
+            at,
+        )
+        .await;
         let pending = store
             .next_notification_at(active.clone(), at)
             .await
@@ -1733,48 +1771,18 @@ async fn upgrade_reconciles_service_deliveries_for_a_host_already_confirmed_down
     }
 }
 
-async fn save_observation(
-    store: &ragios::store::Store,
-    target: ragios::store::CheckTarget,
-    status: ragios::runner::Status,
-    at: chrono::DateTime<chrono::Utc>,
-) {
-    save_observation_for(
-        store,
-        target,
-        status,
-        at,
-        vec!["observer@example.invalid".into()],
-    )
-    .await;
+fn single_attempt_config(path: &std::path::Path) -> Arc<ragios::config::Config> {
+    let mut config = ragios::config::Config::load(path).unwrap();
+    config.confirmation_attempts = 1;
+    Arc::new(config)
 }
 
-async fn save_observation_for(
+async fn save_configured_observation(
     store: &ragios::store::Store,
+    config: Arc<ragios::config::Config>,
     target: ragios::store::CheckTarget,
     status: ragios::runner::Status,
     at: chrono::DateTime<chrono::Utc>,
-    recipients: Vec<String>,
-) {
-    save_observation_with_policy(
-        store,
-        target,
-        status,
-        at,
-        ragios::store::NotificationPolicy {
-            recipients,
-            ..Default::default()
-        },
-    )
-    .await;
-}
-
-async fn save_observation_with_policy(
-    store: &ragios::store::Store,
-    target: ragios::store::CheckTarget,
-    status: ragios::runner::Status,
-    at: chrono::DateTime<chrono::Utc>,
-    policy: ragios::store::NotificationPolicy,
 ) {
     let timestamp = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     store
@@ -1788,8 +1796,7 @@ async fn save_observation_with_policy(
                 finished_at: timestamp,
                 duration_ms: 0,
             },
-            1,
-            policy,
+            config,
         )
         .await
         .unwrap();
@@ -1798,7 +1805,6 @@ async fn save_observation_with_policy(
 #[tokio::test]
 async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evidence() {
     use ragios::{
-        config::Config,
         runner::{CheckResult, Status},
         store::{CheckTarget, DeliveryOutcome, Store},
     };
@@ -1812,7 +1818,7 @@ async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evi
             smtp_yaml("127.0.0.1", 1, "implicit")
         ),
     );
-    let config = Arc::new(Config::load(&path).unwrap());
+    let config = single_attempt_config(&path);
     let (_publisher, active) = tokio::sync::watch::channel(config.clone());
     let store = Store::open_server(&config.database).unwrap();
     let old = chrono::Utc::now() - chrono::TimeDelta::days(40);
@@ -1828,11 +1834,7 @@ async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evi
                 finished_at: timestamp,
                 duration_ms: 0,
             },
-            1,
-            ragios::store::NotificationPolicy {
-                recipients: vec!["observer@example.invalid".into()],
-                ..Default::default()
-            },
+            config.clone(),
         )
     };
     save(Status::Critical).await.unwrap();
