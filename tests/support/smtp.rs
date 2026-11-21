@@ -368,6 +368,57 @@ fn smtp_sends_recurring_host_reminders_but_no_service_mail_during_a_prolonged_ou
 }
 
 #[test]
+fn reopening_notification_window_sends_only_the_current_problem() {
+    use chrono::Datelike;
+
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let closed_day = (chrono::Utc::now() + chrono::TimeDelta::days(3))
+        .weekday()
+        .to_string()
+        .to_lowercase();
+    let path = notification_config(
+        &dir,
+        &relay,
+        &format!(
+            "confirmation_attempts: 1\nnotification_window: staffed\ncheck_windows:\n  - id: staffed\n    ranges: [{{days: [{closed_day}], start: '00:00', end: '24:00'}}]"
+        ),
+    );
+    observation(&dir, 2, "first problem outside hours");
+    let mut app = Application::start(&path);
+    app.page(SERVICE, "first problem outside hours");
+    app.page(DELIVERY, "Outside notification window");
+    check(&mut app, &dir, 0, "recovered outside hours");
+    check(&mut app, &dir, 1, "new problem outside hours");
+    check(&mut app, &dir, 2, "still current on reopening");
+    relay.expect_quiet(Duration::from_millis(400));
+
+    let closed = fs::read_to_string(&path).unwrap();
+    let opened = closed.replace(
+        "notification_window: staffed",
+        "notification_window: always",
+    );
+    fs::write(&path, &opened).unwrap();
+    app.reload("reloaded");
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(451);
+    app.page(DELIVERY, "<td>retrying</td><td>1</td>");
+
+    fs::write(&path, closed).unwrap();
+    app.reload("reloaded");
+    app.page(DELIVERY, "Outside notification window");
+    relay.expect_quiet(Duration::from_millis(3300));
+    fs::write(&path, opened).unwrap();
+    app.reload("reloaded");
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    app.page(DELIVERY, "<td>delivered</td><td>2</td>");
+    relay.expect_quiet(Duration::from_millis(400));
+}
+
+#[test]
 fn smtp_credentials_must_be_in_protected_files() {
     let dir = tempfile::tempdir().unwrap();
     let credentials = dir.path().join("password");
@@ -1000,6 +1051,304 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
 }
 
 #[tokio::test]
+async fn retry_rechecks_window_at_dispatch_across_the_spring_clock_change() {
+    use chrono::TimeDelta;
+    use ragios::{runner::Status::Critical, store::DeliveryOutcome};
+
+    let (_dir, store, config) = windowed_store("01:30", "02:30");
+    let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+    // 01:59:55 EST; the clock jumps from 01:59:59 EST to 03:00:00 EDT.
+    let initial = utc("2099-03-08T06:59:55Z");
+    save_observation(&store, application_target(), Critical, initial).await;
+    let first = store
+        .next_notification_at(active.clone(), initial)
+        .await
+        .unwrap()
+        .unwrap();
+    let sending = store
+        .begin_notification_at(first, active.clone(), config.clone(), initial)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .finish_notification_at(
+            sending,
+            DeliveryOutcome::Retry("SMTP reply 451".into()),
+            initial,
+        )
+        .await
+        .unwrap();
+    let retry_due = initial + TimeDelta::seconds(3);
+    let retry = store
+        .next_notification_at(active.clone(), retry_due)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.attempts, 1);
+    let closed = utc("2099-03-08T07:00:00Z");
+    assert!(
+        store
+            .begin_notification_at(retry, active.clone(), config.clone(), closed)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .next_notification_at(active.clone(), closed)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let reopened = utc("2099-03-15T05:30:00Z"); // 01:30 EDT the following Sunday.
+    assert!(
+        store
+            .next_notification_at(active.clone(), reopened - TimeDelta::seconds(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let retry = store
+        .next_notification_at(active.clone(), reopened)
+        .await
+        .unwrap()
+        .unwrap();
+    let sending = store
+        .begin_notification_at(retry, active, config, reopened)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sending.attempts, 2);
+    assert_eq!(sending.label(), "Confirmed problem: CRITICAL");
+}
+
+#[tokio::test]
+async fn a_silence_releases_mail_only_when_the_notification_window_is_open() {
+    use ragios::{
+        runner::Status::Critical,
+        store::{CreateSilence, Silence, SilenceScope},
+    };
+
+    let (_dir, store, config) = windowed_store("01:15", "01:45");
+    let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+    let open = utc("2099-11-01T05:15:00Z");
+    let expiry = utc("2099-11-01T05:50:00Z");
+    let reopen = utc("2099-11-01T06:15:00Z");
+    save_observation(&store, application_target(), Critical, open).await;
+    let candidate = store
+        .next_notification_at(active.clone(), open)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store
+            .create_silence(
+                Silence {
+                    scope: SilenceScope::Host("local".into()),
+                    expires_at: expiry,
+                    reason: None,
+                },
+                active.clone()
+            )
+            .await
+            .unwrap(),
+        CreateSilence::Created
+    ));
+    assert!(
+        store
+            .begin_notification_at(candidate, active.clone(), config.clone(), open)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .next_notification_at(active.clone(), open)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .next_notification_at(active.clone(), expiry)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let candidate = store
+        .next_notification_at(active.clone(), reopen)
+        .await
+        .unwrap()
+        .unwrap();
+    let sending = store
+        .begin_notification_at(candidate, active, config, reopen)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sending.label(), "Confirmed problem: CRITICAL");
+}
+
+#[tokio::test]
+async fn reopening_reconciles_severity_reminders_and_recovery_during_fall_clock_change() {
+    use chrono::TimeDelta;
+    use ragios::{
+        config::Probe,
+        runner::Status::{Critical, Ok as Healthy, Warning},
+        store::{CheckTarget, DeliveryOutcome, NotificationPolicy, Store},
+    };
+
+    let (_dir, store, config) = windowed_store("01:15", "01:45");
+    let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+    let window = config.hosts[0].notification_window("application").unwrap();
+    let save_service = |store: Store, status, at| {
+        let policy = NotificationPolicy {
+            recipients: vec!["observer@example.invalid".into()],
+            window: Some(window.clone()),
+            group: None,
+        };
+        async move {
+            save_observation_with_policy(&store, application_target(), status, at, policy).await
+        }
+    };
+    let next = |at| store.next_notification_at(active.clone(), at);
+    let deliver = |store: Store, at, label: &'static str| {
+        let active = active.clone();
+        let config = config.clone();
+        async move {
+            let candidate = store
+                .next_notification_at(active.clone(), at)
+                .await
+                .unwrap()
+                .unwrap();
+            let sending = store
+                .begin_notification_at(candidate, active, config, at)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sending.label(), label);
+            store
+                .finish_notification_at(sending, DeliveryOutcome::Delivered, at)
+                .await
+                .unwrap();
+        }
+    };
+    let first_open = utc("2099-11-01T05:15:00Z"); // 01:15 EDT
+    let first_close = utc("2099-11-01T05:45:00Z");
+    let second_open = utc("2099-11-01T06:15:00Z"); // 01:15 EST
+    save_service(store.clone(), Critical, first_open).await;
+    assert!(
+        next(first_open - TimeDelta::seconds(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    deliver(store.clone(), first_open, "Confirmed problem: CRITICAL").await;
+    // A reminder is overdue, but the end is exclusive.
+    assert!(next(first_close).await.unwrap().is_none());
+    save_service(store.clone(), Warning, first_close).await;
+    save_service(store.clone(), Critical, first_close + TimeDelta::seconds(1)).await;
+    assert!(
+        next(second_open - TimeDelta::seconds(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let candidate = next(second_open).await.unwrap().unwrap();
+    assert!(
+        store
+            .begin_notification_at(candidate, active.clone(), config.clone(), second_open)
+            .await
+            .unwrap()
+            .is_none()
+    ); // No severity change: the recipient already knows CRITICAL.
+
+    // Even though the window is now open and the reminder is due, confirmed
+    // host down holds service mail until reachability recovers.
+    let host = || CheckTarget::Host(Probe::Ping);
+    save_observation(&store, host(), Critical, second_open).await;
+    deliver(store.clone(), second_open, "Confirmed problem: Down").await;
+    assert!(next(second_open).await.unwrap().is_none());
+    save_observation(&store, host(), Healthy, second_open + TimeDelta::seconds(1)).await;
+    deliver(
+        store.clone(),
+        second_open + TimeDelta::seconds(1),
+        "Recovery: Reachable",
+    )
+    .await;
+    deliver(
+        store.clone(),
+        second_open + TimeDelta::seconds(1),
+        "Reminder: CRITICAL",
+    )
+    .await;
+    assert!(
+        next(second_open + TimeDelta::seconds(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let second_close = utc("2099-11-01T06:45:00Z");
+    save_service(store.clone(), Warning, second_close).await;
+    save_service(store.clone(), Healthy, second_close + TimeDelta::seconds(1)).await;
+    assert!(
+        next(second_close + TimeDelta::seconds(1))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let next_week = utc("2099-11-08T06:15:00Z");
+    deliver(store.clone(), next_week, "Recovery: OK").await;
+    assert!(next(next_week).await.unwrap().is_none());
+}
+
+fn utc(iso: &str) -> chrono::DateTime<chrono::Utc> {
+    iso.parse().unwrap()
+}
+
+fn application_target() -> ragios::store::CheckTarget {
+    ragios::store::CheckTarget::Service("application".into())
+}
+
+fn windowed_store(
+    start: &str,
+    end: &str,
+) -> (TempDir, ragios::store::Store, Arc<ragios::config::Config>) {
+    let dir = TempDir::new().unwrap();
+    private_file(&dir, "username", USER);
+    private_file(&dir, "password", PASSWORD);
+    let path = config(
+        &dir,
+        &format!(
+            "{}recipients: [observer@example.invalid]\nreminder_interval_seconds: 600\nnotification_window: staffed\ncheck_windows:\n  - id: staffed\n    timezone: America/New_York\n    ranges: [{{days: [sun], start: '{start}', end: '{end}'}}]",
+            smtp_yaml("127.0.0.1", 1, "implicit"),
+        ),
+    );
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    yaml["hosts"][0]["reachability"] = serde_yaml::Mapping::from_iter([
+        ("probe".into(), "ping".into()),
+        ("executable".into(), "check".into()),
+        ("notification_window".into(), "always".into()),
+    ])
+    .into();
+    fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+    let config = Arc::new(ragios::config::Config::load(&path).unwrap());
+    assert!(
+        config.hosts[0]
+            .reachability
+            .as_ref()
+            .unwrap()
+            .notification_window
+            .is_none()
+    );
+    let store = ragios::store::Store::open_server(&config.database).unwrap();
+    (dir, store, config)
+}
+
+#[tokio::test]
 async fn upgrade_reconciles_service_deliveries_for_a_host_already_confirmed_down() {
     use chrono::{TimeDelta, Utc};
     use ragios::{
@@ -1128,6 +1477,26 @@ async fn save_observation_for(
     at: chrono::DateTime<chrono::Utc>,
     recipients: Vec<String>,
 ) {
+    save_observation_with_policy(
+        store,
+        target,
+        status,
+        at,
+        ragios::store::NotificationPolicy {
+            recipients,
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+async fn save_observation_with_policy(
+    store: &ragios::store::Store,
+    target: ragios::store::CheckTarget,
+    status: ragios::runner::Status,
+    at: chrono::DateTime<chrono::Utc>,
+    policy: ragios::store::NotificationPolicy,
+) {
     let timestamp = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     store
         .save_with_notifications(
@@ -1141,8 +1510,7 @@ async fn save_observation_for(
                 duration_ms: 0,
             },
             1,
-            recipients,
-            None,
+            policy,
         )
         .await
         .unwrap();
@@ -1182,8 +1550,10 @@ async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evi
                 duration_ms: 0,
             },
             1,
-            vec!["observer@example.invalid".into()],
-            None,
+            ragios::store::NotificationPolicy {
+                recipients: vec!["observer@example.invalid".into()],
+                ..Default::default()
+            },
         )
     };
     save(Status::Critical).await.unwrap();

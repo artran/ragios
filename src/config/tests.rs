@@ -657,6 +657,47 @@ fn check_windows_resolve_with_the_same_precedence_as_timing_and_default_to_utc()
 }
 
 #[test]
+fn notification_windows_inherit_independently_from_check_windows() {
+    let config = load(&format!(
+        "notification_window: work-hours\ncheck_window: sundays\n{WINDOWS}hosts:
+  - id: a
+    name: A
+    notification_window: sundays
+    reachability: {{probe: ping, executable: check, notification_window: always}}
+    overrides: {{overridden: {{notification_window: always}}}}
+    services:
+      - {{id: inherited, name: Inherited, executable: check}}
+      - {{id: explicit, name: Explicit, executable: check, notification_window: work-hours}}
+      - {{id: overridden, name: Overridden, executable: check, check_window: work-hours}}
+  - id: b
+    name: B
+    services: [{{id: root, name: Root, executable: check}}]
+"
+    ))
+    .unwrap();
+    let [a, b] = &config.hosts[..] else { panic!() };
+    assert!(a.notification_window("").is_none());
+    assert_eq!(a.notification_window("inherited").unwrap().id, "sundays");
+    assert_eq!(
+        a.notification_window("explicit").unwrap().timezone,
+        chrono_tz::Europe::London
+    );
+    assert!(a.notification_window("overridden").is_none());
+    assert_eq!(
+        a.services[2].check.window.as_ref().unwrap().id,
+        "work-hours"
+    );
+    assert_eq!(b.notification_window("root").unwrap().id, "work-hours");
+    assert_eq!(b.services[0].check.window.as_ref().unwrap().id, "sundays");
+}
+
+#[test]
+fn unknown_notification_windows_in_unused_bundles_are_rejected() {
+    let error = load("bundles: [{id: unused, services: [{id: s, name: S, executable: check, notification_window: missing}]}]\nhosts: [{id: a, name: A, services: [{id: s, name: S, executable: check}]}]").unwrap_err();
+    assert!(format!("{error:#}").contains("unknown notification window \"missing\""));
+}
+
+#[test]
 fn invalid_check_windows_and_unknown_references_reject_the_whole_fleet() {
     let service = "hosts: [{id: a, name: A, services: [{id: s, name: S, executable: check}]}]\n";
     let window = |range: &str| format!("check_windows: [{{id: w, ranges: [{range}]}}]\n{service}");

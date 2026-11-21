@@ -2,7 +2,7 @@ mod notifications;
 mod schema;
 mod silences;
 
-pub use notifications::{DeliveryOutcome, Notification};
+pub use notifications::{DeliveryOutcome, Notification, NotificationPolicy};
 pub use silences::{CreateSilence, Silence, SilenceScope};
 
 use crate::{
@@ -327,8 +327,7 @@ impl Store {
             target,
             result,
             confirmation_attempts,
-            Vec::new(),
-            None,
+            Default::default(),
         )
         .await
     }
@@ -339,8 +338,7 @@ impl Store {
         target: CheckTarget,
         result: CheckResult,
         confirmation_attempts: u32,
-        recipients: Vec<String>,
-        group: Option<String>,
+        policy: NotificationPolicy,
     ) -> Result<ProblemState> {
         ensure!(
             confirmation_attempts > 0,
@@ -425,7 +423,7 @@ impl Store {
                         target.kind().as_str()
                     ],
                 )?;
-                notifications::record(&transaction, (&host_id, service_id, group.as_deref()), kind, previous.confirmed_severity, assessment, &result.finished_at, &recipients)?;
+                notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, assessment, &result.finished_at, &policy)?;
                 if matches!(target, CheckTarget::Host(_))
                     && previous.confirmed_severity != Some(Status::Critical)
                     && state.confirmed_severity == Some(Status::Critical)

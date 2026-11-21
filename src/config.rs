@@ -50,12 +50,14 @@ pub struct Service {
     pub id: String,
     pub name: String,
     pub check: Check,
+    pub notification_window: Option<CheckWindow>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReachabilityCheck {
     pub probe: Probe,
     pub check: Check,
+    pub notification_window: Option<CheckWindow>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
@@ -84,12 +86,44 @@ pub struct Check {
     pub window: Option<CheckWindow>,
 }
 
-/// A named recurring weekly period, in local time, during which checks may start.
+/// A named recurring weekly period in local time, shared by check and notification policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckWindow {
     pub id: String,
     pub timezone: chrono_tz::Tz,
     pub ranges: Vec<WindowRange>,
+}
+
+impl CheckWindow {
+    /// Local wall-clock time keeps the window fixed across daylight-saving changes.
+    pub fn is_open(&self, at: chrono::DateTime<chrono::Utc>) -> bool {
+        let local = at.with_timezone(&self.timezone);
+        self.ranges.iter().any(|range| range.contains(&local))
+    }
+}
+
+impl Host {
+    pub fn notification_window(&self, service_id: &str) -> Option<&CheckWindow> {
+        if service_id.is_empty() {
+            self.reachability.as_ref()?.notification_window.as_ref()
+        } else {
+            self.services
+                .iter()
+                .find(|service| service.id == service_id)?
+                .notification_window
+                .as_ref()
+        }
+    }
+
+    /// Only restricted targets. An empty service ID denotes host reachability.
+    pub fn notification_windows(&self) -> impl Iterator<Item = (&str, &CheckWindow)> {
+        self.reachability
+            .iter()
+            .filter_map(|probe| Some(("", probe.notification_window.as_ref()?)))
+            .chain(self.services.iter().filter_map(|service| {
+                Some((service.id.as_str(), service.notification_window.as_ref()?))
+            }))
+    }
 }
 
 /// Local time from `start` up to, but excluding, `end` on each of `days`.
@@ -434,6 +468,11 @@ impl Resolver<'_> {
                 .map(|probe| -> Result<_> {
                     Ok(ReachabilityCheck {
                         probe: probe.probe,
+                        notification_window: self.window([
+                            probe.notification_window.as_ref(),
+                            host.notification_window.as_ref(),
+                            self.file.notification_window.as_ref(),
+                        ]),
                         check: Check {
                             executable: probe.executable.clone(),
                             args: probe
@@ -497,6 +536,12 @@ impl Resolver<'_> {
             .with_context(|| format!("arguments from {origin}"))?;
         Ok(Service {
             id: service.id.clone(),
+            notification_window: self.window([
+                overrides.and_then(|o| o.notification_window.as_ref()),
+                service.notification_window.as_ref(),
+                host.notification_window.as_ref(),
+                self.file.notification_window.as_ref(),
+            ]),
             name: overrides
                 .and_then(|o| o.name.as_ref())
                 .unwrap_or(&service.name)

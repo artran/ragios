@@ -1,6 +1,6 @@
 use super::{Store, TransitionKind, silences, status_code};
 use crate::{
-    config::Config,
+    config::{CheckWindow, Config},
     runner::{Reachability, Status},
 };
 use anyhow::{Result, ensure};
@@ -113,16 +113,23 @@ fn timestamp(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
+#[derive(Default)]
+pub struct NotificationPolicy {
+    pub recipients: Vec<String>,
+    pub window: Option<CheckWindow>,
+    pub group: Option<String>,
+}
+
 /// A confirmed problem begins an episode; subsequent severity changes and its
 /// recovery share that ID. This history is independent of check history pruning.
 pub(super) fn record(
     tx: &Transaction<'_>,
-    check: (&str, &str, Option<&str>),
+    check: (&str, &str),
     kind: TransitionKind,
     previous_severity: Option<Status>,
     severity: Status,
     occurred_at: &str,
-    recipients: &[String],
+    policy: &NotificationPolicy,
 ) -> Result<()> {
     if !matches!(
         kind,
@@ -131,7 +138,7 @@ pub(super) fn record(
     {
         return Ok(());
     }
-    let (host_id, service_id, _) = check;
+    let (host_id, service_id) = check;
     let previous = tx
         .query_row(
             "SELECT id, COALESCE(episode_id, id), kind FROM notification_events
@@ -151,7 +158,7 @@ pub(super) fn record(
             kind != TransitionKind::Confirmed && *previous_kind != TransitionKind::Recovery
         })
         .map(|(_, episode, _)| episode);
-    if recipients.is_empty() {
+    if policy.recipients.is_empty() {
         match (kind, episode, previous) {
             // Keep one recovery marker to close an existing episode.
             (TransitionKind::Recovery, Some(_), _) => {}
@@ -185,9 +192,15 @@ pub(super) fn record(
     )?;
     let event = tx.last_insert_rowid();
     let ready_at = now.timestamp_millis();
-    let held = (!service_id.is_empty() && host_is_down(tx, host_id)?)
-        || (kind == TransitionKind::SeverityChanged && silences::is_silenced(tx, check, now)?);
-    for recipient in recipients {
+    let held = policy.window.as_ref().is_some_and(|window| {
+        let observed_at = DateTime::parse_from_rfc3339(occurred_at)
+            .map(|at| at.with_timezone(&Utc))
+            .unwrap_or(now);
+        !window.is_open(observed_at)
+    }) || (!service_id.is_empty() && host_is_down(tx, host_id)?)
+        || (kind == TransitionKind::SeverityChanged
+            && silences::is_silenced(tx, (host_id, service_id, policy.group.as_deref()), now)?);
+    for recipient in &policy.recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
         if kind == TransitionKind::Recovery && !has_problem_delivery(tx, episode, recipient, true)?
@@ -370,9 +383,34 @@ impl Store {
                     .collect::<Vec<_>>(),
             )?;
             let groups = silences::host_groups(&config)?;
+            let closed_targets = config.hosts.iter().flat_map(|host| {
+                host.notification_windows()
+                    .filter(|(_, window)| !window.is_open(now))
+                    .map(|(id, _)| (&host.id, id))
+            }).collect::<Vec<_>>();
+            let closed_targets = if closed_targets.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&closed_targets)?)
+            };
+            // Remember changes that were queued before the window closed (e.g.
+            // an SMTP retry). Recording transitions also marks those made while closed.
+            if let Some(closed_targets) = &closed_targets {
+                tx.execute(
+                    "UPDATE notification_deliveries AS d SET held = 1
+                     WHERE d.state IN ('queued', 'retrying') AND d.held = 0 AND EXISTS (
+                         SELECT 1 FROM notification_events e WHERE e.id = d.event_id
+                           AND e.kind = 'severity_changed' AND e.reminder_for IS NULL
+                           AND (e.host_id, e.service_id) IN (
+                               SELECT value ->> 0, value ->> 1 FROM json_each(?1)
+                           )
+                     )",
+                    [closed_targets],
+                )?;
+            }
             // Materialize at most one reminder per poll; no backlog accumulates
             // during restarts, suppression, or an unfinished SMTP attempt.
-            queue_due_reminder(&tx, &config, now, &reachability_hosts, &groups)?;
+            queue_due_reminder(&tx, &config, now, &reachability_hosts, &groups, closed_targets.as_deref())?;
             // Bound how much reconciliation can delay check writes or reload.
             for _ in 0..32 {
                 let candidate = tx
@@ -385,9 +423,11 @@ impl Store {
                            SELECT host_id FROM check_problems WHERE check_kind = 'host'
                              AND service_id = '' AND confirmed_severity = 2
                              AND host_id IN (SELECT value FROM json_each(:reachability))
-                       )) AND {}
+                       )) AND {} AND (e.host_id, e.service_id) NOT IN (
+                           SELECT value ->> 0, value ->> 1 FROM json_each(:closed_targets)
+                       )
                      ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1", silences::ACTIVE_FILTER),
-                        named_params!{":now": now.timestamp_millis(), ":reachability": reachability_hosts, ":groups": groups},
+                        named_params!{":now": now.timestamp_millis(), ":reachability": reachability_hosts, ":groups": groups, ":closed_targets": closed_targets},
                         read_notification,
                     )
                     .optional()?;
@@ -416,7 +456,7 @@ impl Store {
         active: watch::Receiver<Arc<Config>>,
         relay_config: Arc<Config>,
     ) -> Result<Option<Notification>> {
-        self.begin_notification_with_time(notification, active, relay_config, Utc::now)
+        self.begin_notification_with_clock(notification, active, relay_config, Utc::now)
             .await
     }
 
@@ -427,16 +467,16 @@ impl Store {
         relay_config: Arc<Config>,
         now: DateTime<Utc>,
     ) -> Result<Option<Notification>> {
-        self.begin_notification_with_time(notification, active, relay_config, move || now)
+        self.begin_notification_with_clock(notification, active, relay_config, move || now)
             .await
     }
 
-    async fn begin_notification_with_time(
+    async fn begin_notification_with_clock(
         &self,
         mut notification: Notification,
         active: watch::Receiver<Arc<Config>>,
         relay_config: Arc<Config>,
-        time: impl FnOnce() -> DateTime<Utc> + Send + 'static,
+        clock: impl FnOnce() -> DateTime<Utc> + Send + 'static,
     ) -> Result<Option<Notification>> {
         ensure!(
             self.1.is_some(),
@@ -448,8 +488,21 @@ impl Store {
             if !Arc::ptr_eq(&config, &relay_config) || config.smtp.is_none() {
                 return Ok(None);
             }
+            let host = config.hosts.iter().find(|host| host.id == notification.host_id);
+            let now = clock();
+            if host.and_then(|host| host.notification_window(&notification.service_id))
+                .is_some_and(|window| !window.is_open(now))
+            {
+                tx.execute(
+                    "UPDATE notification_deliveries SET held = 1 WHERE event_id = ?1 AND recipient = ?2
+                     AND state IN ('queued', 'retrying') AND held = 0",
+                    params![notification.event_id, notification.recipient],
+                )?;
+                tx.commit()?;
+                return Ok(None);
+            }
             if !notification.service_id.is_empty()
-                && config.hosts.iter().any(|host| host.id == notification.host_id && host.reachability.is_some())
+                && host.is_some_and(|host| host.reachability.is_some())
                 && host_is_down(&tx, &notification.host_id)?
             {
                 return Ok(None);
@@ -459,13 +512,11 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
-            let now = time();
-            let group = config.hosts.iter().find(|host| host.id == notification.host_id)
-                .map(|host| host.group.as_str());
+            let group = host.map(|host| host.group.as_str());
             if silences::is_silenced(&tx, (&notification.host_id, &notification.service_id, group), now)? {
                 return Ok(None);
             }
-            if reconcile_held_change(&tx, &notification)? {
+            if reconcile_held_change(&tx, &mut notification)? {
                 tx.commit()?;
                 return Ok(None);
             }
@@ -613,25 +664,33 @@ impl Store {
     }
 }
 
-// If the check changed away and back under suppression, the current
-// severity is already known to this recipient. Resume the reminder cadence
-// instead of sending a spurious change; keep distinct changes and recoveries.
-fn reconcile_held_change(tx: &Transaction<'_>, notification: &Notification) -> Result<bool> {
+// Compare a held change with what the recipient actually saw, not the last
+// suppressed transition. If nothing was delivered, introduce the current problem.
+fn reconcile_held_change(tx: &Transaction<'_>, notification: &mut Notification) -> Result<bool> {
     if notification.reminder || notification.kind != TransitionKind::SeverityChanged {
         return Ok(false);
     }
-    let known = tx.query_row(
-        "SELECT prior.severity, delivered.retry_at
-         FROM notification_events e JOIN notification_deliveries held ON held.event_id = e.id
-         JOIN notification_events prior ON prior.id = e.episode_id OR prior.episode_id = e.episode_id
-         JOIN notification_deliveries delivered ON delivered.event_id = prior.id AND delivered.recipient = held.recipient
-         WHERE e.id = ?1 AND held.recipient = ?2 AND held.held = 1
-           AND delivered.state = 'delivered' AND prior.kind != 'recovery'
-         ORDER BY prior.id DESC LIMIT 1",
+    let Some(episode) = tx.query_row(
+        "SELECT e.episode_id FROM notification_events e JOIN notification_deliveries d ON d.event_id = e.id
+         WHERE e.id = ?1 AND d.recipient = ?2 AND d.held = 1",
         params![notification.event_id, notification.recipient],
-        |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
-    ).optional()?;
+        |row| row.get::<_, Option<i64>>(0),
+    ).optional()? else {
+        return Ok(false);
+    };
+    let known = tx
+        .query_row(
+            "SELECT e.severity, d.retry_at
+         FROM notification_events e JOIN notification_deliveries d ON d.event_id = e.id
+         WHERE (e.id = ?1 OR e.episode_id = ?1) AND d.recipient = ?2
+           AND d.state = 'delivered' AND e.kind != 'recovery'
+         ORDER BY e.id DESC LIMIT 1",
+            params![episode, notification.recipient],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
     let Some((severity, delivered_at)) = known else {
+        notification.kind = TransitionKind::Confirmed;
         return Ok(false);
     };
     if severity != status_code(notification.severity) {
@@ -655,6 +714,7 @@ fn queue_due_reminder(
     now: DateTime<Utc>,
     reachability_hosts: &str,
     groups: &str,
+    closed_targets: Option<&str>,
 ) -> Result<()> {
     let due = tx
         .query_row(
@@ -665,7 +725,9 @@ fn queue_due_reminder(
              SELECT host_id FROM check_problems WHERE check_kind = 'host'
                AND service_id = '' AND confirmed_severity = 2
                AND host_id IN (SELECT value FROM json_each(:reachability))
-         )) AND {} ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
+         )) AND {} AND (e.host_id, e.service_id) NOT IN (
+             SELECT value ->> 0, value ->> 1 FROM json_each(:closed_targets)
+         ) ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
                 silences::ACTIVE_FILTER
             ),
             named_params! {
@@ -673,6 +735,7 @@ fn queue_due_reminder(
                 ":now": now.timestamp_millis(),
                 ":reachability": reachability_hosts,
                 ":groups": groups,
+                ":closed_targets": closed_targets,
             },
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
