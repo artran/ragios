@@ -270,8 +270,14 @@ follow the same confirmation, recovery, and scheduling rules as timed checks.
 If the check is already running or all execution slots are busy, no extra run
 is queued. Try again after a slot frees up.
 
-There are no accounts. Manual check and silence requests use POST and require a
-token from the dashboard to prevent cross-site requests. Keep the default loopback binding;
+Use **Acknowledge problem** on a reachability or service detail page to stop
+reminders for that confirmed problem. Checks, confirmed severity-change emails,
+and eligible recovery emails continue under the usual notification policy.
+The acknowledgement survives a restart and clears on recovery, so a later
+problem needs its own acknowledgement.
+
+There are no accounts. Dashboard mutations use POST and require a token from
+the dashboard to prevent cross-site requests. Keep the default loopback binding;
 private Tailscale access requires an explicit private address in `bind` and
 appropriate network policy. Open the dashboard using its bound IP address and
 port (or `localhost` with the same port for a loopback bind). Other hostnames,
