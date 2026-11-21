@@ -1,3 +1,4 @@
+mod mail;
 mod monitor;
 mod web;
 
@@ -24,19 +25,29 @@ struct Arguments {
     validate: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let arguments = Arguments::parse();
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run(Arguments::parse()));
+    // A system DNS lookup may still be running on Tokio's blocking pool.
+    // Delivery has already had its chance to record a known SMTP outcome.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn run(arguments: Arguments) -> Result<()> {
     let config = Arc::new(Config::load(&arguments.config)?);
     if arguments.validate {
         println!("Configuration valid: {}", arguments.config.display());
         return Ok(());
     }
-    // Install the handler before announcing readiness, so an immediate SIGHUP
-    // cannot terminate the process with the OS default action.
-    let reloads = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .context("listen for SIGHUP")?;
-    let store = Store::open(&config.database)?;
+    // Install signal handlers before announcing readiness.
+    use tokio::signal::unix::{SignalKind, signal};
+    let reloads = signal(SignalKind::hangup()).context("listen for SIGHUP")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
+    let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
+    let store = Store::open_server(&config.database)?;
     let listener = TcpListener::bind(config.bind)
         .await
         .context("bind HTTP listener")?;
@@ -44,15 +55,38 @@ async fn main() -> Result<()> {
     let (status, scheduler) = watch::channel(Default::default());
     let (request_check, requests) = mpsc::channel(1);
     let address = listener.local_addr().context("read bound HTTP address")?;
-    let router = web::router(active, scheduler, store.clone(), request_check, address)?;
-    eprintln!("Ragios listening on http://{address}; email disabled");
+    let router = web::router(
+        active.clone(),
+        scheduler,
+        store.clone(),
+        request_check,
+        address,
+    )?;
+    let email = if config.smtp.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    eprintln!("Ragios listening on http://{address}; email {email}");
     let server = axum::serve(listener, router);
-    tokio::select! {
+    let mut delivery = std::pin::pin!(mail::run(store.clone(), active));
+    let result = tokio::select! {
         result = server => result.context("HTTP server failed"),
         result = monitor::run(arguments.config, config, store.clone(), published, status, reloads, requests) => result,
+        () = &mut delivery => return Ok(()),
         () = prune_history(store) => unreachable!("history pruning never stops"),
-        result = tokio::signal::ctrl_c() => result.context("listen for Ctrl-C"),
+        _ = interrupt.recv() => Ok(()),
+        _ = terminate.recv() => Ok(()),
+    };
+    // The monitor's config sender is now dropped. Let an in-flight SMTP
+    // attempt finish and record its outcome, without claiming another email.
+    if tokio::time::timeout(Duration::from_secs(20), delivery)
+        .await
+        .is_err()
+    {
+        eprintln!("Timed out waiting for email delivery to stop");
     }
+    result
 }
 
 /// Apply state-change retention at startup and hourly. A failed pass is retried
@@ -61,8 +95,12 @@ async fn prune_history(store: Store) {
     let mut ticks = tokio::time::interval(Duration::from_secs(3600));
     loop {
         ticks.tick().await;
-        if let Err(error) = store.prune_transitions(chrono::Utc::now()).await {
+        let now = chrono::Utc::now();
+        if let Err(error) = store.prune_transitions(now).await {
             eprintln!("prune state-change history: {error:#}");
+        }
+        if let Err(error) = store.prune_notifications(now).await {
+            eprintln!("prune notification history: {error:#}");
         }
     }
 }

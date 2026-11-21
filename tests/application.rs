@@ -143,6 +143,9 @@ impl Drop for Application {
     }
 }
 
+#[path = "support/smtp.rs"]
+mod smtp;
+
 fn plugin(dir: &TempDir, script: &str) {
     let path = dir.path().join("check");
     fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();

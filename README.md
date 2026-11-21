@@ -224,8 +224,7 @@ undetermined assessments share the initial failure streak. After confirmation,
 changing between down and undetermined requires the same matching-result streak
 as service severity changes. Host problems use the same configurable confirmation
 threshold and retry interval, independently of service problems. Only confirmed
-down is eligible for future service-notification suppression; notifications are
-still disabled.
+down is eligible for future service-notification suppression.
 
 SQLite saves each result, problem state, and lifecycle transition in one
 transaction. Streaks and confirmed severity survive restarts. Transitions include
@@ -234,11 +233,19 @@ changes, and recovery; repeated stable results do not create transitions.
 State changes are kept for 30 days: Ragios prunes older ones at startup and
 hourly. The latest result and current problem state of every check are never
 pruned, so a long-standing confirmed problem stays visible after its
-confirmation leaves the history. There is no notification delivery yet.
+confirmation leaves the history.
 Databases from before lifecycle support retain their results: an existing non-OK result seeds one pending failure,
 not a confirmed problem or invented historical transitions. The host-reachability
 schema upgrade preserves existing service results, confirmation state, and
 transition IDs; it does not infer host reachability from service results.
+
+## Email notifications
+
+Email is disabled by default. [Configure an authenticated SMTP relay](docs/configuration.md#email-delivery)
+to send email for confirmed service problems, confirmed severity changes, and
+eligible recoveries. Pending problems do not send email. Delivery retries run
+independently of checks and survive restarts in SQLite. Follow **Email delivery**
+from the dashboard to see delivery outcomes and SMTP errors.
 
 ## Access and current scope
 
@@ -268,7 +275,8 @@ problem and history browsing ([#7](https://github.com/artran/ragios/issues/7)), 
 restart recovery with freshness assessment
 ([#8](https://github.com/artran/ragios/issues/8)), weekly check windows
 ([#9](https://github.com/artran/ragios/issues/9)), and manual checks
-([#10](https://github.com/artran/ragios/issues/10)). Notifications are later work.
+([#10](https://github.com/artran/ragios/issues/10)), and durable email delivery
+([#11](https://github.com/artran/ragios/issues/11)).
 A displayed result is the last observation, not proof of current health. No
 existing Nagios server or configuration is modified.
 

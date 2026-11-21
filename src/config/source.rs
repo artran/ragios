@@ -16,6 +16,8 @@ pub(super) struct File {
     pub bind: SocketAddr,
     pub plugin_dir: PathBuf,
     pub database: PathBuf,
+    #[serde(default)]
+    pub email: super::email::EmailSource,
     #[serde(default = "super::default_interval")]
     pub interval_seconds: u64,
     #[serde(default = "super::default_timeout")]
@@ -403,6 +405,7 @@ impl File {
             !self.database.as_os_str().is_empty(),
             "database must not be empty"
         );
+        super::validate_database_path(&self.database)?;
         ensure!(
             !self.hosts.is_empty(),
             "hosts must contain at least one host"

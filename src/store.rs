@@ -1,4 +1,7 @@
+mod notifications;
 mod schema;
+
+pub use notifications::{DeliveryOutcome, Notification};
 
 use crate::{
     config::Probe,
@@ -12,6 +15,7 @@ use rusqlite::{
 };
 use std::{
     collections::HashMap,
+    fs::{File, OpenOptions},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -168,7 +172,7 @@ pub struct Transition {
 }
 
 #[derive(Clone)]
-pub struct Store(Arc<Mutex<Connection>>);
+pub struct Store(Arc<Mutex<Connection>>, Option<Arc<File>>);
 
 // Host checks have their own namespace, never a reserved user service ID.
 #[derive(Clone, PartialEq, Eq)]
@@ -227,7 +231,37 @@ impl Store {
         let mut connection = Connection::open(path)
             .with_context(|| format!("open SQLite database {}", path.display()))?;
         schema::initialize(&mut connection)?;
-        Ok(Self(Arc::new(Mutex::new(connection))))
+        Ok(Self(Arc::new(Mutex::new(connection)), None))
+    }
+
+    /// Only a server holding this advisory lock may run the delivery worker.
+    /// Keep a separate lock file: SQLite can use advisory locks on the database
+    /// itself. Never unlink the lock file, as contenders may already have it open.
+    pub fn open_server(path: &Path) -> Result<Self> {
+        crate::config::validate_database_path(path)?;
+        // Resolve aliases before deriving the lock path. Create an empty file
+        // on first start without opening SQLite before the lock is acquired.
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open SQLite database {}", path.display()))?;
+        let database = path
+            .canonicalize()
+            .context("resolve database path for server lock")?;
+        let mut lock_path = database.as_os_str().to_os_string();
+        lock_path.push(".ragios.lock");
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .context("open Ragios server lock file")?;
+        file.try_lock().with_context(|| format!("acquire exclusive Ragios server lock for database {} (another instance may be running)", database.display()))?;
+        let mut store = Self::open(&database)?;
+        store.1 = Some(Arc::new(file));
+        Ok(store)
     }
 
     /// Persist the result, problem state, and any transition atomically. The
@@ -270,6 +304,18 @@ impl Store {
         target: CheckTarget,
         result: CheckResult,
         confirmation_attempts: u32,
+    ) -> Result<ProblemState> {
+        self.save_with_notifications(host_id, target, result, confirmation_attempts, Vec::new())
+            .await
+    }
+
+    pub async fn save_with_notifications(
+        &self,
+        host_id: String,
+        target: CheckTarget,
+        result: CheckResult,
+        confirmation_attempts: u32,
+        recipients: Vec<String>,
     ) -> Result<ProblemState> {
         ensure!(
             confirmation_attempts > 0,
@@ -354,6 +400,9 @@ impl Store {
                         target.kind().as_str()
                     ],
                 )?;
+                if matches!(target, CheckTarget::Service(_)) {
+                    notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, &result, &recipients)?;
+                }
             }
             transaction.commit()?;
             Ok(state)

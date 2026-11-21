@@ -50,6 +50,8 @@ pub fn router(
     Ok(Router::new()
         .route("/", get(page))
         .route("/status", get(status))
+        .route("/notifications", get(notifications_page))
+        .route("/notifications/status", get(notifications_status))
         .route("/hosts/{host}", get(host_page))
         .route("/hosts/{host}/status", get(host_status))
         .route("/hosts/{host}/reachability", get(reachability_page))
@@ -238,7 +240,7 @@ async fn page(State(dashboard): State<Dashboard>, Query(filters): Query<Filters>
     Ok(layout(
         "Ragios — host reachability and service health",
         &format!(
-            r##"<h1>Ragios</h1><p>Host reachability and service health · email disabled</p>
+            r##"<h1>Ragios</h1><p>Host reachability and service health · <a href="/notifications">Email delivery</a></p>
 <p>Latest results, confirmed problems, and pending changes are shown separately.
 Reachability is assessed from this monitoring server, independently of service health.
 A failed probe does not prove the machine is powered off. Service checks continue regardless of host reachability.</p>
@@ -267,6 +269,57 @@ async fn status(
         response.headers_mut().insert("hx-replace-url", url);
     }
     Ok(response)
+}
+
+async fn notifications_page(State(dashboard): State<Dashboard>) -> WebResult {
+    let fragment = notification_deliveries(&dashboard).await?;
+    Ok(layout(
+        "Ragios — Email delivery",
+        &format!(
+            r#"<nav><a href="/">Overview</a></nav><h1>Email delivery</h1>
+<div hx-get="/notifications/status" hx-trigger="every 2s" hx-swap="innerHTML">{fragment}</div>"#,
+        ),
+    ))
+}
+
+async fn notifications_status(State(dashboard): State<Dashboard>) -> WebResult {
+    Ok(Html(notification_deliveries(&dashboard).await?))
+}
+
+async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebError> {
+    let mode = if dashboard.config.borrow().smtp.is_some() {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    let records = dashboard
+        .store
+        .recent_deliveries()
+        .await
+        .map_err(load_error)?;
+    let mut html = format!("<p>SMTP email {mode}.</p>");
+    if records.is_empty() {
+        html.push_str("<p>No notification deliveries recorded.</p>");
+        return Ok(html);
+    }
+    html.push_str("<h2>Recent notification deliveries</h2><div class=\"scroll\"><table><thead><tr><th>Host / Service</th><th>Notification</th><th>Recipient</th><th>State</th><th>Attempts</th><th>Last update</th><th>Diagnostic</th></tr></thead><tbody>");
+    for record in records {
+        let notification = record.notification;
+        let _ = write!(
+            html,
+            "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape(&notification.host_id),
+            escape(&notification.service_id),
+            escape(&notification.label()),
+            escape(&notification.recipient),
+            escape(&record.state),
+            notification.attempts,
+            escape(&record.updated_at),
+            escape(record.diagnostic.as_deref().unwrap_or("—")),
+        );
+    }
+    html.push_str("</tbody></table></div>");
+    Ok(html)
 }
 
 fn load_error(error: anyhow::Error) -> WebError {
