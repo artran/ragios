@@ -143,6 +143,8 @@ impl Drop for Application {
     }
 }
 
+#[path = "support/fleet.rs"]
+mod fleet;
 #[path = "support/smtp.rs"]
 mod smtp;
 

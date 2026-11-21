@@ -1,0 +1,47 @@
+commands:
+  - id: http
+    executable: check_http
+    args: ["-H", "{{address}}", "-p", "80", "-u", "/health"]
+  - id: https
+    executable: check_http
+    args: ["-H", "{{address}}", "-p", "443", "-S", "--sni", "-u", "/health"]
+  - id: https-redirect
+    executable: check_http
+    args: ["-H", "{{address}}", "-p", "80", "-u", "/", "-f", "follow"]
+  - id: certificate
+    executable: check_http
+    args: ["-H", "{{address}}", "-p", "443", "--sni", "-C", "30,14"]
+  # Illustrative contracts only. Use the actual installed scripts and their CLI.
+  - id: application
+    executable: check_application
+    args: ["--url", "https://{{address}}/api/health", "--credential-file", "{{credential_file}}"]
+  - id: json
+    executable: check_json
+    args: ["--url", "https://{{address}}/api/health", "--field", "status", "--expected", "ok"]
+  - id: threshold
+    executable: check_threshold
+    args: ["--url", "https://{{address}}/api/queue", "--warning", "100", "--critical", "250"]
+  - id: version
+    executable: check_version
+    args: ["--url", "https://{{address}}/api/version", "--expected", "{{expected_version}}"]
+  - id: tailscale-node
+    executable: check_tailscale_node
+    args: ["--node", "{{address}}"]
+
+bundles:
+  - id: public-web
+    services:
+      - {id: http, name: HTTP health, command: http}
+      - {id: https, name: HTTPS health, command: https}
+      - {id: redirect, name: Follow public redirect, command: https-redirect}
+      - id: certificate
+        name: TLS certificate expiry
+        command: certificate
+        interval_seconds: 86400
+        check_window: weekday-certificates
+  - id: application
+    services:
+      - {id: application, name: Authenticated application health, command: application}
+      - {id: json, name: JSON health status, command: json}
+      - {id: threshold, name: Queue depth, command: threshold}
+      - {id: version, name: Deployed version, command: version}

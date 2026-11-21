@@ -99,6 +99,16 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
              DROP TABLE problem_transitions;",
         )?;
     }
+    let has_email_disabled: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('check_transitions') WHERE name = 'email_disabled')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_email_disabled {
+        transaction.execute_batch(
+            "ALTER TABLE check_transitions ADD COLUMN email_disabled INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     // Clear episodes on recovery even when the previous binary records it
     // during a rollback. Re-upgrading must never revive an acknowledgement.
     transaction.execute_batch(

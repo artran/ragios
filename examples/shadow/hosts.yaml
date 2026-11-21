@@ -1,0 +1,36 @@
+groups:
+  - id: web
+    name: Web platforms
+    recipients: [web@example.invalid]
+  - id: private
+    name: Private nodes
+
+hosts:
+  - id: public-web
+    name: Public web (group recipients)
+    address: web.example.invalid
+    group: web
+    bundles: [public-web]
+    reachability:
+      probe: ping
+      executable: check_ping
+      args: ["-H", "{{address}}", "-w", "100.0,20%", "-c", "500.0,60%", "-p", "5"]
+  - id: api
+    name: API (host recipients)
+    address: api.example.invalid
+    group: web
+    recipients: [api@example.invalid]
+    bundles: [public-web, application]
+    vars:
+      credential_file: /etc/ragios/credentials/api-token
+      expected_version: "1.2.3"
+    reachability:
+      probe: tcp
+      executable: check_tcp
+      args: ["-H", "{{address}}", "-p", "443"]
+  - id: private-node
+    name: Private node (global recipients)
+    address: private-node.example.invalid
+    group: private
+    services:
+      - {id: tailscale, name: Tailnet node health, command: tailscale-node}
