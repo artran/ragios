@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -13,8 +13,8 @@ use ragios::{
     runner::{CheckResult, Reachability, Status},
     schedule,
     store::{
-        LatestHosts, LatestResults, ProblemState, Store, TRANSITION_RETENTION, Transition,
-        TransitionKind,
+        AcknowledgeOutcome, LatestHosts, LatestResults, ProblemEpisode, ProblemState, Store,
+        TRANSITION_RETENTION, Transition, TransitionKind,
     },
 };
 use serde::Deserialize;
@@ -71,6 +71,14 @@ pub fn router(
         .route(
             "/hosts/{host}/services/{service}/check-now",
             post(service_check_now),
+        )
+        .route(
+            "/hosts/{host}/reachability/acknowledge",
+            post(reachability_acknowledge),
+        )
+        .route(
+            "/hosts/{host}/services/{service}/acknowledge",
+            post(service_acknowledge),
         )
         .route(
             "/assets/htmx.min.js",
@@ -592,10 +600,12 @@ fn checks_table(
                         &format!("Configured probe: {}", probe.probe.label()),
                         &reachability_url(host),
                     );
+                    let episode = state.and_then(|state| state.episode.as_ref());
                     let state = state.map(|state| (&state.result, state.problem));
                     render_result(
                         &mut rows,
                         state,
+                        episode,
                         snapshot.freshness(&reachability_key(host), &probe.check, state),
                         CheckDisplay::Reachability(
                             hosts.get(&host.id).map_or(probe.probe, |state| state.probe),
@@ -616,10 +626,12 @@ fn checks_table(
                         &service.id,
                         &service_url(host, service),
                     );
+                    let episode = state.and_then(|state| state.episode.as_ref());
                     let state = state.map(|state| (&state.result, state.problem));
                     render_result(
                         &mut rows,
                         state,
+                        episode,
                         snapshot.freshness(&key, &service.check, state),
                         CheckDisplay::Service,
                         config.confirmation_attempts,
@@ -718,10 +730,19 @@ fn latest_cell(result: &CheckResult, display: CheckDisplay, freshness: Freshness
     cell
 }
 
-fn confirmed_cell(problem: ProblemState, display: CheckDisplay) -> String {
+fn confirmed_cell(
+    problem: ProblemState,
+    display: CheckDisplay,
+    episode: Option<&ProblemEpisode>,
+) -> String {
+    let acknowledgement = if episode.is_some_and(|episode| episode.acknowledged) {
+        "<br><small>Acknowledged — reminders paused</small>"
+    } else {
+        ""
+    };
     match problem.confirmed_severity {
         Some(severity) => format!(
-            "<td class=\"{}\">Confirmed problem: {}</td>",
+            "<td class=\"{}\">Confirmed problem: {}{acknowledgement}</td>",
             severity.label(),
             display.label(severity)
         ),
@@ -755,6 +776,7 @@ fn pending_cell(
 fn render_result(
     html: &mut String,
     state: Option<(&CheckResult, ProblemState)>,
+    episode: Option<&ProblemEpisode>,
     freshness: Freshness,
     display: CheckDisplay,
     confirmation_attempts: u32,
@@ -762,7 +784,7 @@ fn render_result(
     if let Some((result, problem)) = state {
         html.push_str(&latest_cell(result, display, freshness));
         html.push_str(&freshness.cell());
-        html.push_str(&confirmed_cell(problem, display));
+        html.push_str(&confirmed_cell(problem, display, episode));
         html.push_str(&pending_cell(problem, display, confirmation_attempts));
         let _ = write!(
             html,
@@ -872,6 +894,7 @@ struct CheckDetail<'a> {
     url: String,
     display: CheckDisplay,
     state: Option<(&'a CheckResult, ProblemState)>,
+    episode: Option<&'a ProblemEpisode>,
     freshness: Freshness,
 }
 
@@ -883,10 +906,8 @@ impl<'a> CheckDetail<'a> {
             .iter()
             .find(|service| service.id == service_id)?;
         let key = service_key(host, service);
-        let state = snapshot
-            .services
-            .get(&key)
-            .map(|state| (&state.result, state.problem));
+        let saved = snapshot.services.get(&key);
+        let state = saved.map(|state| (&state.result, state.problem));
         Some(Self {
             host,
             name: &service.name,
@@ -894,6 +915,7 @@ impl<'a> CheckDetail<'a> {
             url: service_url(host, service),
             display: CheckDisplay::Service,
             state,
+            episode: saved.and_then(|state| state.episode.as_ref()),
             freshness: snapshot.freshness(&key, &service.check, state),
         })
     }
@@ -910,6 +932,7 @@ impl<'a> CheckDetail<'a> {
             url: reachability_url(host),
             display: CheckDisplay::Reachability(saved.map_or(probe.probe, |state| state.probe)),
             state,
+            episode: saved.and_then(|state| state.episode.as_ref()),
             freshness: snapshot.freshness(&reachability_key(host), &probe.check, state),
         })
     }
@@ -925,7 +948,7 @@ impl<'a> CheckDetail<'a> {
         )
     }
 
-    fn fragment(&self, snapshot: &Snapshot, transitions: &[Transition]) -> String {
+    fn fragment(&self, snapshot: &Snapshot, transitions: &[Transition], csrf: &str) -> String {
         let confirmation_attempts = snapshot.config.confirmation_attempts;
         let mut html = alerts(snapshot);
         html.push_str("<h2>Current state</h2><table class=\"facts\"><tbody>");
@@ -936,7 +959,7 @@ impl<'a> CheckDetail<'a> {
                     "<tr><th>Latest result</th>{}</tr><tr><th>Freshness</th>{}</tr><tr><th>Confirmed problem</th>{}</tr><tr><th>Pending problem / severity change</th>{}</tr><tr><th>Output</th><td><pre>{}</pre></td></tr><tr><th>Started (UTC)</th><td>{}</td></tr><tr><th>Finished (UTC)</th><td>{}</td></tr><tr><th>Duration</th><td>{} ms</td></tr><tr><th>Result age</th><td>{}</td></tr>",
                     latest_cell(result, self.display, self.freshness),
                     self.freshness.cell(),
-                    confirmed_cell(problem, self.display),
+                    confirmed_cell(problem, self.display, self.episode),
                     pending_cell(problem, self.display, confirmation_attempts),
                     escape(&result.output),
                     escape(&result.started_at),
@@ -953,7 +976,16 @@ impl<'a> CheckDetail<'a> {
                 );
             }
         }
-        html.push_str("</tbody></table><h2>State changes</h2>");
+        html.push_str("</tbody></table>");
+        if let Some(episode) = self.episode.filter(|episode| !episode.acknowledged) {
+            let _ = write!(
+                html,
+                r#"<form method="post" action="{}/acknowledge"><input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="episode" value="{}"><button>Acknowledge problem</button></form>"#,
+                self.url,
+                escape(&episode.token),
+            );
+        }
+        html.push_str("<h2>State changes</h2>");
         if transitions.is_empty() {
             let _ = write!(
                 html,
@@ -972,7 +1004,7 @@ impl<'a> CheckDetail<'a> {
                 change_label(transition, self.display),
                 result.label(),
                 self.display.label(result),
-                confirmed_cell(transition.state, self.display)
+                confirmed_cell(transition.state, self.display, None)
             );
         }
         html.push_str("</tbody></table></div>");
@@ -1042,25 +1074,25 @@ async fn check_detail(
         CheckPath::Reachability(host) => dashboard.store.host_transitions(host.clone()).await,
     }
     .map_err(load_error)?;
-    let fragment = detail.fragment(&snapshot, &transitions);
-    Ok(if fragment_only {
+    let fragment = detail.fragment(&snapshot, &transitions, &dashboard.csrf);
+    let mut response = if fragment_only {
         Html(fragment).into_response()
     } else {
         let control = check_now_form(&detail.url, &dashboard.csrf);
-        let mut response = detail_page(
+        detail_page(
             detail.name,
             &(detail.heading() + &control),
             &detail.url,
             &fragment,
-        );
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        response
-            .headers_mut()
-            .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-        response
-    })
+        )
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    Ok(response)
 }
 
 async fn service_page(
@@ -1104,6 +1136,34 @@ struct CheckNowForm {
     csrf: String,
 }
 
+fn validate_mutation(
+    dashboard: &Dashboard,
+    uri: &Uri,
+    headers: &HeaderMap,
+    csrf: &str,
+) -> Result<(), WebError> {
+    // The private dashboard has no accounts. A foreign page cannot read this
+    // process-local token, and explicit non-same-origin browser requests are
+    // rejected even when they include a token.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site != "same-origin")
+        || csrf != dashboard.csrf.as_ref()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Invalid dashboard request; reload the page.",
+        ));
+    }
+    if uri.query().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Dashboard mutations do not accept query parameters.",
+        ));
+    }
+    Ok(())
+}
+
 async fn check_now(
     dashboard: &Dashboard,
     key: Key,
@@ -1111,25 +1171,7 @@ async fn check_now(
     headers: &HeaderMap,
     form: CheckNowForm,
 ) -> Result<Response, WebError> {
-    // The private dashboard has no accounts. A foreign page cannot read this
-    // process-local token, and explicit non-same-origin browser requests are
-    // rejected even when they include a token.
-    if headers
-        .get("sec-fetch-site")
-        .is_some_and(|site| site != "same-origin")
-        || form.csrf != *dashboard.csrf
-    {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Invalid check request; reload the dashboard.",
-        ));
-    }
-    if uri.query().is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Check requests do not accept query parameters.",
-        ));
-    }
+    validate_mutation(dashboard, uri, headers, &form.csrf)?;
     let unavailable = (StatusCode::SERVICE_UNAVAILABLE, "Scheduler is unavailable.");
     let (reply, outcome) = oneshot::channel();
     let outcome = match dashboard.requests.try_send(CheckRequest { key, reply }) {
@@ -1179,6 +1221,80 @@ async fn reachability_check_now(
     Form(form): Form<CheckNowForm>,
 ) -> Result<Response, WebError> {
     check_now(&dashboard, (host, String::new()), &uri, &headers, form).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeForm {
+    csrf: String,
+    episode: String,
+}
+
+async fn acknowledge(
+    dashboard: &Dashboard,
+    path: CheckPath,
+    uri: &Uri,
+    headers: &HeaderMap,
+    form: AcknowledgeForm,
+) -> Result<Response, WebError> {
+    validate_mutation(dashboard, uri, headers, &form.csrf)?;
+    let (host, service) = match path {
+        CheckPath::Service(host, service) => (host, Some(service)),
+        CheckPath::Reachability(host) => (host, None),
+    };
+    match dashboard
+        .store
+        .acknowledge_problem(dashboard.config.clone(), host, service, form.episode)
+        .await
+        .map_err(load_error)?
+    {
+        AcknowledgeOutcome::Acknowledged => {
+            let detail_url = uri
+                .path()
+                .strip_suffix("/acknowledge")
+                .expect("acknowledge route");
+            Ok(Redirect::to(detail_url).into_response())
+        }
+        AcknowledgeOutcome::NotConfigured => Ok(not_configured("check")),
+        AcknowledgeOutcome::NoMatchingProblem => Err((
+            StatusCode::CONFLICT,
+            "This confirmed problem is no longer current; reload the dashboard.",
+        )),
+    }
+}
+
+async fn service_acknowledge(
+    State(dashboard): State<Dashboard>,
+    Path((host, service)): Path<Key>,
+    uri: Uri,
+    headers: HeaderMap,
+    Form(form): Form<AcknowledgeForm>,
+) -> Result<Response, WebError> {
+    acknowledge(
+        &dashboard,
+        CheckPath::Service(host, service),
+        &uri,
+        &headers,
+        form,
+    )
+    .await
+}
+
+async fn reachability_acknowledge(
+    State(dashboard): State<Dashboard>,
+    Path(host): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    Form(form): Form<AcknowledgeForm>,
+) -> Result<Response, WebError> {
+    acknowledge(
+        &dashboard,
+        CheckPath::Reachability(host),
+        &uri,
+        &headers,
+        form,
+    )
+    .await
 }
 
 fn escape(text: &str) -> String {

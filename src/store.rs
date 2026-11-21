@@ -4,7 +4,7 @@ mod schema;
 pub use notifications::{DeliveryOutcome, Notification, NotificationPolicy};
 
 use crate::{
-    config::Probe,
+    config::{Config, Probe},
     runner::{CheckResult, Reachability, Status},
 };
 use anyhow::{Context, Result, ensure};
@@ -29,6 +29,7 @@ pub struct HostState {
     pub probe: Probe,
     pub result: CheckResult,
     pub problem: ProblemState,
+    pub episode: Option<ProblemEpisode>,
 }
 
 impl HostState {
@@ -46,6 +47,19 @@ impl HostState {
 pub struct CheckState {
     pub result: CheckResult,
     pub problem: ProblemState,
+    pub episode: Option<ProblemEpisode>,
+}
+
+/// Current confirmed episode, independent of check history and email delivery.
+pub struct ProblemEpisode {
+    pub token: String,
+    pub acknowledged: bool,
+}
+
+pub enum AcknowledgeOutcome {
+    Acknowledged,
+    NotConfigured,
+    NoMatchingProblem,
 }
 
 /// A pending severity is either an initial failure or a candidate change to a
@@ -389,6 +403,22 @@ impl Store {
                 ],
             )?;
             if let Some(kind) = state.transition_from(previous) {
+                match kind {
+                    TransitionKind::Confirmed => {
+                        transaction.execute(
+                            "INSERT INTO check_problem_episodes (host_id, service_id, token)
+                             VALUES (?1, ?2, lower(hex(randomblob(16))))",
+                            params![host_id, service_id],
+                        )?;
+                    }
+                    TransitionKind::Recovery if previous.confirmed_severity.is_some() => {
+                        transaction.execute(
+                            "DELETE FROM check_problem_episodes WHERE host_id = ?1 AND service_id = ?2",
+                            params![host_id, service_id],
+                        )?;
+                    }
+                    _ => {}
+                }
                 transaction.execute(
                     "INSERT INTO check_transitions
                      (host_id, service_id, occurred_at, result_status, kind,
@@ -420,6 +450,47 @@ impl Store {
         .await?
     }
 
+    pub async fn acknowledge_problem(
+        &self,
+        active: tokio::sync::watch::Receiver<Arc<Config>>,
+        host_id: String,
+        service_id: Option<String>,
+        token: String,
+    ) -> Result<AcknowledgeOutcome> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            // Keep the active identity and current episode stable until the write completes.
+            let config = active.borrow();
+            let configured = config.hosts.iter().any(|host| {
+                host.id == host_id
+                    && match &service_id {
+                        Some(id) => {
+                            !id.is_empty() && host.services.iter().any(|service| service.id == *id)
+                        }
+                        None => host.reachability.is_some(),
+                    }
+            });
+            if !configured {
+                return Ok(AcknowledgeOutcome::NotConfigured);
+            }
+            let updated = connection.execute(
+                "UPDATE check_problem_episodes SET acknowledged = 1
+                 WHERE host_id = ?1 AND service_id = ?2 AND token = ?3",
+                params![host_id, service_id.as_deref().unwrap_or_default(), token],
+            )?;
+            Ok(if updated == 0 {
+                AcknowledgeOutcome::NoMatchingProblem
+            } else {
+                AcknowledgeOutcome::Acknowledged
+            })
+        })
+        .await?
+    }
+
     pub async fn latest(&self) -> Result<LatestResults> {
         Ok(self
             .latest_checks(CheckKind::Service)
@@ -440,6 +511,7 @@ impl Store {
                         probe: saved.probe.context("host result missing probe origin")?,
                         result: saved.state.result,
                         problem: saved.state.problem,
+                        episode: saved.state.episode,
                     },
                 ))
             })
@@ -456,9 +528,11 @@ impl Store {
             let mut query = connection.prepare(
                 "SELECT r.host_id, r.service_id, r.status, r.output, r.started_at,
                         r.finished_at, r.duration_ms,
-                        p.confirmed_severity, p.pending_severity, p.pending_attempts, r.probe
+                        p.confirmed_severity, p.pending_severity, p.pending_attempts, r.probe,
+                        e.token, COALESCE(e.acknowledged, 0)
                  FROM check_results r JOIN check_problems p
                     ON r.host_id = p.host_id AND r.service_id = p.service_id AND r.check_kind = p.check_kind
+                 LEFT JOIN check_problem_episodes e ON r.host_id = e.host_id AND r.service_id = e.service_id
                  WHERE r.check_kind = ?1",
             )?;
             let rows = query.query_map([kind.as_str()], |row| {
@@ -474,6 +548,10 @@ impl Store {
                             duration_ms: row.get(6)?,
                         },
                         problem: read_problem(row, 7)?,
+                        episode: match row.get(11)? {
+                            Some(token) => Some(ProblemEpisode { token, acknowledged: row.get(12)? }),
+                            None => None,
+                        },
                     },
                     probe: row.get(10)?,
                 })

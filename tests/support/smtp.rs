@@ -85,6 +85,140 @@ fn smtp_sends_recurring_host_reminders_but_no_service_mail_during_a_prolonged_ou
             .respond(250);
     }
     app.page(DELIVERY, "Reminder: Down");
+    let reachability = "/hosts/local/reachability";
+    let page = app.page(reachability, "Acknowledge problem");
+    assert!(
+        acknowledge(
+            &app,
+            reachability,
+            super::check_now_token(&page),
+            episode_token(&page)
+        )
+        .send()
+        .unwrap()
+        .status()
+        .is_success()
+    );
+    app.page(reachability, "Acknowledged");
+    check(&mut app, &dir, 1, "severity changed while host is down");
+    app.page(DELIVERY, "Held: host confirmed down");
+    assert!(
+        !app.page(SERVICE, "Confirmed problem: WARNING")
+            .contains("Acknowledged")
+    );
+    relay.expect_quiet(Duration::from_millis(1500));
+}
+
+fn episode_token(page: &str) -> &str {
+    page.split_once("name=\"episode\" value=\"")
+        .expect("acknowledgement form has an episode token")
+        .1
+        .split('"')
+        .next()
+        .unwrap()
+}
+
+fn acknowledge(
+    app: &Application,
+    target: &str,
+    csrf: &str,
+    episode: &str,
+) -> reqwest::blocking::RequestBuilder {
+    app.client
+        .post(format!("{}{target}/acknowledge", app.url))
+        .form(&[("csrf", csrf), ("episode", episode)])
+}
+
+#[test]
+fn dashboard_acknowledgement_survives_restart_and_stops_only_reminders() {
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(
+        &dir,
+        &relay,
+        "confirmation_attempts: 1\nreminder_interval_seconds: 2",
+    );
+    observation(&dir, 2, "current failure");
+    let mut app = Application::start(&path);
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    let page = app.page(SERVICE, "Acknowledge problem");
+    let csrf = super::check_now_token(&page);
+    let episode = episode_token(&page);
+    let acknowledge =
+        |app: &Application, target: &str, csrf: &str| acknowledge(app, target, csrf, episode);
+    assert_eq!(
+        acknowledge(&app, SERVICE, csrf)
+            .header("sec-fetch-site", "cross-site")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        acknowledge(&app, SERVICE, "invalid")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    for target in [
+        "/hosts/unknown/services/application",
+        "/hosts/local/services/missing",
+        "/hosts/local/reachability",
+    ] {
+        assert_eq!(
+            acknowledge(&app, target, csrf).send().unwrap().status(),
+            404
+        );
+    }
+    assert!(
+        acknowledge(&app, SERVICE, csrf)
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    app.page("/status", "Acknowledged");
+    drop(app);
+    let mut app = Application::start(&path);
+    let after_restart = app.page(SERVICE, "Acknowledged");
+    let csrf = super::check_now_token(&after_restart);
+    check(&mut app, &dir, 2, "same problem after manual check");
+    app.page(SERVICE, "Acknowledged");
+    check(&mut app, &dir, 1, "confirmed change");
+    relay
+        .receive(
+            "observer@example.invalid",
+            "Confirmed severity change: WARNING",
+        )
+        .respond(250);
+    app.page(SERVICE, "Acknowledged");
+    relay.expect_quiet(Duration::from_millis(2300));
+    check(&mut app, &dir, 0, "recovered after acknowledgement");
+    relay
+        .receive("observer@example.invalid", "Recovery: OK")
+        .respond(250);
+    assert!(
+        !app.page(SERVICE, "No confirmed problem")
+            .contains("Acknowledged")
+    );
+    assert_eq!(
+        acknowledge(&app, SERVICE, csrf).send().unwrap().status(),
+        409
+    );
+    check(&mut app, &dir, 2, "new episode");
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    assert_eq!(
+        acknowledge(&app, SERVICE, csrf).send().unwrap().status(),
+        409
+    );
+    relay
+        .receive("observer@example.invalid", "Reminder: CRITICAL")
+        .respond(250);
 }
 
 #[test]
@@ -634,6 +768,84 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
     assert!(
         store
             .next_notification_at(active, at(20_000))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn acknowledgement_blocks_an_already_selected_reminder_at_dispatch() {
+    use chrono::{TimeDelta, Utc};
+    use ragios::{
+        config::Config,
+        runner::Status::Critical,
+        store::{AcknowledgeOutcome, DeliveryOutcome, Store},
+    };
+
+    let dir = TempDir::new().unwrap();
+    private_file(&dir, "username", USER);
+    private_file(&dir, "password", PASSWORD);
+    let path = config(
+        &dir,
+        &format!(
+            "{}recipients: [observer@example.invalid]",
+            smtp_yaml("127.0.0.1", 1, "implicit")
+        ),
+    );
+    let config = Arc::new(Config::load(&path).unwrap());
+    let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+    let store = Store::open_server(&config.database).unwrap();
+    let observed_at = Utc::now();
+    save_observation(&store, application_target(), Critical, observed_at).await;
+    let delivered_at = observed_at + TimeDelta::seconds(1);
+    let initial = store
+        .next_notification_at(active.clone(), delivered_at)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(initial.label(), "Confirmed problem: CRITICAL");
+    let initial = store
+        .begin_notification_at(initial, active.clone(), config.clone(), delivered_at)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .finish_notification_at(initial, DeliveryOutcome::Delivered, delivered_at)
+        .await
+        .unwrap();
+
+    let due_at = delivered_at + TimeDelta::hours(1);
+    let reminder = store
+        .next_notification_at(active.clone(), due_at)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reminder.label(), "Reminder: CRITICAL");
+    let host = "local".to_owned();
+    let service = "application".to_owned();
+    let latest = store.latest().await.unwrap();
+    let episode = latest[&(host.clone(), service.clone())]
+        .episode
+        .as_ref()
+        .unwrap();
+    assert!(matches!(
+        store
+            .acknowledge_problem(active.clone(), host, Some(service), episode.token.clone())
+            .await
+            .unwrap(),
+        AcknowledgeOutcome::Acknowledged
+    ));
+    assert!(
+        store
+            .begin_notification_at(reminder, active.clone(), config, due_at)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .next_notification_at(active, due_at + TimeDelta::hours(24))
             .await
             .unwrap()
             .is_none()

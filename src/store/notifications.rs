@@ -628,8 +628,10 @@ impl Store {
             let mut statement = db.prepare(
                 "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
                         e.occurred_at, d.attempts, e.reminder_for IS NOT NULL,
-                        d.state, d.diagnostic, d.updated_at, d.remind_from
+                        d.state, d.diagnostic, d.updated_at,
+                        CASE WHEN p.acknowledged IS NOT 1 THEN d.remind_from END
                  FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
+                 LEFT JOIN check_problem_episodes p ON p.host_id = e.host_id AND p.service_id = e.service_id
                  ORDER BY d.updated_at DESC, d.event_id DESC, d.recipient LIMIT 100",
             )?;
             let rows = statement.query_map([], |row| {
@@ -710,6 +712,9 @@ fn queue_due_reminder(
                AND host_id IN (SELECT value FROM json_each(?2))
          )) AND (e.host_id, e.service_id) NOT IN (
              SELECT value ->> 0, value ->> 1 FROM json_each(?3)
+         ) AND NOT EXISTS (
+             SELECT 1 FROM check_problem_episodes p
+             WHERE p.host_id = e.host_id AND p.service_id = e.service_id AND p.acknowledged = 1
          ) ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
             params![
                 now.timestamp_millis() - i64::from(config.reminder_interval_seconds) * 1000,
@@ -751,7 +756,7 @@ fn obsolete_reason(
     config: &Config,
     notification: &Notification,
 ) -> Result<Option<&'static str>> {
-    let Some((episode, current)) = db
+    let Some((episode, current, acknowledged)) = db
         .query_row(
             "SELECT e.episode_id,
                 NOT EXISTS(SELECT 1 FROM notification_events newer
@@ -760,10 +765,12 @@ fn obsolete_reason(
                 AND EXISTS(SELECT 1 FROM check_problems p
                     WHERE p.check_kind = CASE WHEN e.service_id = '' THEN 'host' ELSE 'service' END
                     AND p.host_id = e.host_id AND p.service_id = e.service_id
-                    AND p.confirmed_severity IS NULLIF(e.severity, 0))
+                    AND p.confirmed_severity IS NULLIF(e.severity, 0)),
+                EXISTS(SELECT 1 FROM check_problem_episodes p
+                    WHERE p.host_id = e.host_id AND p.service_id = e.service_id AND p.acknowledged = 1)
          FROM notification_events e WHERE e.id = ?1",
             [notification.event_id],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, bool>(1)?)),
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?)),
         )
         .optional()?
     else {
@@ -771,6 +778,9 @@ fn obsolete_reason(
     };
     if !current {
         return Ok(Some("Superseded by a newer confirmed state"));
+    }
+    if notification.reminder && acknowledged {
+        return Ok(Some("Problem acknowledged"));
     }
     if !config.hosts.iter().any(|host| {
         host.id == notification.host_id

@@ -40,7 +40,14 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS transitions_by_check
             ON check_transitions(check_kind, host_id, service_id, id);
-         CREATE INDEX IF NOT EXISTS transitions_by_time ON check_transitions(occurred_at);",
+         CREATE INDEX IF NOT EXISTS transitions_by_time ON check_transitions(occurred_at);
+         CREATE TABLE IF NOT EXISTS check_problem_episodes (
+            host_id TEXT NOT NULL,
+            service_id TEXT NOT NULL,
+            token TEXT NOT NULL,
+            acknowledged INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (host_id, service_id)
+         );",
     )?;
     transaction.execute_batch(super::notifications::SCHEMA)?;
     super::notifications::migrate(&transaction)?;
@@ -91,6 +98,14 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
              DROP TABLE problem_transitions;",
         )?;
     }
+    // Backfill currently confirmed problems on upgrade, independently of
+    // retained check history and whether SMTP was configured.
+    transaction.execute_batch(
+        "INSERT INTO check_problem_episodes (host_id, service_id, token)
+         SELECT host_id, service_id, lower(hex(randomblob(16))) FROM check_problems
+         WHERE confirmed_severity IS NOT NULL
+         ON CONFLICT(host_id, service_id) DO NOTHING;",
+    )?;
     transaction.commit()?;
     Ok(())
 }
