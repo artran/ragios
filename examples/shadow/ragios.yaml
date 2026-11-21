@@ -1,0 +1,24 @@
+bind: "127.0.0.1:8080"
+plugin_dir: /usr/local/libexec/ragios/plugins
+database: /var/lib/ragios/shadow.sqlite3
+email: {mode: disabled}
+recipients: [operations@example.invalid]
+interval_seconds: 300
+retry_interval_seconds: 60
+confirmation_attempts: 3
+timeout_seconds: 30
+max_concurrent_checks: 20
+max_output_bytes: 65536
+startup_spread_seconds: 60
+notification_window: staffed-hours
+includes: [checks.yaml, hosts.yaml]
+
+check_windows:
+  - id: weekday-certificates
+    timezone: Europe/London
+    ranges:
+      - {days: [mon, tue, wed, thu, fri], start: "06:00", end: "08:00"}
+  - id: staffed-hours
+    timezone: Europe/London
+    ranges:
+      - {days: [mon, tue, wed, thu, fri], start: "09:00", end: "17:30"}

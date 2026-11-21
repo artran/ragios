@@ -5,7 +5,9 @@ plugins from YAML, stores their latest results in SQLite, and serves an HTML das
 updates. Email is disabled by default.
 
 For production installation as an unprivileged systemd service, see
-[Install Ragios on Amazon Linux 2023](docs/install-al2023.md).
+[Install Ragios on Amazon Linux 2023](docs/install-al2023.md). To evaluate
+Ragios alongside Nagios without sending email, see the
+[shadow evaluation runbook](docs/shadow-evaluation.md).
 
 ## Development setup
 
