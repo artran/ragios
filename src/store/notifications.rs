@@ -95,12 +95,14 @@ pub(super) fn record(
             _ => return Ok(()),
         }
     }
+    let now = Utc::now();
+    let updated_at = timestamp(now);
     if let Some((id, _, _)) = previous {
         tx.execute(
             "UPDATE notification_deliveries SET state = 'discarded', updated_at = ?2,
                     diagnostic = 'Superseded by a newer confirmed state'
              WHERE event_id = ?1 AND state IN ('queued', 'retrying')",
-            params![id, result.finished_at],
+            params![id, updated_at],
         )?;
     }
     tx.execute(
@@ -109,7 +111,7 @@ pub(super) fn record(
         params![host_id, service_id, episode, kind.as_str(), status_code(result.status), result.finished_at],
     )?;
     let event = tx.last_insert_rowid();
-    let ready_at = Utc::now().timestamp_millis();
+    let ready_at = now.timestamp_millis();
     for recipient in recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
@@ -120,7 +122,7 @@ pub(super) fn record(
         tx.execute(
             "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at)
              VALUES (?1, ?2, 'queued', ?3, ?4) ON CONFLICT DO NOTHING",
-            params![event, recipient, result.finished_at, ready_at],
+            params![event, recipient, updated_at, ready_at],
         )?;
     }
     Ok(())

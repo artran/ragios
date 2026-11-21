@@ -238,6 +238,7 @@ impl Store {
     /// Keep a separate lock file: SQLite can use advisory locks on the database
     /// itself. Never unlink the lock file, as contenders may already have it open.
     pub fn open_server(path: &Path) -> Result<Self> {
+        crate::config::validate_database_path(path)?;
         // Resolve aliases before deriving the lock path. Create an empty file
         // on first start without opening SQLite before the lock is acquired.
         OpenOptions::new()

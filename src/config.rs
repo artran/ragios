@@ -207,6 +207,15 @@ fn expand(arg: &str, host: &source::Host) -> Result<String> {
     Ok(output)
 }
 
+pub(crate) fn validate_database_path(path: &Path) -> Result<()> {
+    let path = path.as_os_str().as_encoded_bytes();
+    ensure!(
+        !path.starts_with(b"file:") && path != b":memory:",
+        "database must be a filesystem path, not a SQLite URI or :memory:"
+    );
+    Ok(())
+}
+
 fn default_bind() -> SocketAddr {
     ([127, 0, 0, 1], 8080).into()
 }

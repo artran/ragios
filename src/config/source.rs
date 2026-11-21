@@ -405,6 +405,7 @@ impl File {
             !self.database.as_os_str().is_empty(),
             "database must not be empty"
         );
+        super::validate_database_path(&self.database)?;
         ensure!(
             !self.hosts.is_empty(),
             "hosts must contain at least one host"

@@ -330,6 +330,61 @@ fn another_server_cannot_resume_the_same_outbox() {
     relay.expect_quiet(Duration::from_millis(350));
 }
 
+#[test]
+fn database_uri_is_rejected_before_creating_a_file() {
+    let dir = TempDir::new().unwrap();
+    let path = config(&dir, "");
+    let yaml = fs::read_to_string(&path).unwrap();
+    let uri = "file:state.sqlite3?mode=rwc";
+    fs::write(
+        &path,
+        yaml.replace("database: state.sqlite3", &format!("database: {uri}")),
+    )
+    .unwrap();
+    // Reserve an HTTP port so this startup test exits promptly even if the
+    // URI were incorrectly accepted and startup reached the listener.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let yaml = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        yaml.replace("127.0.0.1:0", &listener.local_addr().unwrap().to_string()),
+    )
+    .unwrap();
+    for argument in ["ragios.yaml", "./ragios.yaml", path.to_str().unwrap()] {
+        let result = Command::new(env!("CARGO_BIN_EXE_ragios"))
+            .current_dir(dir.path())
+            .args(["--config", argument])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(
+            stderr.contains("database must be a filesystem path"),
+            "{stderr}"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn current_notification_retries_after_smtp_credentials_are_corrected() {
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
+    private_file(&dir, "password", "incorrect");
+    observation(&dir, 2, "problem before credential repair");
+    let mut app = Application::start(&path);
+    let page = app.page(DELIVERY, "SMTP rejected authentication (reply 535)");
+    assert!(page.contains("<td>retrying</td>"));
+    assert!(!page.contains("incorrect"));
+    private_file(&dir, "password", PASSWORD);
+    app.reload("reloaded");
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    app.page(DELIVERY, "<td>delivered</td><td>2</td>");
+}
+
 #[tokio::test]
 async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evidence() {
     use ragios::{
@@ -373,7 +428,25 @@ async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evi
         .await
         .unwrap()
         .unwrap();
+    let before_discard = chrono::Utc::now().timestamp_millis();
     save(Status::Ok).await.unwrap();
+    let records = store.recent_deliveries().await.unwrap();
+    assert_eq!(records[0].state, "discarded");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&records[0].updated_at)
+            .unwrap()
+            .timestamp_millis()
+            >= before_discard
+    );
+    // Leave the row selectable, isolating the dispatch recheck from the
+    // normal superseding write that already marks this delivery discarded.
+    rusqlite::Connection::open(&config.database)
+        .unwrap()
+        .execute(
+            "UPDATE notification_deliveries SET state = 'queued' WHERE event_id = ?1",
+            [candidate.event_id],
+        )
+        .unwrap();
     assert!(
         store
             .begin_notification(candidate, active.clone(), config.clone())
@@ -640,10 +713,12 @@ fn handle_smtp(
     }
     assert!(smtp_line(&mut secure).starts_with("EHLO "));
     smtp_reply(secure.get_mut(), "250-localhost\r\n250 AUTH PLAIN");
-    assert_eq!(
-        smtp_line(&mut secure),
-        "AUTH PLAIN AGZha2UtdXNlcgBmYWtlLXBhc3N3b3JkLW5ldmVyLWluLWRpYWdub3N0aWNz"
-    );
+    let auth = smtp_line(&mut secure);
+    assert!(auth.starts_with("AUTH PLAIN "));
+    if auth != "AUTH PLAIN AGZha2UtdXNlcgBmYWtlLXBhc3N3b3JkLW5ldmVyLWluLWRpYWdub3N0aWNz" {
+        smtp_reply(secure.get_mut(), "535 incorrect credentials");
+        return;
+    }
     smtp_reply(secure.get_mut(), "235 Authenticated");
     assert_eq!(
         smtp_line(&mut secure),

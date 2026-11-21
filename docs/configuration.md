@@ -36,6 +36,7 @@ bundle, group, or host IDs are errors across the complete configuration.
 `plugin_dir` and `database` resolve beside the root file, even when all commands
 and hosts come from fragments. Relative executables resolve inside `plugin_dir`;
 absolute executables are allowed. Executables are never searched on `PATH`.
+Set `database` to a filesystem path, not a SQLite `file:` URI or `:memory:`.
 SQLite's parent directory must already exist and be writable.
 
 ## Commands, bundles, and hosts
@@ -330,7 +331,9 @@ queued deliveries. Transitions recorded while disabled are not replayed.
 
 Open **Email delivery** on the dashboard to see delivery state, attempts, and
 sanitized SMTP diagnostics. Temporary failures retry starting after three seconds,
-with exponential backoff up to five minutes. SMTP 5xx replies are not retried.
+with exponential backoff up to five minutes. A `535` authentication rejection
+also retries, so pending mail can be delivered after credentials are corrected
+and reloaded. Other SMTP 5xx replies are not retried.
 Ragios does not resend a recorded delivery on restart. If the relay accepts a
 message but Ragios cannot record that outcome (for example, on a crash), the
 outcome is uncertain and a still-current message may be retried. A message

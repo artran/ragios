@@ -55,7 +55,15 @@ impl Relay {
             Ok(Err(error)) => {
                 // SMTP servers can echo AUTH values in replies. Persist only a
                 // numeric reply code or a locally defined error description.
-                let diagnostic = match error.status() {
+                // 535 (invalid credentials) can be repaired by an operator.
+                // Keep it retryable, unlike a permanent rejection of a recipient.
+                let status = error.status().map(u16::from);
+                if status == Some(535) {
+                    return DeliveryOutcome::Retry(
+                        "SMTP rejected authentication (reply 535)".into(),
+                    );
+                }
+                let diagnostic = match status {
                     Some(code) => format!("SMTP rejected delivery (reply {code})"),
                     None if error.is_tls() => "SMTP TLS negotiation or verification failed".into(),
                     None if error.is_timeout() => "SMTP delivery timed out".into(),
