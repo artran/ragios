@@ -1,11 +1,11 @@
-use super::{Store, TransitionKind, status_code};
+use super::{Store, TransitionKind, silences, status_code};
 use crate::{
     config::Config,
     runner::{Reachability, Status},
 };
 use anyhow::{Result, anyhow, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, named_params, params};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -288,7 +288,7 @@ pub enum DeliveryOutcome {
 }
 
 impl Store {
-    async fn notification_db<T: Send + 'static>(
+    pub(super) async fn notification_db<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
@@ -360,24 +360,28 @@ impl Store {
                     .map(|host| &host.id)
                     .collect::<Vec<_>>(),
             )?;
+            let groups = serde_json::to_string(
+                &config.hosts.iter().map(|host| (&host.id, &host.group))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            )?;
             // Materialize at most one reminder per poll; no backlog accumulates
             // during restarts, suppression, or an unfinished SMTP attempt.
-            queue_due_reminder(&tx, &config, now, &reachability_hosts)?;
+            queue_due_reminder(&tx, &config, now, &reachability_hosts, &groups)?;
             // Bound how much reconciliation can delay check writes or reload.
             for _ in 0..32 {
                 let candidate = tx
                     .query_row(
-                        "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
+                        &format!("SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
                             e.occurred_at, d.attempts, e.reminder_for IS NOT NULL
                      FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
-                     WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= ?1
+                     WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= :now
                        AND (e.service_id = '' OR e.host_id NOT IN (
                            SELECT host_id FROM check_problems WHERE check_kind = 'host'
                              AND service_id = '' AND confirmed_severity = 2
-                             AND host_id IN (SELECT value FROM json_each(?2))
-                       ))
-                     ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1",
-                        params![now.timestamp_millis(), reachability_hosts],
+                             AND host_id IN (SELECT value FROM json_each(:reachability))
+                       )) AND {}
+                     ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1", silences::ACTIVE_FILTER),
+                        named_params!{":now": now.timestamp_millis(), ":reachability": reachability_hosts, ":groups": groups},
                         read_notification,
                     )
                     .optional()?;
@@ -402,9 +406,31 @@ impl Store {
     /// treated as in flight; SMTP I/O never holds the database lock.
     pub async fn begin_notification(
         &self,
+        notification: Notification,
+        active: watch::Receiver<Arc<Config>>,
+        relay_config: Arc<Config>,
+    ) -> Result<Option<Notification>> {
+        self.begin_notification_with_time(notification, active, relay_config, Utc::now)
+            .await
+    }
+
+    pub async fn begin_notification_at(
+        &self,
+        notification: Notification,
+        active: watch::Receiver<Arc<Config>>,
+        relay_config: Arc<Config>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Notification>> {
+        self.begin_notification_with_time(notification, active, relay_config, move || now)
+            .await
+    }
+
+    async fn begin_notification_with_time(
+        &self,
         mut notification: Notification,
         active: watch::Receiver<Arc<Config>>,
         relay_config: Arc<Config>,
+        time: impl FnOnce() -> DateTime<Utc> + Send + 'static,
     ) -> Result<Option<Notification>> {
         ensure!(
             self.1.is_some(),
@@ -427,14 +453,25 @@ impl Store {
                 tx.commit()?;
                 return Ok(None);
             }
-            if reconcile_held_change(&tx, &notification)? {
+            let now = time();
+            let group = config.hosts.iter().find(|host| host.id == notification.host_id)
+                .map(|host| host.group.as_str());
+            let expiry = silences::latest_expiry(&tx, &notification.host_id, &notification.service_id, group)?;
+            if expiry.is_some_and(|expiry| expiry > now) {
+                return Ok(None);
+            }
+            // An expired silence may have covered this queued transition even
+            // if the worker didn't poll until after it ended (e.g. restart).
+            let was_silenced = expiry.zip(notification.occurred_at.parse::<DateTime<Utc>>().ok())
+                .is_some_and(|(expiry, occurred)| expiry > occurred);
+            if reconcile_held_change(&tx, &notification, was_silenced)? {
                 tx.commit()?;
                 return Ok(None);
             }
             let updated = tx.execute(
                 "UPDATE notification_deliveries SET state = 'sending', attempts = attempts + 1, updated_at = ?3
                  WHERE event_id = ?1 AND recipient = ?2 AND state IN ('queued', 'retrying')",
-                params![notification.event_id, notification.recipient, timestamp(Utc::now())],
+                params![notification.event_id, notification.recipient, timestamp(now)],
             )?;
             tx.commit()?;
             notification.attempts += 1;
@@ -575,10 +612,14 @@ impl Store {
     }
 }
 
-// If the service changed away and back during the outage, the current
+// If the check changed away and back under suppression, the current
 // severity is already known to this recipient. Resume the reminder cadence
 // instead of sending a spurious change; keep distinct changes and recoveries.
-fn reconcile_held_change(tx: &Transaction<'_>, notification: &Notification) -> Result<bool> {
+fn reconcile_held_change(
+    tx: &Transaction<'_>,
+    notification: &Notification,
+    was_silenced: bool,
+) -> Result<bool> {
     if notification.reminder || notification.kind != TransitionKind::SeverityChanged {
         return Ok(false);
     }
@@ -587,10 +628,10 @@ fn reconcile_held_change(tx: &Transaction<'_>, notification: &Notification) -> R
          FROM notification_events e JOIN notification_deliveries held ON held.event_id = e.id
          JOIN notification_events prior ON prior.id = e.episode_id OR prior.episode_id = e.episode_id
          JOIN notification_deliveries delivered ON delivered.event_id = prior.id AND delivered.recipient = held.recipient
-         WHERE e.id = ?1 AND held.recipient = ?2 AND held.held = 1
+         WHERE e.id = ?1 AND held.recipient = ?2 AND (held.held = 1 OR ?3)
            AND delivered.state = 'delivered' AND prior.kind != 'recovery'
          ORDER BY prior.id DESC LIMIT 1",
-        params![notification.event_id, notification.recipient],
+        params![notification.event_id, notification.recipient, was_silenced],
         |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
     ).optional()?;
     let Some((severity, delivered_at)) = known else {
@@ -602,7 +643,7 @@ fn reconcile_held_change(tx: &Transaction<'_>, notification: &Notification) -> R
     discard(
         tx,
         notification,
-        "Current severity already delivered before host suppression",
+        "Current severity already delivered before suppression",
     )?;
     tx.execute(
         "UPDATE notification_deliveries SET remind_from = ?3 WHERE event_id = ?1 AND recipient = ?2",
@@ -616,20 +657,26 @@ fn queue_due_reminder(
     config: &Config,
     now: DateTime<Utc>,
     reachability_hosts: &str,
+    groups: &str,
 ) -> Result<()> {
     let due = tx
         .query_row(
-            "SELECT d.event_id, d.recipient
+            &format!(
+                "SELECT d.event_id, d.recipient
          FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
-         WHERE d.remind_from <= ?1 AND (e.service_id = '' OR e.host_id NOT IN (
+         WHERE d.remind_from <= :due AND (e.service_id = '' OR e.host_id NOT IN (
              SELECT host_id FROM check_problems WHERE check_kind = 'host'
                AND service_id = '' AND confirmed_severity = 2
-               AND host_id IN (SELECT value FROM json_each(?2))
-         )) ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
-            params![
-                now.timestamp_millis() - i64::from(config.reminder_interval_seconds) * 1000,
-                reachability_hosts
-            ],
+               AND host_id IN (SELECT value FROM json_each(:reachability))
+         )) AND {} ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
+                silences::ACTIVE_FILTER
+            ),
+            named_params! {
+                ":due": now.timestamp_millis() - i64::from(config.reminder_interval_seconds) * 1000,
+                ":now": now.timestamp_millis(),
+                ":reachability": reachability_hosts,
+                ":groups": groups,
+            },
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;

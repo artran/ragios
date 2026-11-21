@@ -1,7 +1,9 @@
 mod notifications;
 mod schema;
+mod silences;
 
 pub use notifications::{DeliveryOutcome, Notification};
+pub use silences::{CreateSilence, Silence, SilenceScope};
 
 use crate::{
     config::Probe,

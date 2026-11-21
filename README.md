@@ -250,6 +250,17 @@ Retries and reminder timing survive restarts in SQLite. Open **Email delivery**
 on the dashboard to see which hosts are holding service mail, upcoming reminders,
 and delivery outcomes.
 
+For maintenance, open **Silences**, choose a service, host (including its
+services), or host group, and enter a future RFC 3339 expiry, such as
+`2027-01-15T18:00:00Z`. Add a reason if useful. Silences live in SQLite, not YAML,
+and survive restart. The page lists active and recently expired silences.
+
+Checks, including **Check now**, still run and update results, history, and
+confirmed problems. Notifications resume only after the last matching silence
+expires. Ragios considers the current confirmed state rather than replaying
+intermediate changes. Recovery mail still requires a delivered problem notification.
+An SMTP attempt already in flight may finish after a silence is created.
+
 ## Access and current scope
 
 Use **Check now** on a reachability or service detail page to run that
@@ -258,8 +269,8 @@ follow the same confirmation, recovery, and scheduling rules as timed checks.
 If the check is already running or all execution slots are busy, no extra run
 is queued. Try again after a slot frees up.
 
-There are no accounts. Check requests use POST and require a token from the
-dashboard to prevent cross-site requests. Keep the default loopback binding;
+There are no accounts. Manual check and silence requests use POST and require a
+token from the dashboard to prevent cross-site requests. Keep the default loopback binding;
 private Tailscale access requires an explicit private address in `bind` and
 appropriate network policy. Open the dashboard using its bound IP address and
 port (or `localhost` with the same port for a loopback bind). Other hostnames,

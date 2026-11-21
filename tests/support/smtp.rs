@@ -19,6 +19,120 @@ const SERVICE: &str = "/hosts/local/services/application";
 const DELIVERY: &str = "/notifications/status";
 
 #[test]
+fn dashboard_silences_are_scoped_protected_and_survive_restart() {
+    use chrono::{TimeDelta, Utc};
+
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
+    install_probe(&dir, &path);
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    yaml["groups"] = serde_yaml::from_str("[{id: ops, name: Ops}]").unwrap();
+    yaml["hosts"][0]["group"] = "ops".into();
+    fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+    host_observation(&dir, 0, "host initially reachable");
+    observation(&dir, 0, "service initially healthy");
+    let mut app = Application::start(&path);
+    app.page(SERVICE, "service initially healthy");
+    app.page("/hosts/local/reachability", "host initially reachable");
+    let page = app.page("/silences", "Create silence");
+    let token = check_now_token(&page);
+    let service = r#"{"service":{"host":"local","service":"application"}}"#;
+    let host = r#"{"host":"local"}"#;
+    let group = r#"{"group":"ops"}"#;
+    let future = (Utc::now() + TimeDelta::hours(1)).to_rfc3339();
+    let past = (Utc::now() - TimeDelta::minutes(1)).to_rfc3339();
+    let submit = |scope: &str, expiry: &str, csrf: &str| {
+        app.client.post(format!("{}/silences", app.url)).form(&[
+            ("csrf", csrf),
+            ("scope", scope),
+            ("expiry", expiry),
+            ("reason", "<maintenance>"),
+        ])
+    };
+    assert_eq!(
+        submit(service, &future, "wrong").send().unwrap().status(),
+        403
+    );
+    assert_eq!(
+        submit(service, &future, token)
+            .header("Origin", "https://foreign.invalid")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    assert_eq!(
+        submit(service, &future, token)
+            .header("Sec-Fetch-Site", "cross-site")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    for (scope, expiry) in [
+        (r#"{"host":"missing"}"#, future.as_str()),
+        (service, &past),
+        (service, "never"),
+    ] {
+        assert_eq!(submit(scope, expiry, token).send().unwrap().status(), 400);
+    }
+    assert!(
+        submit(service, &future, token)
+            .header("Origin", &app.url)
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    check(&mut app, &dir, 2, "confirmed service during own silence");
+    relay.expect_quiet(Duration::from_millis(400));
+    // The service silence must not touch reachability.
+    host_observation(&dir, 3, "host undetermined independently");
+    request_check(
+        &mut app,
+        "/hosts/local/reachability",
+        "host undetermined independently",
+    );
+    relay
+        .receive(
+            "observer@example.invalid",
+            "Confirmed problem: Undetermined",
+        )
+        .respond(250);
+    for scope in [host, group] {
+        assert!(
+            app.client
+                .post(format!("{}/silences", app.url))
+                .form(&[
+                    ("csrf", token),
+                    ("scope", scope),
+                    ("expiry", &future),
+                    ("reason", "<maintenance>"),
+                ])
+                .send()
+                .unwrap()
+                .status()
+                .is_success()
+        );
+    }
+    drop(app);
+    let mut app = Application::start(&path);
+    let page = app.page("/silences", "&lt;maintenance&gt;");
+    assert_eq!(page.matches("<td>Active</td>").count(), 3);
+    assert!(!page.contains("<maintenance>"));
+    host_observation(&dir, 0, "host recovered under silence");
+    request_check(
+        &mut app,
+        "/hosts/local/reachability",
+        "host recovered under silence",
+    );
+    check(&mut app, &dir, 0, "service recovered under silence");
+    relay.expect_quiet(Duration::from_millis(400));
+}
+
+#[test]
 fn confirmed_host_down_holds_service_email_until_reachability_returns() {
     let dir = TempDir::new().unwrap();
     let relay = TestRelay::listen(&dir, "implicit");
@@ -452,6 +566,136 @@ fn current_notification_retries_after_smtp_credentials_are_corrected() {
         .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
         .respond(250);
     app.page(DELIVERY, "<td>delivered</td><td>2</td>");
+}
+
+#[tokio::test]
+async fn silence_expiry_releases_only_current_eligible_notifications() {
+    use chrono::{TimeDelta, Utc};
+    use ragios::{
+        config::{Config, Probe},
+        runner::Status::{Critical, Ok as Healthy, Unknown, Warning},
+        store::{CheckTarget, CreateSilence, DeliveryOutcome, Silence, SilenceScope, Store},
+    };
+
+    let dir = TempDir::new().unwrap();
+    private_file(&dir, "username", USER);
+    private_file(&dir, "password", PASSWORD);
+    let path = config(
+        &dir,
+        &format!(
+            "{}recipients: [observer@example.invalid]",
+            smtp_yaml("127.0.0.1", 1, "implicit")
+        ),
+    );
+    with_reachability(&path, "ping", "check", &[]);
+    // Use the configured default group, whatever its internal ID is.
+    let config = Arc::new(Config::load(&path).unwrap());
+    let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+    let zero = Utc::now();
+    let at = |minute| zero + TimeDelta::minutes(minute);
+    let service = || CheckTarget::Service("application".into());
+    let host = || CheckTarget::Host(Probe::Ping);
+    let next = |store: Store, minute| {
+        let active = active.clone();
+        async move {
+            store
+                .next_notification_at(active, at(minute))
+                .await
+                .unwrap()
+        }
+    };
+    let begin = |store: Store, notification, minute| {
+        let active = active.clone();
+        let config = config.clone();
+        async move {
+            store
+                .begin_notification_at(notification, active, config, at(minute))
+                .await
+                .unwrap()
+        }
+    };
+    let deliver = async |store: Store, minute, label: &'static str| {
+        let queued = next(store.clone(), minute).await.unwrap();
+        let sending = begin(store.clone(), queued, minute).await.unwrap();
+        assert_eq!(sending.label(), label);
+        store
+            .finish_notification_at(sending, DeliveryOutcome::Delivered, at(minute))
+            .await
+            .unwrap();
+    };
+    let create = |store: Store, scope, minute| {
+        let active = active.clone();
+        async move {
+            assert!(matches!(
+                store
+                    .create_silence(
+                        Silence {
+                            scope,
+                            expires_at: at(minute),
+                            reason: None
+                        },
+                        active
+                    )
+                    .await
+                    .unwrap(),
+                CreateSilence::Created
+            ));
+        }
+    };
+    let store = Store::open_server(&config.database).unwrap();
+    save_observation(&store, service(), Critical, at(0)).await;
+    deliver(store.clone(), 1, "Confirmed problem: CRITICAL").await;
+    // Simulate a candidate picked immediately before a host silence was created.
+    save_observation(&store, host(), Unknown, at(1)).await;
+    let candidate = next(store.clone(), 2).await.unwrap();
+    create(store.clone(), SilenceScope::Host("local".into()), 10).await;
+    assert!(begin(store.clone(), candidate, 2).await.is_none());
+    save_observation(&store, service(), Warning, at(3)).await;
+    assert!(next(store.clone(), 4).await.is_none());
+
+    create(
+        store.clone(),
+        SilenceScope::Group(config.hosts[0].group.clone()),
+        20,
+    )
+    .await;
+    create(
+        store.clone(),
+        SilenceScope::Service {
+            host: "local".into(),
+            service: "application".into(),
+        },
+        70,
+    )
+    .await;
+    save_observation(&store, host(), Healthy, at(5)).await;
+    save_observation(&store, host(), Unknown, at(6)).await;
+    save_observation(&store, service(), Critical, at(7)).await;
+    drop(store);
+    let store = Store::open_server(&config.database).unwrap();
+    store.resume_notifications().await.unwrap();
+    assert!(
+        next(store.clone(), 10).await.is_none(),
+        "group still holds reachability"
+    );
+    deliver(store.clone(), 20, "Confirmed problem: Undetermined").await;
+    assert!(
+        next(store.clone(), 20).await.is_none(),
+        "service silence still holds the change"
+    );
+    assert!(next(store.clone(), 69).await.is_none());
+    let current = next(store.clone(), 70).await.unwrap();
+    assert!(
+        begin(store.clone(), current, 70).await.is_none(),
+        "severity already delivered"
+    );
+    deliver(store.clone(), 70, "Reminder: CRITICAL").await;
+    assert!(
+        next(store.clone(), 70).await.is_none(),
+        "no obsolete transitions or reminders"
+    );
+    save_observation(&store, service(), Healthy, at(71)).await;
+    deliver(store.clone(), 72, "Recovery: OK").await;
 }
 
 #[tokio::test]
