@@ -775,6 +775,73 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
 }
 
 #[tokio::test]
+async fn recovery_during_rollback_clears_acknowledgement_before_reupgrade() {
+    use chrono::Utc;
+    use ragios::{
+        config::Config,
+        runner::Status::Critical,
+        store::{AcknowledgeOutcome, Store},
+    };
+
+    for confirmed_during_rollback in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let path = config(&dir, "");
+        let config = Arc::new(Config::load(&path).unwrap());
+        let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+        let key = ("local".to_owned(), "application".to_owned());
+        let store = Store::open(&config.database).unwrap();
+        save_observation(&store, application_target(), Critical, Utc::now()).await;
+        let original = store.latest().await.unwrap()[&key]
+            .episode
+            .as_ref()
+            .unwrap()
+            .token
+            .clone();
+        assert!(matches!(
+            store
+                .acknowledge_problem(
+                    active.clone(),
+                    key.0.clone(),
+                    Some(key.1.clone()),
+                    original.clone()
+                )
+                .await
+                .unwrap(),
+            AcknowledgeOutcome::Acknowledged
+        ));
+        drop(store);
+
+        // The previous binary updates check_problems but never writes to the
+        // episode table. Reproduce its confirmed-state writes directly.
+        let legacy = rusqlite::Connection::open(&config.database).unwrap();
+        let write_severity = |severity: Option<i32>| {
+            legacy
+                .execute(
+                    "UPDATE check_problems SET confirmed_severity = ?1
+                 WHERE check_kind = 'service' AND host_id = ?2 AND service_id = ?3",
+                    rusqlite::params![severity, key.0, key.1],
+                )
+                .unwrap();
+        };
+        write_severity(None);
+        if confirmed_during_rollback {
+            write_severity(Some(2));
+        }
+        drop(legacy);
+
+        let store = Store::open(&config.database).unwrap();
+        if !confirmed_during_rollback {
+            assert!(store.latest().await.unwrap()[&key].episode.is_none());
+            save_observation(&store, application_target(), Critical, Utc::now()).await;
+        }
+        let latest = store.latest().await.unwrap();
+        let successor = latest[&key].episode.as_ref().unwrap();
+        assert!(!successor.acknowledged);
+        assert_ne!(successor.token, original);
+    }
+}
+
+#[tokio::test]
 async fn acknowledgement_blocks_an_already_selected_reminder_at_dispatch() {
     use chrono::{TimeDelta, Utc};
     use ragios::{

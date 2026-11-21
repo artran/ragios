@@ -98,6 +98,17 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
              DROP TABLE problem_transitions;",
         )?;
     }
+    // Clear episodes on recovery even when the previous binary records it
+    // during a rollback. Re-upgrading must never revive an acknowledgement.
+    transaction.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS clear_episode_on_recovery
+         AFTER UPDATE OF confirmed_severity ON check_problems
+         WHEN OLD.confirmed_severity IS NOT NULL AND NEW.confirmed_severity IS NULL
+         BEGIN
+             DELETE FROM check_problem_episodes
+             WHERE host_id = NEW.host_id AND service_id = NEW.service_id;
+         END;",
+    )?;
     // Backfill currently confirmed problems on upgrade, independently of
     // retained check history and whether SMTP was configured.
     transaction.execute_batch(

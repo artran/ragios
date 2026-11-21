@@ -403,21 +403,12 @@ impl Store {
                 ],
             )?;
             if let Some(kind) = state.transition_from(previous) {
-                match kind {
-                    TransitionKind::Confirmed => {
-                        transaction.execute(
-                            "INSERT INTO check_problem_episodes (host_id, service_id, token)
-                             VALUES (?1, ?2, lower(hex(randomblob(16))))",
-                            params![host_id, service_id],
-                        )?;
-                    }
-                    TransitionKind::Recovery if previous.confirmed_severity.is_some() => {
-                        transaction.execute(
-                            "DELETE FROM check_problem_episodes WHERE host_id = ?1 AND service_id = ?2",
-                            params![host_id, service_id],
-                        )?;
-                    }
-                    _ => {}
+                if kind == TransitionKind::Confirmed {
+                    transaction.execute(
+                        "INSERT INTO check_problem_episodes (host_id, service_id, token)
+                         VALUES (?1, ?2, lower(hex(randomblob(16))))",
+                        params![host_id, service_id],
+                    )?;
                 }
                 transaction.execute(
                     "INSERT INTO check_transitions
