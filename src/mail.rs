@@ -96,6 +96,13 @@ pub async fn run(store: Store, mut active: watch::Receiver<Arc<Config>>) {
     }
     while active.has_changed().is_ok() {
         let config = active.borrow_and_update().clone();
+        if config.smtp.is_some()
+            && let Err(error) = store.hold_silenced_deliveries(config.clone()).await
+        {
+            eprintln!("Reconcile notification silences: {error:#}");
+            sleep(Duration::from_secs(1)).await;
+            continue;
+        }
         let mut relay = match config.smtp.as_ref().map(Relay::new).transpose() {
             Ok(relay) => relay,
             Err(error) => {

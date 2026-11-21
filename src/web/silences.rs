@@ -1,7 +1,7 @@
 use super::{Dashboard, WebError, WebResult, escape, layout, load_error, require_mutation};
 use axum::{
     Form,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode, Uri},
     response::{Html, Redirect},
 };
@@ -12,7 +12,16 @@ use std::fmt::Write;
 
 const REASON_LIMIT: usize = 500;
 
-pub(super) async fn page(State(dashboard): State<Dashboard>) -> WebResult {
+#[derive(Deserialize, Default)]
+#[serde(default)]
+pub(super) struct History {
+    expired_page: u32,
+}
+
+pub(super) async fn page(
+    State(dashboard): State<Dashboard>,
+    Query(history): Query<History>,
+) -> WebResult {
     let config = dashboard.config.borrow().clone();
     let mut options = String::from(r#"<option value="">Select a scope</option>"#);
     let mut option = |scope: SilenceScope| {
@@ -38,7 +47,8 @@ pub(super) async fn page(State(dashboard): State<Dashboard>) -> WebResult {
     }
     let csrf = &dashboard.csrf;
     let example = (Utc::now() + TimeDelta::hours(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
-    let fragment = table(&dashboard).await?;
+    let expired_page = history.expired_page;
+    let fragment = table(&dashboard, expired_page).await?;
     Ok(layout(
         "Ragios — Silences",
         &format!(
@@ -54,23 +64,30 @@ pub(super) async fn page(State(dashboard): State<Dashboard>) -> WebResult {
 <label>Reason (optional) <input name="reason" maxlength="{REASON_LIMIT}"></label>
 <button>Create silence</button>
 </form><p id="expiry-help">Include a timezone offset or use UTC, for example <code>{example}</code>.</p>
-<div hx-get="/silences/status" hx-trigger="every 2s" hx-swap="innerHTML">{fragment}</div>"#
+<div hx-get="/silences/status?expired_page={expired_page}" hx-trigger="every 2s" hx-swap="innerHTML">{fragment}</div>"#
         ),
     ))
 }
 
-pub(super) async fn status(State(dashboard): State<Dashboard>) -> WebResult {
-    Ok(Html(table(&dashboard).await?))
+pub(super) async fn status(
+    State(dashboard): State<Dashboard>,
+    Query(history): Query<History>,
+) -> WebResult {
+    Ok(Html(table(&dashboard, history.expired_page).await?))
 }
 
-async fn table(dashboard: &Dashboard) -> Result<String, WebError> {
+async fn table(dashboard: &Dashboard, expired_page: u32) -> Result<String, WebError> {
     let now = Utc::now();
-    let silences = dashboard.store.silences_at(now).await.map_err(load_error)?;
-    if silences.is_empty() {
+    let (silences, has_older) = dashboard
+        .store
+        .silences_at(now, expired_page)
+        .await
+        .map_err(load_error)?;
+    if silences.is_empty() && expired_page == 0 {
         return Ok("<p>No silences recorded.</p>".into());
     }
     let mut html = String::from(
-        "<h2>Active and recently expired silences</h2><div class=\"scroll\"><table><thead><tr><th>Scope</th><th>Expires at (UTC)</th><th>Reason</th><th>Status</th></tr></thead><tbody>",
+        "<h2>Active and expired silences</h2><div class=\"scroll\"><table><thead><tr><th>Scope</th><th>Expires at (UTC)</th><th>Reason</th><th>Status</th></tr></thead><tbody>",
     );
     for silence in silences {
         let _ = write!(
@@ -89,6 +106,18 @@ async fn table(dashboard: &Dashboard) -> Result<String, WebError> {
         );
     }
     html.push_str("</tbody></table></div>");
+    if let Some(newer) = expired_page.checked_sub(1) {
+        let _ = write!(
+            html,
+            r#"<a href="/silences?expired_page={newer}">Newer expired silences</a> "#
+        );
+    }
+    if let Some(older) = expired_page.checked_add(1).filter(|_| has_older) {
+        let _ = write!(
+            html,
+            r#"<a href="/silences?expired_page={older}">Older expired silences</a>"#
+        );
+    }
     Ok(html)
 }
 

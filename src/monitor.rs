@@ -302,16 +302,12 @@ impl Monitor {
         if let Some(scheduled) = self.checks.get_mut(&key)
             && scheduled.generation == generation
         {
-            let recipients = if self.config.smtp.is_some() {
-                self.config
-                    .hosts
-                    .iter()
-                    .find(|host| host.id == key.0)
-                    .map(|host| host.recipients.clone())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let host = self.config.hosts.iter().find(|host| host.id == key.0);
+            let recipients = host
+                .filter(|_| self.config.smtp.is_some())
+                .map(|host| host.recipients.clone())
+                .unwrap_or_default();
+            let group = host.map(|host| host.group.clone());
             let saved = self
                 .store
                 .save_with_notifications(
@@ -320,6 +316,7 @@ impl Monitor {
                     result,
                     self.config.confirmation_attempts,
                     recipients,
+                    group,
                 )
                 .await;
             scheduled.finished = Some(Instant::now());

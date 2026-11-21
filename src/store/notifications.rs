@@ -3,7 +3,7 @@ use crate::{
     config::Config,
     runner::{Reachability, Status},
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, named_params, params};
 use std::sync::Arc;
@@ -117,7 +117,7 @@ fn timestamp(now: DateTime<Utc>) -> String {
 /// recovery share that ID. This history is independent of check history pruning.
 pub(super) fn record(
     tx: &Transaction<'_>,
-    check: (&str, &str),
+    check: (&str, &str, Option<&str>),
     kind: TransitionKind,
     previous_severity: Option<Status>,
     severity: Status,
@@ -131,7 +131,7 @@ pub(super) fn record(
     {
         return Ok(());
     }
-    let (host_id, service_id) = check;
+    let (host_id, service_id, _) = check;
     let previous = tx
         .query_row(
             "SELECT id, COALESCE(episode_id, id), kind FROM notification_events
@@ -185,7 +185,8 @@ pub(super) fn record(
     )?;
     let event = tx.last_insert_rowid();
     let ready_at = now.timestamp_millis();
-    let held = !service_id.is_empty() && host_is_down(tx, host_id)?;
+    let held = (!service_id.is_empty() && host_is_down(tx, host_id)?)
+        || (kind == TransitionKind::SeverityChanged && silences::is_silenced(tx, check, now)?);
     for recipient in recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
@@ -288,19 +289,12 @@ pub enum DeliveryOutcome {
 }
 
 impl Store {
-    pub(super) async fn notification_db<T: Send + 'static>(
-        &self,
-        operation: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut connection = store
-                .0
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            operation(&mut connection)
-        })
-        .await?
+    // A reload can bring already-queued mail into a silenced group. Mark
+    // that hold when the worker adopts the new group membership.
+    pub async fn hold_silenced_deliveries(&self, config: Arc<Config>) -> Result<()> {
+        let groups = silences::host_groups(&config)?;
+        self.with_connection(move |db| silences::hold_pending(db, &groups, Utc::now()))
+            .await
     }
 
     /// Only the single delivery worker calls this at startup. An interrupted
@@ -310,7 +304,7 @@ impl Store {
             self.1.is_some(),
             "email delivery requires the exclusive server database lock"
         );
-        self.notification_db(|db| {
+        self.with_connection(|db| {
             db.execute(
                 "UPDATE notification_deliveries SET state = 'retrying', retry_at = 0,
                    updated_at = ?1, diagnostic = 'Interrupted SMTP attempt; outcome unknown'
@@ -338,7 +332,7 @@ impl Store {
             self.1.is_some(),
             "email delivery requires the exclusive server database lock"
         );
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             // Keep the configuration stable until reconciliation commits.
             let config = active.borrow();
@@ -360,10 +354,7 @@ impl Store {
                     .map(|host| &host.id)
                     .collect::<Vec<_>>(),
             )?;
-            let groups = serde_json::to_string(
-                &config.hosts.iter().map(|host| (&host.id, &host.group))
-                    .collect::<std::collections::BTreeMap<_, _>>(),
-            )?;
+            let groups = silences::host_groups(&config)?;
             // Materialize at most one reminder per poll; no backlog accumulates
             // during restarts, suppression, or an unfinished SMTP attempt.
             queue_due_reminder(&tx, &config, now, &reachability_hosts, &groups)?;
@@ -436,7 +427,7 @@ impl Store {
             self.1.is_some(),
             "email delivery requires the exclusive server database lock"
         );
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             let config = active.borrow();
             if !Arc::ptr_eq(&config, &relay_config) || config.smtp.is_none() {
@@ -456,15 +447,10 @@ impl Store {
             let now = time();
             let group = config.hosts.iter().find(|host| host.id == notification.host_id)
                 .map(|host| host.group.as_str());
-            let expiry = silences::latest_expiry(&tx, &notification.host_id, &notification.service_id, group)?;
-            if expiry.is_some_and(|expiry| expiry > now) {
+            if silences::is_silenced(&tx, (&notification.host_id, &notification.service_id, group), now)? {
                 return Ok(None);
             }
-            // An expired silence may have covered this queued transition even
-            // if the worker didn't poll until after it ended (e.g. restart).
-            let was_silenced = expiry.zip(notification.occurred_at.parse::<DateTime<Utc>>().ok())
-                .is_some_and(|(expiry, occurred)| expiry > occurred);
-            if reconcile_held_change(&tx, &notification, was_silenced)? {
+            if reconcile_held_change(&tx, &notification)? {
                 tx.commit()?;
                 return Ok(None);
             }
@@ -494,7 +480,7 @@ impl Store {
         outcome: DeliveryOutcome,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             let (state, diagnostic, delay, undo_attempt) = match outcome {
                 DeliveryOutcome::Delivered => ("delivered", None, 0, false),
@@ -538,7 +524,7 @@ impl Store {
     /// recovery) and completed episodes with unfinished or recent deliveries.
     pub async fn prune_notifications(&self, now: DateTime<Utc>) -> Result<()> {
         let cutoff = timestamp(now - super::TRANSITION_RETENTION);
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             // Keep the first accepted reminder if the lifecycle message failed:
             // it can be the only evidence that qualifies the recipient for recovery.
@@ -587,7 +573,7 @@ impl Store {
     }
 
     pub async fn recent_deliveries(&self) -> Result<Vec<DeliveryRecord>> {
-        self.notification_db(|db| {
+        self.with_connection(|db| {
             let mut statement = db.prepare(
                 "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
                         e.occurred_at, d.attempts, e.reminder_for IS NOT NULL,
@@ -615,11 +601,7 @@ impl Store {
 // If the check changed away and back under suppression, the current
 // severity is already known to this recipient. Resume the reminder cadence
 // instead of sending a spurious change; keep distinct changes and recoveries.
-fn reconcile_held_change(
-    tx: &Transaction<'_>,
-    notification: &Notification,
-    was_silenced: bool,
-) -> Result<bool> {
+fn reconcile_held_change(tx: &Transaction<'_>, notification: &Notification) -> Result<bool> {
     if notification.reminder || notification.kind != TransitionKind::SeverityChanged {
         return Ok(false);
     }
@@ -628,10 +610,10 @@ fn reconcile_held_change(
          FROM notification_events e JOIN notification_deliveries held ON held.event_id = e.id
          JOIN notification_events prior ON prior.id = e.episode_id OR prior.episode_id = e.episode_id
          JOIN notification_deliveries delivered ON delivered.event_id = prior.id AND delivered.recipient = held.recipient
-         WHERE e.id = ?1 AND held.recipient = ?2 AND (held.held = 1 OR ?3)
+         WHERE e.id = ?1 AND held.recipient = ?2 AND held.held = 1
            AND delivered.state = 'delivered' AND prior.kind != 'recovery'
          ORDER BY prior.id DESC LIMIT 1",
-        params![notification.event_id, notification.recipient, was_silenced],
+        params![notification.event_id, notification.recipient],
         |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
     ).optional()?;
     let Some((severity, delivered_at)) = known else {

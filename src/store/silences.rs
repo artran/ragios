@@ -2,7 +2,7 @@ use super::Store;
 use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, Row, named_params, params};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -58,13 +58,15 @@ impl Store {
         silence: Silence,
         active: watch::Receiver<Arc<Config>>,
     ) -> Result<CreateSilence> {
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
+            let tx = db.transaction()?;
             let config = active.borrow();
             if !silence.scope.configured(&config) {
                 return Ok(CreateSilence::InvalidScope);
             }
             let expiry = silence.expires_at.timestamp_millis();
-            if expiry <= Utc::now().timestamp_millis() {
+            let now = Utc::now();
+            if expiry <= now.timestamp_millis() {
                 return Ok(CreateSilence::InvalidExpiry);
             }
             let (host, service, group) = match &silence.scope {
@@ -72,27 +74,39 @@ impl Store {
                 SilenceScope::Host(host) => (Some(host), None, None),
                 SilenceScope::Group(group) => (None, None, Some(group)),
             };
-            db.execute(
+            tx.execute(
                 "INSERT INTO silences (host_id, service_id, group_id, expires_at, reason)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![host, service, group, expiry, silence.reason],
             )?;
+            hold_pending(&tx, &host_groups(&config)?, now)?;
+            tx.commit()?;
             Ok(CreateSilence::Created)
         })
         .await
     }
 
-    /// Keep all active silences visible, plus the 100 most recently expired.
-    pub async fn silences_at(&self, now: DateTime<Utc>) -> Result<Vec<Silence>> {
-        self.notification_db(move |db| {
+    /// Keep all active silences visible while paging through expired ones.
+    pub async fn silences_at(
+        &self,
+        now: DateTime<Utc>,
+        expired_page: u32,
+    ) -> Result<(Vec<Silence>, bool)> {
+        const PAGE_SIZE: i64 = 100;
+        self.with_connection(move |db| {
             let mut statement = db.prepare(
                 "SELECT host_id, service_id, group_id, expires_at, reason FROM silences
                  WHERE expires_at > ?1 OR id IN (
-                    SELECT id FROM silences WHERE expires_at <= ?1 ORDER BY expires_at DESC, id DESC LIMIT 100
+                    SELECT id FROM silences WHERE expires_at <= ?1 ORDER BY expires_at DESC, id DESC LIMIT ?2 OFFSET ?3
                  ) ORDER BY expires_at DESC, id DESC",
             )?;
-            let rows = statement.query_map([now.timestamp_millis()], read_silence)?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
+            let rows = statement.query_map(params![now.timestamp_millis(), PAGE_SIZE + 1, PAGE_SIZE * i64::from(expired_page)], read_silence)?;
+            let mut silences = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_older = silences.iter().rev().take_while(|silence| silence.expires_at <= now).count() as i64 > PAGE_SIZE;
+            if has_older {
+                silences.pop();
+            }
+            Ok((silences, has_older))
         })
         .await
     }
@@ -122,17 +136,40 @@ pub(super) const ACTIVE_FILTER: &str = "NOT EXISTS (
     )
 )";
 
-pub(super) fn latest_expiry(
+pub(super) fn is_silenced(
     db: &Connection,
-    host: &str,
-    service: &str,
-    group: Option<&str>,
-) -> Result<Option<DateTime<Utc>>> {
-    let milliseconds: Option<i64> = db.query_row(
-        "SELECT MAX(expires_at) FROM silences
-         WHERE (host_id = ?1 AND (service_id IS NULL OR service_id = ?2)) OR group_id = ?3",
-        params![host, service, group],
+    (host, service, group): (&str, &str, Option<&str>),
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM silences WHERE expires_at > ?4
+         AND ((host_id = ?1 AND (service_id IS NULL OR service_id = ?2)) OR group_id = ?3))",
+        params![host, service, group, now.timestamp_millis()],
         |row| row.get(0),
+    )?)
+}
+
+pub(super) fn host_groups(config: &Config) -> Result<String> {
+    Ok(serde_json::to_string(
+        &config
+            .hosts
+            .iter()
+            .map(|host| (&host.id, &host.group))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )?)
+}
+
+pub(super) fn hold_pending(db: &Connection, groups: &str, now: DateTime<Utc>) -> Result<()> {
+    // Only severity changes need the durable held marker: the delivery worker
+    // can then reconcile them even after group membership changes or a restart.
+    db.execute(
+        &format!(
+            "UPDATE notification_deliveries AS d SET held = 1
+        WHERE state IN ('queued', 'retrying', 'sending') AND held = 0
+          AND EXISTS (SELECT 1 FROM notification_events e WHERE e.id = d.event_id
+            AND e.kind = 'severity_changed' AND NOT {ACTIVE_FILTER})"
+        ),
+        named_params! {":now": now.timestamp_millis(), ":groups": groups},
     )?;
-    Ok(milliseconds.and_then(DateTime::from_timestamp_millis))
+    Ok(())
 }

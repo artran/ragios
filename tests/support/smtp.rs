@@ -133,6 +133,104 @@ fn dashboard_silences_are_scoped_protected_and_survive_restart() {
 }
 
 #[test]
+fn group_silence_holds_scheduled_results_until_expiry_then_smtp_sends_the_recovery() {
+    use chrono::{TimeDelta, Utc};
+
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
+    let yaml = fs::read_to_string(&path).unwrap().replacen(
+        "interval_seconds: 300",
+        "interval_seconds: 1",
+        1,
+    );
+    fs::write(&path, yaml).unwrap();
+    observation(&dir, 2, "problem before maintenance");
+    let mut app = Application::start(&path);
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    app.page(DELIVERY, "<td>delivered</td>");
+    let page = app.page("/silences", "Create silence");
+    let group = ragios::config::Config::load(&path).unwrap().hosts[0]
+        .group
+        .clone();
+    let scope = serde_json::to_string(&ragios::store::SilenceScope::Group(group)).unwrap();
+    let expires = Utc::now() + TimeDelta::seconds(5);
+    let response = app
+        .client
+        .post(format!("{}/silences", app.url))
+        .form(&[
+            ("scope", scope.as_str()),
+            ("expiry", &expires.to_rfc3339()),
+            ("csrf", check_now_token(&page)),
+        ])
+        .send()
+        .unwrap();
+    assert!(response.status().is_success());
+    observation(&dir, 1, "scheduled severity change during maintenance");
+    app.page(SERVICE, "scheduled severity change during maintenance");
+    observation(&dir, 0, "scheduled recovery during maintenance");
+    app.page(SERVICE, "scheduled recovery during maintenance");
+    assert!(
+        Utc::now() < expires,
+        "periodic results should update before expiry"
+    );
+    relay.expect_quiet(Duration::from_millis(300));
+    let recovery = relay.receive("observer@example.invalid", "Recovery: OK");
+    assert!(Utc::now().timestamp_millis() >= expires.timestamp_millis());
+    recovery.respond(250);
+    app.page("/silences/status", "<td>Expired</td>");
+    relay.expect_quiet(Duration::from_millis(300));
+}
+
+#[test]
+fn moving_out_of_a_silenced_group_does_not_replay_an_already_delivered_severity() {
+    use chrono::{TimeDelta, Utc};
+
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
+    observation(&dir, 2, "first critical result");
+    let mut app = Application::start(&path);
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    app.page(DELIVERY, "<td>delivered</td>");
+    let page = app.page("/silences", "Create silence");
+    let group = ragios::config::Config::load(&path).unwrap().hosts[0]
+        .group
+        .clone();
+    let scope = serde_json::to_string(&ragios::store::SilenceScope::Group(group)).unwrap();
+    assert!(
+        app.client
+            .post(format!("{}/silences", app.url))
+            .form(&[
+                ("scope", scope.as_str()),
+                ("expiry", &(Utc::now() + TimeDelta::hours(1)).to_rfc3339()),
+                ("csrf", check_now_token(&page)),
+            ])
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    check(&mut app, &dir, 1, "warning during maintenance");
+    check(&mut app, &dir, 2, "critical again during maintenance");
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    yaml["groups"] = serde_yaml::from_str("[{id: other, name: Other}]").unwrap();
+    yaml["hosts"][0]["group"] = "other".into();
+    fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+    app.reload("reloaded");
+    app.page(
+        DELIVERY,
+        "Current severity already delivered before suppression",
+    );
+    relay.expect_quiet(Duration::from_millis(400));
+}
+
+#[test]
 fn confirmed_host_down_holds_service_email_until_reachability_returns() {
     let dir = TempDir::new().unwrap();
     let relay = TestRelay::listen(&dir, "implicit");
@@ -976,6 +1074,7 @@ async fn save_observation_for(
             },
             1,
             recipients,
+            None,
         )
         .await
         .unwrap();
@@ -1016,6 +1115,7 @@ async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evi
             },
             1,
             vec!["observer@example.invalid".into()],
+            None,
         )
     };
     save(Status::Critical).await.unwrap();

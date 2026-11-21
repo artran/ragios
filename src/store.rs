@@ -229,6 +229,21 @@ struct StoredCheck {
 }
 
 impl Store {
+    async fn with_connection<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            operation(&mut connection)
+        })
+        .await?
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open(path)
             .with_context(|| format!("open SQLite database {}", path.display()))?;
@@ -307,8 +322,15 @@ impl Store {
         result: CheckResult,
         confirmation_attempts: u32,
     ) -> Result<ProblemState> {
-        self.save_with_notifications(host_id, target, result, confirmation_attempts, Vec::new())
-            .await
+        self.save_with_notifications(
+            host_id,
+            target,
+            result,
+            confirmation_attempts,
+            Vec::new(),
+            None,
+        )
+        .await
     }
 
     pub async fn save_with_notifications(
@@ -318,6 +340,7 @@ impl Store {
         result: CheckResult,
         confirmation_attempts: u32,
         recipients: Vec<String>,
+        group: Option<String>,
     ) -> Result<ProblemState> {
         ensure!(
             confirmation_attempts > 0,
@@ -402,7 +425,7 @@ impl Store {
                         target.kind().as_str()
                     ],
                 )?;
-                notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, assessment, &result.finished_at, &recipients)?;
+                notifications::record(&transaction, (&host_id, service_id, group.as_deref()), kind, previous.confirmed_severity, assessment, &result.finished_at, &recipients)?;
                 if matches!(target, CheckTarget::Host(_))
                     && previous.confirmed_severity != Some(Status::Critical)
                     && state.confirmed_severity == Some(Status::Critical)
