@@ -58,6 +58,36 @@ impl Freshness {
     }
 }
 
+/// Persisted inputs to freshness, without the plugin status or diagnostic output.
+#[derive(Clone, Copy)]
+pub struct SavedCheckTiming {
+    pub finished: Option<DateTime<Utc>>,
+    pub cadence: Cadence,
+}
+
+impl SavedCheckTiming {
+    pub fn from_result(result: &CheckResult, problem: ProblemState) -> Self {
+        Self {
+            finished: result.finished(),
+            cadence: problem.into(),
+        }
+    }
+
+    fn due_at(
+        self,
+        check: &Check,
+        retry_interval_seconds: u64,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let finished = self.finished?;
+        if finished > now {
+            return None;
+        }
+        let interval = self.cadence.interval(check, retry_interval_seconds);
+        Some(finished + TimeDelta::from_std(interval).expect("bounded check interval"))
+    }
+}
+
 /// Assess when a newer result should have been available. Use the first due
 /// time only in the absence of a saved result. Apply the window at the original
 /// due time, not at `now`: a missed deadline survives a later window closure.
@@ -68,14 +98,30 @@ pub fn freshness(
     first_due: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Freshness {
-    let Some((result, problem)) = saved else {
+    freshness_from_timing(
+        check,
+        retry_interval_seconds,
+        saved.map(|(result, problem)| SavedCheckTiming::from_result(result, problem)),
+        first_due,
+        now,
+    )
+}
+
+pub fn freshness_from_timing(
+    check: &Check,
+    retry_interval_seconds: u64,
+    saved: Option<SavedCheckTiming>,
+    first_due: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Freshness {
+    let Some(saved) = saved else {
         return match first_due.map(|since| eligible_from(check, since)) {
             Some(due) if is_overdue(check, due, now) => Freshness::Missing(due),
             Some(due) => Freshness::Current(due),
             None => Freshness::NotYetChecked,
         };
     };
-    let Some(due) = interval_due_at(check, retry_interval_seconds, result, problem, now) else {
+    let Some(due) = saved.due_at(check, retry_interval_seconds, now) else {
         return Freshness::Overdue(None);
     };
     let due = eligible_from(check, due);
@@ -95,12 +141,7 @@ pub fn interval_due_at(
     problem: ProblemState,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    let finished = result.finished()?;
-    if finished > now {
-        return None;
-    }
-    let interval = Cadence::from(problem).interval(check, retry_interval_seconds);
-    Some(finished + TimeDelta::from_std(interval).expect("bounded check interval"))
+    SavedCheckTiming::from_result(result, problem).due_at(check, retry_interval_seconds, now)
 }
 
 /// The earliest instant at or after `at` when `check` may start.
