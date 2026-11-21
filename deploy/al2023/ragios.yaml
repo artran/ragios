@@ -1,0 +1,26 @@
+# Local-only installation example. Resolve the check paths through the links
+# created by the installation guide; don't assume an RPM architecture path.
+bind: "127.0.0.1:8080"
+plugin_dir: /usr/local/libexec/ragios/plugins
+database: /var/lib/ragios/ragios.sqlite3
+email: {mode: disabled}
+interval_seconds: 300
+
+hosts:
+  - id: local
+    name: Monitoring server
+    address: "127.0.0.1"
+    reachability:
+      probe: ping
+      executable: check_ping
+      args: ["-H", "{{address}}", "-w", "100.0,20%", "-c", "500.0,60%", "-p", "3"]
+      timeout_seconds: 10
+    services:
+      - id: dashboard
+        name: Dashboard HTTP
+        executable: check_http
+        args: ["-H", "{{address}}:8080", "-I", "{{address}}", "-p", "8080", "-u", "/"]
+      - id: dashboard-tcp
+        name: Dashboard TCP
+        executable: check_tcp
+        args: ["-H", "{{address}}", "-p", "8080"]
