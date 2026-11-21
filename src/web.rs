@@ -119,7 +119,11 @@ async fn require_served_host(
         )
             .into_response();
     }
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
 }
 
 fn serves(listener: SocketAddr, host: &str) -> bool {
@@ -1024,9 +1028,6 @@ async fn check_detail(
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        response
-            .headers_mut()
-            .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
         response
     })
 }

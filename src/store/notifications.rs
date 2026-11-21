@@ -289,8 +289,23 @@ pub enum DeliveryOutcome {
 }
 
 impl Store {
-    // A reload can bring already-queued mail into a silenced group. Mark
-    // that hold when the worker adopts the new group membership.
+    /// Mark holds before exposing new group membership. Serialize with silence
+    /// creation so neither operation can miss the other's configuration.
+    pub async fn publish_notification_config(
+        &self,
+        config: Arc<Config>,
+        published: watch::Sender<Arc<Config>>,
+    ) -> Result<()> {
+        let groups = silences::host_groups(&config)?;
+        self.with_connection(move |db| {
+            silences::hold_pending(db, &groups, Utc::now())?;
+            published.send_replace(config);
+            Ok(())
+        })
+        .await
+    }
+
+    // The worker also marks holds when it starts, including after a restart.
     pub async fn hold_silenced_deliveries(&self, config: Arc<Config>) -> Result<()> {
         let groups = silences::host_groups(&config)?;
         self.with_connection(move |db| silences::hold_pending(db, &groups, Utc::now()))

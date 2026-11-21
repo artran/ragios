@@ -406,8 +406,11 @@ pub async fn run(
                 });
                 match candidate {
                     Ok(config) => {
-                        monitor.replace(config.clone());
-                        published.send_replace(config);
+                        if let Err(error) = monitor.store.publish_notification_config(config.clone(), published.clone()).await {
+                            eprintln!("Configuration reload rejected: cannot persist silence holds: {error:#}");
+                            continue;
+                        }
+                        monitor.replace(config);
                         eprintln!("Configuration reloaded");
                     }
                     Err(error) => eprintln!("Configuration reload rejected: {error:#}"),

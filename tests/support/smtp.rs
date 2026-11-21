@@ -37,6 +37,12 @@ fn dashboard_silences_are_scoped_protected_and_survive_restart() {
     app.page(SERVICE, "service initially healthy");
     app.page("/hosts/local/reachability", "host initially reachable");
     let page = app.page("/silences", "Create silence");
+    let response = app
+        .client
+        .get(format!("{}/silences", app.url))
+        .send()
+        .unwrap();
+    assert_eq!(response.headers()["x-frame-options"], "DENY");
     let token = check_now_token(&page);
     let service = r#"{"service":{"host":"local","service":"application"}}"#;
     let host = r#"{"host":"local"}"#;
@@ -228,6 +234,68 @@ fn moving_out_of_a_silenced_group_does_not_replay_an_already_delivered_severity(
         "Current severity already delivered before suppression",
     );
     relay.expect_quiet(Duration::from_millis(400));
+}
+
+#[test]
+fn reload_marks_silenced_mail_even_if_smtp_is_busy_until_after_expiry() {
+    use chrono::{TimeDelta, Utc};
+
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
+    install_probe(&dir, &path);
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    yaml["groups"] = serde_yaml::from_str("[{id: ops, name: Ops}]").unwrap();
+    fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+    observation(&dir, 2, "first critical");
+    host_observation(&dir, 0, "reachable initially");
+    let mut app = Application::start(&path);
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    app.page(DELIVERY, "<td>delivered</td>");
+    let reachability = "/hosts/local/reachability";
+    app.page(reachability, "reachable initially");
+    host_observation(&dir, 3, "reachability mail in flight");
+    request_check(&mut app, reachability, "reachability mail in flight");
+    let in_flight = relay.receive(
+        "observer@example.invalid",
+        "Confirmed problem: Undetermined",
+    );
+    check(&mut app, &dir, 1, "queued warning");
+    check(&mut app, &dir, 2, "queued return to critical");
+
+    let page = app.page("/silences", "Create silence");
+    let expiry = (Utc::now() + TimeDelta::seconds(4)).to_rfc3339();
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(format!("{}/silences", app.url))
+        .form(&[
+            ("csrf", check_now_token(&page)),
+            ("scope", r#"{"group":"ops"}"#),
+            ("expiry", &expiry),
+        ])
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 303);
+    let framing = response.headers().get("x-frame-options").cloned();
+    yaml["hosts"][0]["group"] = "ops".into();
+    fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
+    app.reload("reloaded");
+    app.page("/silences/status", "<td>Active</td>");
+    app.page("/silences/status", "<td>Expired</td>");
+    in_flight.respond(250);
+    app.page(
+        DELIVERY,
+        "Current severity already delivered before suppression",
+    );
+    relay.expect_quiet(Duration::from_millis(400));
+    assert_eq!(framing.unwrap(), "DENY");
 }
 
 #[test]
