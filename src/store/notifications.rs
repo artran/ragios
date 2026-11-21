@@ -44,8 +44,16 @@ pub(super) const SCHEMA: &str = "
 
 pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
     if !has_column(tx, "notification_deliveries", "held")? {
+        // Recovery can be recorded before the delivery worker starts, so
+        // preserve suppression history for the existing outbox during upgrade.
         tx.execute_batch(
-            "ALTER TABLE notification_deliveries ADD COLUMN held INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE notification_deliveries ADD COLUMN held INTEGER NOT NULL DEFAULT 0;
+             UPDATE notification_deliveries SET held = 1
+             WHERE state IN ('queued', 'retrying', 'sending') AND event_id IN (
+                 SELECT e.id FROM notification_events e JOIN check_problems p ON p.host_id = e.host_id
+                 WHERE e.service_id != '' AND p.check_kind = 'host' AND p.service_id = ''
+                   AND p.confirmed_severity = 2
+             );",
         )?;
     }
     if !has_column(tx, "notification_events", "reminder_for")? {
@@ -368,7 +376,7 @@ impl Store {
                              AND service_id = '' AND confirmed_severity = 2
                              AND host_id IN (SELECT value FROM json_each(?2))
                        ))
-                     ORDER BY d.held, d.retry_at, d.event_id, d.recipient LIMIT 1",
+                     ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1",
                         params![now.timestamp_millis(), reachability_hosts],
                         read_notification,
                     )

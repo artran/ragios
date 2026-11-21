@@ -46,13 +46,13 @@ fn confirmed_host_down_holds_service_email_until_reachability_returns() {
     host_result(3, "undetermined sample");
     request_check(&mut app, reachability, "undetermined sample");
     relay
+        .receive("observer@example.invalid", "Confirmed problem: WARNING")
+        .respond(250);
+    relay
         .receive(
             "observer@example.invalid",
             "Confirmed reachability change: Undetermined",
         )
-        .respond(250);
-    relay
-        .receive("observer@example.invalid", "Confirmed problem: WARNING")
         .respond(250);
     host_result(1, "degraded but reachable sample");
     request_check(&mut app, reachability, "degraded but reachable sample");
@@ -553,7 +553,7 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
             .is_none()
     );
     save_observation(&store, host(), Healthy, at(10_001)).await;
-    deliver(store.clone(), 10_001, "Recovery: Reachable").await;
+    // Older released mail gets a dispatch turn before newer unheld mail.
     let due = store
         .next_notification_at(active.clone(), at(10_001))
         .await
@@ -569,6 +569,7 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
             .unwrap()
             .is_none()
     );
+    deliver(store.clone(), 10_001, "Recovery: Reachable").await;
     deliver(store.clone(), 10_001, "Reminder: CRITICAL").await;
     assert!(
         store
@@ -588,11 +589,134 @@ async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppressi
     );
 }
 
+#[tokio::test]
+async fn upgrade_reconciles_service_deliveries_for_a_host_already_confirmed_down() {
+    use chrono::{TimeDelta, Utc};
+    use ragios::{
+        config::{Config, Probe},
+        runner::Status::{Critical, Ok as Healthy, Unknown, Warning},
+        store::{CheckTarget, DeliveryOutcome, Store},
+    };
+
+    for final_severity in [Critical, Unknown] {
+        let dir = TempDir::new().unwrap();
+        private_file(&dir, "username", USER);
+        private_file(&dir, "password", PASSWORD);
+        let path = config(
+            &dir,
+            &format!(
+                "{}recipients: [observer@example.invalid]",
+                smtp_yaml("127.0.0.1", 1, "implicit")
+            ),
+        );
+        with_reachability(&path, "ping", "check", &[]);
+        let config = Arc::new(Config::load(&path).unwrap());
+        let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+        let store = Store::open_server(&config.database).unwrap();
+        let at = Utc::now() + TimeDelta::minutes(1);
+        let service = || CheckTarget::Service("application".into());
+        save_observation(&store, service(), Critical, at).await;
+        let initial = store
+            .next_notification_at(active.clone(), at)
+            .await
+            .unwrap()
+            .unwrap();
+        let sending = store
+            .begin_notification(initial, active.clone(), config.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .finish_notification_at(sending, DeliveryOutcome::Delivered, at)
+            .await
+            .unwrap();
+        save_observation(&store, service(), Warning, at).await;
+        save_observation(&store, service(), final_severity, at).await;
+        // The old version persisted host state without enqueuing host mail.
+        save_observation_for(
+            &store,
+            CheckTarget::Host(Probe::Ping),
+            Critical,
+            at,
+            Vec::new(),
+        )
+        .await;
+        drop(store);
+        rusqlite::Connection::open(&config.database)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX notification_reminders_by_event;
+             DROP INDEX notification_reminders_due;
+             ALTER TABLE notification_events DROP COLUMN reminder_for;
+             ALTER TABLE notification_deliveries DROP COLUMN remind_from;
+             ALTER TABLE notification_deliveries DROP COLUMN held;",
+            )
+            .unwrap();
+
+        let store = Store::open_server(&config.database).unwrap();
+        // Recovery can be recorded before the delivery worker polls at startup.
+        save_observation(&store, CheckTarget::Host(Probe::Ping), Healthy, at).await;
+        let pending = store
+            .next_notification_at(active.clone(), at)
+            .await
+            .unwrap()
+            .unwrap();
+        let sending = store
+            .begin_notification(pending, active.clone(), config.clone())
+            .await
+            .unwrap();
+        if final_severity == Critical {
+            assert!(
+                sending.is_none(),
+                "the accepted severity should not be sent again"
+            );
+            assert!(
+                store
+                    .next_notification_at(active.clone(), at)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .next_notification_at(active, at + TimeDelta::hours(1))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .label(),
+                "Reminder: CRITICAL"
+            );
+        } else {
+            assert_eq!(
+                sending.unwrap().label(),
+                "Confirmed severity change: UNKNOWN"
+            );
+        }
+    }
+}
+
 async fn save_observation(
     store: &ragios::store::Store,
     target: ragios::store::CheckTarget,
     status: ragios::runner::Status,
     at: chrono::DateTime<chrono::Utc>,
+) {
+    save_observation_for(
+        store,
+        target,
+        status,
+        at,
+        vec!["observer@example.invalid".into()],
+    )
+    .await;
+}
+
+async fn save_observation_for(
+    store: &ragios::store::Store,
+    target: ragios::store::CheckTarget,
+    status: ragios::runner::Status,
+    at: chrono::DateTime<chrono::Utc>,
+    recipients: Vec<String>,
 ) {
     let timestamp = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     store
@@ -607,7 +731,7 @@ async fn save_observation(
                 duration_ms: 0,
             },
             1,
-            vec!["observer@example.invalid".into()],
+            recipients,
         )
         .await
         .unwrap();
