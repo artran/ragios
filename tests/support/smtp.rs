@@ -1269,7 +1269,7 @@ async fn recovery_during_rollback_clears_acknowledgement_before_reupgrade() {
 async fn acknowledgement_blocks_an_already_selected_reminder_at_dispatch() {
     use chrono::{TimeDelta, Utc};
     use ragios::{
-        runner::Status::Critical,
+        runner::Status::{Critical, Warning},
         store::{AcknowledgeOutcome, DeliveryOutcome, Store},
     };
 
@@ -1335,18 +1335,39 @@ async fn acknowledgement_blocks_an_already_selected_reminder_at_dispatch() {
     ));
     assert!(
         store
-            .begin_notification_at(reminder, active.clone(), config, due_at)
+            .begin_notification_at(reminder, active.clone(), config.clone(), due_at)
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .next_notification_at(active, due_at + TimeDelta::hours(24))
+            .next_notification_at(active.clone(), due_at + TimeDelta::hours(24))
             .await
             .unwrap()
             .is_none()
     );
+    // The same Acknowledgement must not suppress a later confirmed change.
+    let changed_at = due_at + TimeDelta::hours(24);
+    save_configured_observation(
+        &store,
+        config.clone(),
+        application_target(),
+        Warning,
+        changed_at,
+    )
+    .await;
+    let changed = store
+        .next_notification_at(active.clone(), changed_at)
+        .await
+        .unwrap()
+        .unwrap();
+    let sending = store
+        .begin_notification_at(changed, active, config, changed_at)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sending.label(), "Confirmed severity change: WARNING");
 }
 
 #[tokio::test]
@@ -1427,6 +1448,127 @@ async fn retry_rechecks_window_at_dispatch_across_the_spring_clock_change() {
         .unwrap();
     assert_eq!(sending.attempts, 2);
     assert_eq!(sending.label(), "Confirmed problem: CRITICAL");
+}
+
+#[tokio::test]
+async fn group_reload_records_holds_while_another_notification_is_in_flight() {
+    use chrono::{TimeDelta, Utc};
+    use ragios::{
+        config::Probe,
+        runner::Status::{Critical, Unknown, Warning},
+        store::{CheckTarget, CreateSilence, DeliveryOutcome, Silence, SilenceScope, Store},
+    };
+
+    let dir = TempDir::new().unwrap();
+    private_file(&dir, "username", USER);
+    private_file(&dir, "password", PASSWORD);
+    let path = config(
+        &dir,
+        &format!(
+            "{}recipients: [observer@example.invalid]\ngroups: [{{id: ops, name: Ops}}]",
+            smtp_yaml("127.0.0.1", 1, "implicit"),
+        ),
+    );
+    with_reachability(&path, "ping", "check", &[]);
+    let config = single_attempt_config(&path);
+    let (published, active) = tokio::sync::watch::channel(config.clone());
+    let store = Store::open_server(&config.database).unwrap();
+    let now = Utc::now() + TimeDelta::seconds(1);
+    save_configured_observation(&store, config.clone(), application_target(), Critical, now).await;
+    let first = store
+        .next_notification_at(active.clone(), now)
+        .await
+        .unwrap()
+        .unwrap();
+    let sending = store
+        .begin_notification_at(first, active.clone(), config.clone(), now)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .finish_notification_at(sending, DeliveryOutcome::Delivered, now)
+        .await
+        .unwrap();
+
+    save_configured_observation(
+        &store,
+        config.clone(),
+        CheckTarget::Host(Probe::Ping),
+        Unknown,
+        now,
+    )
+    .await;
+    let host = store
+        .next_notification_at(active.clone(), now)
+        .await
+        .unwrap()
+        .unwrap();
+    let in_flight = store
+        .begin_notification_at(host, active.clone(), config.clone(), now)
+        .await
+        .unwrap()
+        .unwrap();
+    save_configured_observation(&store, config.clone(), application_target(), Warning, now).await;
+    save_configured_observation(&store, config.clone(), application_target(), Critical, now).await;
+    let expiry = now + TimeDelta::minutes(1);
+    assert!(matches!(
+        store
+            .create_silence(
+                Silence {
+                    scope: SilenceScope::Group("ops".into()),
+                    expires_at: expiry,
+                    reason: None,
+                },
+                active.clone()
+            )
+            .await
+            .unwrap(),
+        CreateSilence::Created
+    ));
+
+    let mut moved = (*config).clone();
+    moved.hosts[0].group = "ops".into();
+    let moved = Arc::new(moved);
+    // No worker poll occurs during the Silence. Publication itself must save
+    // the hold, even though the SMTP attempt has not finished yet.
+    store
+        .publish_notification_config(moved.clone(), published)
+        .await
+        .unwrap();
+    assert_eq!(active.borrow().hosts[0].group, "ops");
+    store
+        .finish_notification_at(in_flight, DeliveryOutcome::Delivered, expiry)
+        .await
+        .unwrap();
+    let pending = store
+        .next_notification_at(active.clone(), expiry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .begin_notification_at(pending, active.clone(), moved, expiry)
+            .await
+            .unwrap()
+            .is_none(),
+        "the recipient already knows CRITICAL; do not replay suppressed changes"
+    );
+    assert!(
+        store
+            .next_notification_at(active, expiry)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .recent_deliveries()
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.diagnostic.as_deref()
+                == Some("Current severity already delivered before suppression"))
+    );
 }
 
 #[tokio::test]
