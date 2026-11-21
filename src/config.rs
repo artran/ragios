@@ -26,6 +26,7 @@ pub struct Config {
     pub hosts: Vec<Host>,
     pub groups: Vec<HostGroup>,
     pub smtp: Option<Smtp>,
+    pub reminder_interval_seconds: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -324,6 +325,10 @@ impl Config {
                 name: "Ungrouped".into(),
             });
         }
+        ensure!(
+            file.reminder_interval_seconds > 0,
+            "reminder_interval_seconds must be positive"
+        );
         let smtp = file.email.resolve(base)?;
         if smtp.is_some() {
             for host in &hosts {
@@ -338,6 +343,7 @@ impl Config {
         }
         Ok(Self {
             smtp,
+            reminder_interval_seconds: file.reminder_interval_seconds,
             bind: file.bind,
             plugin_dir: file.plugin_dir.clone(),
             database: file.database.clone(),

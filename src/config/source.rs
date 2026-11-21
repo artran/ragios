@@ -18,6 +18,8 @@ pub(super) struct File {
     pub database: PathBuf,
     #[serde(default)]
     pub email: super::email::EmailSource,
+    #[serde(default = "default_reminder_interval")]
+    pub reminder_interval_seconds: u32,
     #[serde(default = "super::default_interval")]
     pub interval_seconds: u64,
     #[serde(default = "super::default_timeout")]
@@ -48,6 +50,10 @@ pub(super) struct File {
     pub check_windows: Vec<CheckWindow>,
     #[serde(default, deserialize_with = "non_null")]
     pub check_window: Option<String>,
+}
+
+fn default_reminder_interval() -> u32 {
+    3600
 }
 
 // Fragments contain definitions only; settings and nested includes are deliberately unsupported.

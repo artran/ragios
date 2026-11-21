@@ -300,6 +300,11 @@ async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebErr
         .map_err(load_error)?;
     let mut html = format!("<p>SMTP email {mode}.</p>");
     if config.smtp.is_some() {
+        let _ = write!(
+            html,
+            "<p>Reminder interval: {} seconds.</p>",
+            config.reminder_interval_seconds
+        );
         let hosts = dashboard.store.latest_hosts().await.map_err(load_error)?;
         for host in &config.hosts {
             if host.reachability.is_some()
@@ -319,12 +324,19 @@ async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebErr
         html.push_str("<p>No notification deliveries recorded.</p>");
         return Ok(html);
     }
-    html.push_str("<h2>Recent notification deliveries</h2><div class=\"scroll\"><table><thead><tr><th>Host / Service</th><th>Notification</th><th>Recipient</th><th>State</th><th>Attempts</th><th>Last update</th><th>Diagnostic</th></tr></thead><tbody>");
+    html.push_str("<h2>Recent notification deliveries</h2><div class=\"scroll\"><table><thead><tr><th>Host / Service</th><th>Notification</th><th>Recipient</th><th>State</th><th>Attempts</th><th>Last update</th><th>Next reminder (if eligible)</th><th>Diagnostic</th></tr></thead><tbody>");
     for record in records {
         let notification = record.notification;
+        let reminder_due = record
+            .reminder_from
+            .filter(|_| config.smtp.is_some())
+            .map(|from| {
+                (from + chrono::TimeDelta::seconds(i64::from(config.reminder_interval_seconds)))
+                    .to_rfc3339()
+            });
         let _ = write!(
             html,
-            "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(&notification.host_id),
             escape(notification.target_label()),
             escape(&notification.label()),
@@ -332,6 +344,7 @@ async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebErr
             escape(&record.state),
             notification.attempts,
             escape(&record.updated_at),
+            escape(reminder_due.as_deref().unwrap_or("—")),
             escape(record.diagnostic.as_deref().unwrap_or("—")),
         );
     }

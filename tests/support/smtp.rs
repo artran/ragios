@@ -23,19 +23,9 @@ fn confirmed_host_down_holds_service_email_until_reachability_returns() {
     let dir = TempDir::new().unwrap();
     let relay = TestRelay::listen(&dir, "implicit");
     let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
-    fs::copy(dir.path().join("check"), dir.path().join("probe")).unwrap();
-    let probe = dir.path().join("probe");
-    let script = fs::read_to_string(&probe).unwrap();
-    fs::write(&probe, script.replace("< observation", "< reachability")).unwrap();
-    with_reachability(&path, "ping", "probe", &[]);
+    install_probe(&dir, &path);
     let reachability = "/hosts/local/reachability";
-    let host_result = |status, text| {
-        fs::write(
-            dir.path().join("reachability"),
-            format!("{status} {text}\n"),
-        )
-        .unwrap();
-    };
+    let host_result = |status, text| host_observation(&dir, status, text);
     host_result(0, "initially reachable");
     observation(&dir, 0, "initially healthy");
     let mut app = Application::start(&path);
@@ -70,6 +60,31 @@ fn confirmed_host_down_holds_service_email_until_reachability_returns() {
         .receive("observer@example.invalid", "Recovery: Reachable")
         .respond(250);
     relay.expect_quiet(Duration::from_millis(400));
+}
+
+#[test]
+fn smtp_sends_recurring_host_reminders_but_no_service_mail_during_a_prolonged_outage() {
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(
+        &dir,
+        &relay,
+        "confirmation_attempts: 1\nreminder_interval_seconds: 1",
+    );
+    install_probe(&dir, &path);
+    host_observation(&dir, 2, "host outage");
+    observation(&dir, 0, "initially healthy");
+    let mut app = Application::start(&path);
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: Down")
+        .respond(250);
+    check(&mut app, &dir, 2, "held during outage");
+    for _ in 0..2 {
+        relay
+            .receive("observer@example.invalid", "Reminder: Down")
+            .respond(250);
+    }
+    app.page(DELIVERY, "Reminder: Down");
 }
 
 #[test]
@@ -440,6 +455,165 @@ fn current_notification_retries_after_smtp_credentials_are_corrected() {
 }
 
 #[tokio::test]
+async fn reminder_cadence_and_queued_delivery_survive_restart_and_host_suppression() {
+    use chrono::{TimeDelta, Utc};
+    use ragios::{
+        config::{Config, Probe},
+        runner::Status::{Critical, Ok as Healthy, Warning},
+        store::{CheckTarget, DeliveryOutcome, Store},
+    };
+    let dir = TempDir::new().unwrap();
+    private_file(&dir, "username", USER);
+    private_file(&dir, "password", PASSWORD);
+    let path = config(
+        &dir,
+        &format!(
+            "{}recipients: [observer@example.invalid]",
+            smtp_yaml("127.0.0.1", 1, "implicit")
+        ),
+    );
+    with_reachability(&path, "ping", "check", &[]);
+    let config = Arc::new(Config::load(&path).unwrap());
+    let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+    let initial = Utc::now();
+    let at = |seconds| initial + TimeDelta::seconds(seconds);
+    let host = || CheckTarget::Host(Probe::Ping);
+    let service = || CheckTarget::Service("application".into());
+    let mut store = Store::open_server(&config.database).unwrap();
+    save_observation(&store, service(), Critical, initial).await;
+
+    let deliver = |store: Store, seconds, label: &'static str| {
+        let active = active.clone();
+        let config = config.clone();
+        async move {
+            let next = store
+                .next_notification_at(active.clone(), at(seconds))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.label(), label);
+            let sending = store
+                .begin_notification(next, active, config)
+                .await
+                .unwrap()
+                .unwrap();
+            store
+                .finish_notification_at(sending, DeliveryOutcome::Delivered, at(seconds))
+                .await
+                .unwrap();
+        }
+    };
+    deliver(store.clone(), 1, "Confirmed problem: CRITICAL").await;
+    drop(store);
+    store = Store::open_server(&config.database).unwrap();
+    store.resume_notifications().await.unwrap();
+    assert!(
+        store
+            .next_notification_at(active.clone(), at(3600))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let pending = store
+        .next_notification_at(active.clone(), at(3601))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.label(), "Reminder: CRITICAL");
+    drop(store);
+    store = Store::open_server(&config.database).unwrap();
+    store.resume_notifications().await.unwrap();
+    assert_eq!(
+        store
+            .next_notification_at(active.clone(), at(3601))
+            .await
+            .unwrap()
+            .unwrap()
+            .event_id,
+        pending.event_id
+    );
+
+    save_observation(&store, host(), Critical, at(3601)).await;
+    assert!(
+        store
+            .begin_notification(pending, active.clone(), config.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    deliver(store.clone(), 3602, "Confirmed problem: Down").await;
+    save_observation(&store, service(), Warning, at(3700)).await;
+    save_observation(&store, service(), Critical, at(3800)).await;
+    deliver(store.clone(), 10_000, "Reminder: Down").await;
+    assert!(
+        store
+            .next_notification_at(active.clone(), at(10_000))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    save_observation(&store, host(), Healthy, at(10_001)).await;
+    deliver(store.clone(), 10_001, "Recovery: Reachable").await;
+    let due = store
+        .next_notification_at(active.clone(), at(10_001))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(due.label(), "Confirmed severity change: CRITICAL");
+    // Reconciliation drops a return to the last delivered severity and rearms
+    // exactly one overdue reminder, not the intermediate severity changes.
+    assert!(
+        store
+            .begin_notification(due, active.clone(), config.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    deliver(store.clone(), 10_001, "Reminder: CRITICAL").await;
+    assert!(
+        store
+            .next_notification_at(active.clone(), at(10_002))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    save_observation(&store, service(), Healthy, at(10_003)).await;
+    deliver(store.clone(), 10_003, "Recovery: OK").await;
+    assert!(
+        store
+            .next_notification_at(active, at(20_000))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+async fn save_observation(
+    store: &ragios::store::Store,
+    target: ragios::store::CheckTarget,
+    status: ragios::runner::Status,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    let timestamp = at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    store
+        .save_with_notifications(
+            "local".into(),
+            target,
+            ragios::runner::CheckResult {
+                status,
+                output: String::new(),
+                started_at: timestamp.clone(),
+                finished_at: timestamp,
+                duration_ms: 0,
+            },
+            1,
+            vec!["observer@example.invalid".into()],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evidence() {
     use ragios::{
         config::Config,
@@ -566,6 +740,22 @@ fn request_check(app: &mut Application, service: &str, text: &str) {
         .unwrap();
     assert!(response.text().unwrap().contains("Check started"));
     app.page(&format!("{service}/status"), text);
+}
+
+fn install_probe(dir: &TempDir, path: &Path) {
+    let probe = dir.path().join("probe");
+    fs::copy(dir.path().join("check"), &probe).unwrap();
+    let script = fs::read_to_string(&probe).unwrap();
+    fs::write(&probe, script.replace("< observation", "< reachability")).unwrap();
+    with_reachability(path, "ping", "probe", &[]);
+}
+
+fn host_observation(dir: &TempDir, status: i32, text: &str) {
+    fs::write(
+        dir.path().join("reachability"),
+        format!("{status} {text}\n"),
+    )
+    .unwrap();
 }
 
 fn observation(dir: &TempDir, status: i32, text: &str) {

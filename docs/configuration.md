@@ -145,9 +145,9 @@ Host results and lifecycle state persist under the host ID in a separate check
 namespace from every service ID. Display-name changes preserve state. A TCP
 probe and a service may test the same endpoint, but their outcomes remain
 independent. Service checks continue while the host is down or undetermined.
-Only confirmed down is eligible for later service-notification suppression;
-confirmed undetermined, pending failures, and degraded reachability are not.
-Email delivery covers service problems; host reachability does not itself send email.
+Only confirmed down holds service notifications. Confirmed undetermined,
+pending failures, and degraded reachability do not. Both confirmed down and
+confirmed undetermined can send host reachability email.
 
 Reachability is observed from the monitoring server's network location. A failed
 probe does not prove the machine is powered off; a reachable host does not prove
@@ -302,6 +302,7 @@ Omit `email` or set `email: {mode: disabled}` for evaluation. To send email thro
 an authenticated SMTP relay, set the following in the root configuration:
 
 ```yaml
+reminder_interval_seconds: 3600  # optional; must be positive
 email:
   mode: smtp
   server: smtp.example.invalid
@@ -322,15 +323,28 @@ with no group or other permissions (for example, `0600` or `0400`). Put one
 nonempty UTF-8 line in each file. Do not put the values in YAML or plugin output.
 `--validate` checks the settings and files without connecting to the relay.
 
-Confirmed service problems and severity changes create email intent in the same
-SQLite transaction as the check result. Pending-only failures do not send email.
-A recovery is sent only to still-configured recipients whose problem message
-was accepted by the relay during that confirmed problem. A newer confirmed
-state supersedes unsent messages. While email is disabled, the worker discards
-queued deliveries. Transitions recorded while disabled are not replayed.
+Confirmed host and service problems and confirmed status changes queue email
+in the same SQLite transaction as the check result. Pending-only failures do
+not send email. A recovery goes only to still-configured recipients whose
+problem message was accepted by the relay during that confirmed problem. A
+newer confirmed state supersedes unsent messages.
 
-Open **Email delivery** on the dashboard to see delivery state, attempts, and
-sanitized SMTP diagnostics. Temporary failures retry starting after three seconds,
+For each unresolved problem, Ragios schedules a reminder after the current
+problem message reaches a delivery outcome (accepted or permanently failed).
+The next reminder interval starts when the reminder reaches a delivery outcome.
+Changing `reminder_interval_seconds` on reload updates waiting reminders but
+does not reschedule messages that are already queued. A restart does not reset
+the interval or queue multiple missed reminders.
+
+Confirmed host down holds queued service notifications and reminders while
+service checks continue. When confirmed down ends, Ragios reevaluates held
+notifications against each service's current confirmed state and what each
+recipient already received. Failures that recovered without a delivered problem
+message don't send recovery email. While email is disabled, Ragios discards
+queued deliveries and cancels reminders; it does not replay disabled transitions.
+
+Open **Email delivery** on the dashboard to see which hosts are holding service
+email, reminder timing, delivery attempts, and sanitized SMTP diagnostics. Temporary failures retry starting after three seconds,
 with exponential backoff up to five minutes. A `535` authentication rejection
 also retries, so pending mail can be delivered after credentials are corrected
 and reloaded. Other SMTP 5xx replies are not retried.
