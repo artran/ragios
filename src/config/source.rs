@@ -50,6 +50,8 @@ pub(super) struct File {
     pub check_windows: Vec<CheckWindow>,
     #[serde(default, deserialize_with = "non_null")]
     pub check_window: Option<String>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub notification_window: Option<String>,
 }
 
 fn default_reminder_interval() -> u32 {
@@ -142,6 +144,8 @@ pub(super) struct Host {
     pub timeout_seconds: Option<u64>,
     #[serde(default, deserialize_with = "non_null")]
     pub check_window: Option<String>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub notification_window: Option<String>,
     #[serde(default, deserialize_with = "unique_map")]
     pub overrides: BTreeMap<String, ServiceOverride>,
     #[serde(default, deserialize_with = "unique_map")]
@@ -167,6 +171,8 @@ pub(super) struct Reachability {
     pub timeout_seconds: Option<u64>,
     #[serde(default, deserialize_with = "non_null")]
     pub check_window: Option<String>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub notification_window: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -188,6 +194,8 @@ pub(super) struct Service {
     pub timeout_seconds: Option<u64>,
     #[serde(default, deserialize_with = "non_null")]
     pub check_window: Option<String>,
+    #[serde(default, deserialize_with = "non_null")]
+    pub notification_window: Option<String>,
 }
 
 // Missing means inherit; an explicit null must not silently erase an override.
@@ -348,11 +356,11 @@ pub(super) struct Definitions<'a> {
 }
 
 impl Definitions<'_> {
-    fn window(&self, id: Option<&String>) -> Result<()> {
+    fn window(&self, id: Option<&String>, kind: &str) -> Result<()> {
         if let Some(id) = id {
             ensure!(
                 id == ALWAYS || self.windows.contains_key(id.as_str()),
-                "unknown check window {id:?}"
+                "unknown {kind} {id:?}"
             );
         }
         Ok(())
@@ -445,8 +453,11 @@ impl File {
         );
         recipients(&self.recipients).context("global recipients")?;
         definitions
-            .window(self.check_window.as_ref())
+            .window(self.check_window.as_ref(), "check window")
             .context("global check_window")?;
+        definitions
+            .window(self.notification_window.as_ref(), "notification window")
+            .context("global notification_window")?;
         for command in &self.commands {
             ensure!(
                 !command.executable.as_os_str().is_empty(),
@@ -514,7 +525,8 @@ impl File {
                 if let Some(values) = &host.recipients {
                     recipients(values)?;
                 }
-                definitions.window(host.check_window.as_ref())?;
+                definitions.window(host.check_window.as_ref(), "check window")?;
+                definitions.window(host.notification_window.as_ref(), "notification window")?;
                 if let Some(value) = host.interval_seconds {
                     duration("interval_seconds", value)?;
                 }
@@ -533,7 +545,10 @@ impl File {
                         duration("reachability timeout_seconds", value)?;
                     }
                     definitions
-                        .window(probe.check_window.as_ref())
+                        .window(probe.check_window.as_ref(), "check window")
+                        .context("reachability")?;
+                    definitions
+                        .window(probe.notification_window.as_ref(), "notification window")
                         .context("reachability")?;
                 }
                 for service in &host.services {
@@ -557,7 +572,13 @@ impl File {
                             .with_context(|| format!("override {id:?}"))?;
                     }
                     definitions
-                        .window(overrides.check_window.as_ref())
+                        .window(overrides.check_window.as_ref(), "check window")
+                        .with_context(|| format!("override {id:?}"))?;
+                    definitions
+                        .window(
+                            overrides.notification_window.as_ref(),
+                            "notification window",
+                        )
                         .with_context(|| format!("override {id:?}"))?;
                 }
                 Ok(())
@@ -595,13 +616,16 @@ impl Service {
         if let Some(value) = self.timeout_seconds {
             duration("timeout_seconds", value)?;
         }
-        definitions.window(self.check_window.as_ref())
+        definitions.window(self.check_window.as_ref(), "check window")?;
+        definitions.window(self.notification_window.as_ref(), "notification window")
     }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ServiceOverride {
+    #[serde(default, deserialize_with = "non_null")]
+    pub notification_window: Option<String>,
     #[serde(default, deserialize_with = "non_null")]
     pub name: Option<String>,
     #[serde(default, deserialize_with = "non_null")]

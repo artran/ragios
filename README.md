@@ -246,9 +246,10 @@ to send email for confirmed host and service problems, confirmed status changes,
 and eligible recoveries. Unresolved problems send reminders every hour by default.
 Confirmed host down holds service notifications, not service checks. When the host
 is no longer confirmed down, Ragios sends only notifications that still apply.
-Retries and reminder timing survive restarts in SQLite. Open **Email delivery**
-on the dashboard to see which hosts are holding service mail, upcoming reminders,
-and delivery outcomes.
+[Notification windows](docs/configuration.md#notification-windows) restrict email
+to recurring weekly hours without changing when checks run. Retries and reminder
+timing survive restarts in SQLite. Open **Email delivery** on the dashboard to see
+held notifications, upcoming reminders, and delivery outcomes.
 
 ## Access and current scope
 

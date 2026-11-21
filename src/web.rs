@@ -306,7 +306,43 @@ async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebErr
             config.reminder_interval_seconds
         );
         let hosts = dashboard.store.latest_hosts().await.map_err(load_error)?;
+        let services = if config
+            .hosts
+            .iter()
+            .any(|host| host.notification_windows().any(|(id, _)| !id.is_empty()))
+        {
+            dashboard.store.latest().await.map_err(load_error)?
+        } else {
+            LatestResults::new()
+        };
+        let now = Utc::now();
         for host in &config.hosts {
+            for (id, window) in host.notification_windows() {
+                if window.is_open(now) {
+                    continue;
+                }
+                let problem = if id.is_empty() {
+                    hosts.get(&host.id).map(|state| state.problem)
+                } else {
+                    services
+                        .get(&(host.id.clone(), id.to_string()))
+                        .map(|state| state.problem)
+                };
+                if problem.is_some_and(|problem| problem.confirmed_severity.is_some()) {
+                    let target = if id.is_empty() {
+                        "Host reachability"
+                    } else {
+                        id
+                    };
+                    let _ = write!(
+                        html,
+                        "<p>{} / {}: Outside notification window ({})</p>",
+                        escape(&host.id),
+                        escape(target),
+                        escape(&window.id)
+                    );
+                }
+            }
             if host.reachability.is_some()
                 && hosts
                     .get(&host.id)

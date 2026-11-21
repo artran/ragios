@@ -203,7 +203,8 @@ For each timing setting, precedence is:
 4. Root default.
 
 `overrides` is a map keyed by an existing service ID on that host. Its only fields
-are `name`, `args`, `interval_seconds`, `timeout_seconds`, and `check_window`.
+are `name`, `args`, `interval_seconds`, `timeout_seconds`, `check_window`, and
+`notification_window`.
 It cannot create or rename an identity, change an executable, or hide a bundle
 collision. Argument
 overrides replace the entire argument list; `args: []` removes all arguments.
@@ -344,10 +345,42 @@ message don't send recovery email. While email is disabled, Ragios discards
 queued deliveries and cancels reminders; it does not replay disabled transitions.
 
 Open **Email delivery** on the dashboard to see which hosts are holding service
-email, reminder timing, delivery attempts, and sanitized SMTP diagnostics. Temporary failures retry starting after three seconds,
+email, which confirmed problems are outside their notification windows, reminder
+timing, delivery attempts, and sanitized SMTP diagnostics. Temporary failures
+retry starting after three seconds,
 with exponential backoff up to five minutes. A `535` authentication rejection
 also retries, so pending mail can be delivered after credentials are corrected
 and reloaded. Other SMTP 5xx replies are not retried.
+
+### Notification windows
+
+Set `notification_window` to a name from `check_windows` to limit when Ragios can
+start an email attempt. This is independent of `check_window`: checks keep
+running on their own schedule and their results are saved normally.
+
+```yaml
+notification_window: staffed-hours
+check_windows:
+  - id: staffed-hours
+    timezone: America/New_York
+    ranges:
+      - {days: [mon, tue, wed, thu, fri], start: "09:00", end: "17:00"}
+```
+
+`notification_window` uses the same precedence and local-time rules as
+`check_window`, with separate assignments. A host, service, service override,
+or reachability probe can use `always` to opt out of an inherited restriction.
+If no level assigns a window, email can be attempted at any time.
+
+While a window is closed, Ragios holds problems, confirmed severity changes,
+recoveries, reminders, and SMTP retries for that check. On reopening it sends
+only what still applies. If a problem came and went without a delivered email,
+there is nothing to send. If a recipient already knows the current severity,
+Ragios resumes reminders instead of reporting an intervening change. If an
+already-notified problem recovered and remains recovered, Ragios can send its
+recovery. Confirmed host-down suppression still applies to service email, and
+at most one overdue reminder is eligible per check and recipient. An SMTP attempt
+that has already started can finish after the window closes.
 Ragios does not resend a recorded delivery on restart. If the relay accepts a
 message but Ragios cannot record that outcome (for example, on a crash), the
 outcome is uncertain and a still-current message may be retried. A message
