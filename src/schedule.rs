@@ -61,20 +61,13 @@ pub fn window_wait(check: &Check, at: DateTime<Utc>) -> Duration {
     (eligible_from(check, at) - at).to_std().unwrap_or_default()
 }
 
-/// Whether local wall-clock time at `at` falls inside one of the window's
-/// ranges. Local time keeps the window fixed across daylight-saving changes.
-fn is_open(window: &CheckWindow, at: DateTime<Utc>) -> bool {
-    let local = at.with_timezone(&window.timezone);
-    window.ranges.iter().any(|range| range.contains(&local))
-}
-
 /// A closed window next opens where a range starts, where a range starting
 /// inside a skipped daylight-saving hour first exists, or where clocks go back
 /// into the middle of a range. A repeated hour offers both of its instants.
 /// Validation guarantees a range, so one opens within a week, or within two
 /// when daylight saving skips an entire occurrence.
 fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
-    if is_open(window, at) {
+    if window.is_open(at) {
         return at;
     }
     let today = at.with_timezone(&window.timezone).date_naive();
@@ -93,7 +86,7 @@ fn next_open(window: &CheckWindow, at: DateTime<Utc>) -> DateTime<Utc> {
         .filter_map(|&day| clocks_go_back(window.timezone, day));
     starts
         .chain(set_backs)
-        .filter(|&instant| instant > at && is_open(window, instant))
+        .filter(|&instant| instant > at && window.is_open(instant))
         .min()
         .expect("a validated window opens within two weeks")
 }

@@ -1,7 +1,7 @@
 mod notifications;
 mod schema;
 
-pub use notifications::{DeliveryOutcome, Notification};
+pub use notifications::{DeliveryOutcome, Notification, NotificationPolicy};
 
 use crate::{
     config::Probe,
@@ -305,8 +305,14 @@ impl Store {
         result: CheckResult,
         confirmation_attempts: u32,
     ) -> Result<ProblemState> {
-        self.save_with_notifications(host_id, target, result, confirmation_attempts, Vec::new())
-            .await
+        self.save_with_notifications(
+            host_id,
+            target,
+            result,
+            confirmation_attempts,
+            Default::default(),
+        )
+        .await
     }
 
     pub async fn save_with_notifications(
@@ -315,7 +321,7 @@ impl Store {
         target: CheckTarget,
         result: CheckResult,
         confirmation_attempts: u32,
-        recipients: Vec<String>,
+        policy: NotificationPolicy,
     ) -> Result<ProblemState> {
         ensure!(
             confirmation_attempts > 0,
@@ -400,7 +406,7 @@ impl Store {
                         target.kind().as_str()
                     ],
                 )?;
-                notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, assessment, &result.finished_at, &recipients)?;
+                notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, assessment, &result.finished_at, &policy)?;
                 if matches!(target, CheckTarget::Host(_))
                     && previous.confirmed_severity != Some(Status::Critical)
                     && state.confirmed_severity == Some(Status::Critical)

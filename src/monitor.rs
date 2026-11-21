@@ -4,7 +4,7 @@ use ragios::{
     config::{Check, Config},
     runner::{self, CheckResult},
     schedule,
-    store::{CheckTarget, ProblemState, Store},
+    store::{CheckTarget, NotificationPolicy, ProblemState, Store},
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -302,16 +302,16 @@ impl Monitor {
         if let Some(scheduled) = self.checks.get_mut(&key)
             && scheduled.generation == generation
         {
-            let recipients = if self.config.smtp.is_some() {
-                self.config
-                    .hosts
-                    .iter()
-                    .find(|host| host.id == key.0)
-                    .map(|host| host.recipients.clone())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
+            let policy = self
+                .config
+                .smtp
+                .as_ref()
+                .and_then(|_| self.config.hosts.iter().find(|host| host.id == key.0))
+                .map(|host| NotificationPolicy {
+                    recipients: host.recipients.clone(),
+                    window: host.notification_window(&key.1).cloned(),
+                })
+                .unwrap_or_default();
             let saved = self
                 .store
                 .save_with_notifications(
@@ -319,7 +319,7 @@ impl Monitor {
                     scheduled.target.clone(),
                     result,
                     self.config.confirmation_attempts,
-                    recipients,
+                    policy,
                 )
                 .await;
             scheduled.finished = Some(Instant::now());
