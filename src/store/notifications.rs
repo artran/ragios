@@ -6,7 +6,7 @@
 //! selection/dispatch transactions; SMTP runs only after dispatch commits.
 //! See `docs/notification-policy.md` for the phase distinctions and regressions.
 
-use super::{Store, TransitionKind, silences, status_code};
+use super::{CheckTarget, Store, TransitionKind, status_code};
 use crate::{
     config::Config,
     runner::{Reachability, Status},
@@ -199,15 +199,24 @@ impl<'a> Eligibility<'a> {
     }
 
     fn silenced(&self, db: &Connection, host: &str, service: &str) -> Result<bool> {
-        silences::is_silenced(
-            db,
-            (
-                host,
-                service,
-                self.host(host).map(|host| host.group.as_str()),
+        let groups = self
+            .host(host)
+            .map(|host| {
+                serde_json::to_string(&std::collections::BTreeMap::from([(&host.id, &host.group)]))
+            })
+            .transpose()?;
+        // Use the same scope match as selection/hold reconciliation, with one
+        // target instead of scanning the queue. Missing configuration still
+        // permits a Host or Service Silence, but has no Host group to match.
+        Ok(db.query_row(
+            &format!(
+                "WITH e(host_id, service_id) AS (VALUES (:host, :service))
+                SELECT NOT {NOT_SILENCED} FROM e"
             ),
-            self.now,
-        )
+            named_params! {":host": host, ":service": service,
+            ":now": self.now.timestamp_millis(), ":groups": groups},
+            |row| row.get(0),
+        )?)
     }
 
     fn select(&self, tx: &Transaction<'_>) -> Result<Option<Notification>> {
@@ -338,16 +347,17 @@ impl<'a> Eligibility<'a> {
 /// recovery share that ID. This history is independent of check history pruning.
 pub(super) fn record(
     tx: &Transaction<'_>,
-    check: (&str, &str),
+    check: (&str, &CheckTarget),
     kind: TransitionKind,
     previous_severity: Option<Status>,
     severity: Status,
     occurred_at: &str,
     config: Option<&Config>,
 ) -> Result<()> {
-    let (host_id, service_id) = check;
+    let (host_id, target) = check;
+    let service_id = target.service_id();
     // Even result-only writes must preserve host-down suppression history.
-    if service_id.is_empty()
+    if matches!(target, CheckTarget::Host(_))
         && severity == Status::Critical
         && previous_severity != Some(Status::Critical)
         && matches!(
@@ -425,7 +435,7 @@ pub(super) fn record(
     let event = tx.last_insert_rowid();
     let ready_at = now.timestamp_millis();
     let held = match &eligibility {
-        Some(policy) => policy.held_at_recording(tx, check, kind, occurred_at)?,
+        Some(policy) => policy.held_at_recording(tx, (host_id, service_id), kind, occurred_at)?,
         None => !service_id.is_empty() && host_is_down(tx, host_id)?,
     };
     for recipient in recipients {

@@ -457,7 +457,7 @@ impl Store {
                         target.kind().as_str()
                     ],
                 )?;
-                notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, assessment, &result.finished_at, config.as_deref())?;
+                notifications::record(&transaction, (&host_id, &target), kind, previous.confirmed_severity, assessment, &result.finished_at, config.as_deref())?;
             }
             transaction.commit()?;
             Ok(state)

@@ -2,7 +2,7 @@ use super::{Store, notifications};
 use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Row, params};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -125,17 +125,4 @@ fn read_silence(row: &Row<'_>) -> rusqlite::Result<Silence> {
         expires_at,
         reason: row.get(4)?,
     })
-}
-
-pub(super) fn is_silenced(
-    db: &Connection,
-    (host, service, group): (&str, &str, Option<&str>),
-    now: DateTime<Utc>,
-) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM silences WHERE expires_at > ?4
-         AND ((host_id = ?1 AND (service_id IS NULL OR service_id = ?2)) OR group_id = ?3))",
-        params![host, service, group, now.timestamp_millis()],
-        |row| row.get(0),
-    )?)
 }

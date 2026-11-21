@@ -1498,13 +1498,13 @@ async fn group_reload_records_holds_while_another_notification_is_in_flight() {
         now,
     )
     .await;
-    let host = store
+    let reachability_candidate = store
         .next_notification_at(active.clone(), now)
         .await
         .unwrap()
         .unwrap();
     let in_flight = store
-        .begin_notification_at(host, active.clone(), config.clone(), now)
+        .begin_notification_at(reachability_candidate, active.clone(), config.clone(), now)
         .await
         .unwrap()
         .unwrap();
