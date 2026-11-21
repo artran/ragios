@@ -43,6 +43,7 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS transitions_by_time ON check_transitions(occurred_at);",
     )?;
     transaction.execute_batch(super::notifications::SCHEMA)?;
+    super::notifications::migrate(&transaction)?;
     let legacy: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'latest_results')",
         [],

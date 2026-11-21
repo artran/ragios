@@ -36,7 +36,7 @@ impl HostState {
         Reachability::from_status(self.result.status)
     }
 
-    /// Eligibility for future host-down notification suppression. Neither an
+    /// Eligibility for host-down notification suppression. Neither an
     /// unconfirmed failure nor confirmed undetermined reachability qualifies.
     pub fn is_confirmed_down(&self) -> bool {
         self.problem.confirmed_severity == Some(Status::Critical)
@@ -400,8 +400,12 @@ impl Store {
                         target.kind().as_str()
                     ],
                 )?;
-                if matches!(target, CheckTarget::Service(_)) {
-                    notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, &result, &recipients)?;
+                notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, assessment, &result.finished_at, &recipients)?;
+                if matches!(target, CheckTarget::Host(_))
+                    && previous.confirmed_severity != Some(Status::Critical)
+                    && state.confirmed_severity == Some(Status::Critical)
+                {
+                    notifications::hold_services(&transaction, &host_id)?;
                 }
             }
             transaction.commit()?;

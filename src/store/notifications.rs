@@ -1,7 +1,7 @@
 use super::{Store, TransitionKind, status_code};
 use crate::{
     config::Config,
-    runner::{CheckResult, Status},
+    runner::{Reachability, Status},
 };
 use anyhow::{Result, anyhow, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -17,7 +17,8 @@ pub(super) const SCHEMA: &str = "
         episode_id INTEGER,
         kind TEXT NOT NULL CHECK (kind IN ('confirmed', 'severity_changed', 'recovery')),
         severity INTEGER NOT NULL,
-        occurred_at TEXT NOT NULL
+        occurred_at TEXT NOT NULL,
+        reminder_for INTEGER
     );
     CREATE INDEX IF NOT EXISTS notification_events_by_service
         ON notification_events(host_id, service_id, id);
@@ -32,12 +33,81 @@ pub(super) const SCHEMA: &str = "
         retry_at INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
         diagnostic TEXT,
+        held INTEGER NOT NULL DEFAULT 0,
+        remind_from INTEGER,
         PRIMARY KEY (event_id, recipient)
     );
     CREATE INDEX IF NOT EXISTS notification_deliveries_due
         ON notification_deliveries(retry_at, event_id, recipient) WHERE state IN ('queued', 'retrying');
     CREATE INDEX IF NOT EXISTS notification_deliveries_recent
         ON notification_deliveries(updated_at DESC, event_id DESC, recipient);";
+
+pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
+    if !has_column(tx, "notification_deliveries", "held")? {
+        // Recovery can be recorded before the delivery worker starts, so
+        // preserve suppression history for the existing outbox during upgrade.
+        tx.execute_batch(
+            "ALTER TABLE notification_deliveries ADD COLUMN held INTEGER NOT NULL DEFAULT 0;
+             UPDATE notification_deliveries SET held = 1
+             WHERE state IN ('queued', 'retrying', 'sending') AND event_id IN (
+                 SELECT e.id FROM notification_events e JOIN check_problems p ON p.host_id = e.host_id
+                 WHERE e.service_id != '' AND p.check_kind = 'host' AND p.service_id = ''
+                   AND p.confirmed_severity = 2
+             );",
+        )?;
+    }
+    if !has_column(tx, "notification_events", "reminder_for")? {
+        tx.execute_batch("ALTER TABLE notification_events ADD COLUMN reminder_for INTEGER;")?;
+    }
+    if !has_column(tx, "notification_deliveries", "remind_from")? {
+        tx.execute_batch(
+            "ALTER TABLE notification_deliveries ADD COLUMN remind_from INTEGER;
+             UPDATE notification_deliveries AS d SET remind_from = retry_at
+             WHERE state IN ('delivered', 'failed') AND EXISTS (
+                 SELECT 1 FROM notification_events e WHERE e.id = d.event_id AND e.kind != 'recovery'
+                   AND NOT EXISTS (SELECT 1 FROM notification_events newer
+                     WHERE newer.host_id = e.host_id AND newer.service_id = e.service_id AND newer.id > e.id)
+             );",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS notification_reminders_by_event
+             ON notification_events(reminder_for) WHERE reminder_for IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS notification_reminders_due
+             ON notification_deliveries(remind_from) WHERE remind_from IS NOT NULL;",
+    )?;
+    Ok(())
+}
+
+fn has_column(db: &Connection, table: &str, name: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        params![table, name],
+        |row| row.get(0),
+    )?)
+}
+
+fn host_is_down(db: &Connection, host: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM check_problems WHERE check_kind = 'host'
+            AND host_id = ?1 AND service_id = '' AND confirmed_severity = 2)",
+        [host],
+        |row| row.get(0),
+    )?)
+}
+
+// This marker survives restarts and lets dispatch reconcile against what each
+// recipient actually saw. The host's current confirmed state gates dispatch.
+pub(super) fn hold_services(tx: &Transaction<'_>, host: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE notification_deliveries SET held = 1
+         WHERE state IN ('queued', 'retrying', 'sending') AND event_id IN (
+            SELECT id FROM notification_events WHERE host_id = ?1 AND service_id != ''
+         )",
+        [host],
+    )?;
+    Ok(())
+}
 
 fn timestamp(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -50,7 +120,8 @@ pub(super) fn record(
     check: (&str, &str),
     kind: TransitionKind,
     previous_severity: Option<Status>,
-    result: &CheckResult,
+    severity: Status,
+    occurred_at: &str,
     recipients: &[String],
 ) -> Result<()> {
     if !matches!(
@@ -64,7 +135,7 @@ pub(super) fn record(
     let previous = tx
         .query_row(
             "SELECT id, COALESCE(episode_id, id), kind FROM notification_events
-         WHERE host_id = ?1 AND service_id = ?2 ORDER BY id DESC LIMIT 1",
+         WHERE host_id = ?1 AND service_id = ?2 AND reminder_for IS NULL ORDER BY id DESC LIMIT 1",
             params![host_id, service_id],
             |row| {
                 Ok((
@@ -101,17 +172,20 @@ pub(super) fn record(
         tx.execute(
             "UPDATE notification_deliveries SET state = 'discarded', updated_at = ?2,
                     diagnostic = 'Superseded by a newer confirmed state'
-             WHERE event_id = ?1 AND state IN ('queued', 'retrying')",
+             WHERE (event_id = ?1 OR event_id IN (SELECT id FROM notification_events WHERE reminder_for = ?1))
+               AND state IN ('queued', 'retrying')",
             params![id, updated_at],
         )?;
+        tx.execute("UPDATE notification_deliveries SET remind_from = NULL WHERE event_id = ?1 AND remind_from IS NOT NULL", [id])?;
     }
     tx.execute(
         "INSERT INTO notification_events (host_id, service_id, episode_id, kind, severity, occurred_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![host_id, service_id, episode, kind.as_str(), status_code(result.status), result.finished_at],
+        params![host_id, service_id, episode, kind.as_str(), status_code(severity), occurred_at],
     )?;
     let event = tx.last_insert_rowid();
     let ready_at = now.timestamp_millis();
+    let held = !service_id.is_empty() && host_is_down(tx, host_id)?;
     for recipient in recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
@@ -120,9 +194,9 @@ pub(super) fn record(
             continue;
         }
         tx.execute(
-            "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at)
-             VALUES (?1, ?2, 'queued', ?3, ?4) ON CONFLICT DO NOTHING",
-            params![event, recipient, updated_at, ready_at],
+            "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at, held)
+             VALUES (?1, ?2, 'queued', ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+            params![event, recipient, updated_at, ready_at, held],
         )?;
     }
     Ok(())
@@ -154,10 +228,38 @@ pub struct Notification {
     pub severity: Status,
     pub occurred_at: String,
     pub attempts: u32,
+    reminder: bool,
 }
 
 impl Notification {
+    pub fn target_label(&self) -> &str {
+        if self.service_id.is_empty() {
+            "Host reachability"
+        } else {
+            &self.service_id
+        }
+    }
+
     pub fn label(&self) -> String {
+        if self.reminder {
+            let state = if self.service_id.is_empty() {
+                Reachability::from_status(self.severity).label()
+            } else {
+                self.severity.label()
+            };
+            return format!("Reminder: {state}");
+        }
+        if self.service_id.is_empty() {
+            let state = Reachability::from_status(self.severity).label();
+            return match self.kind {
+                TransitionKind::Recovery => format!("Recovery: {state}"),
+                TransitionKind::Confirmed => format!("Confirmed problem: {state}"),
+                TransitionKind::SeverityChanged => {
+                    format!("Confirmed reachability change: {state}")
+                }
+                _ => unreachable!("pending transitions do not create notifications"),
+            };
+        }
         match self.kind {
             TransitionKind::Recovery => "Recovery: OK".into(),
             TransitionKind::Confirmed => format!("Confirmed problem: {}", self.severity.label()),
@@ -174,6 +276,7 @@ pub struct DeliveryRecord {
     pub state: String,
     pub diagnostic: Option<String>,
     pub updated_at: String,
+    pub reminder_from: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone)]
@@ -223,6 +326,14 @@ impl Store {
         &self,
         active: watch::Receiver<Arc<Config>>,
     ) -> Result<Option<Notification>> {
+        self.next_notification_at(active, Utc::now()).await
+    }
+
+    pub async fn next_notification_at(
+        &self,
+        active: watch::Receiver<Arc<Config>>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<Notification>> {
         ensure!(
             self.1.is_some(),
             "email delivery requires the exclusive server database lock"
@@ -235,22 +346,38 @@ impl Store {
                 tx.execute(
                     "UPDATE notification_deliveries SET state = 'discarded', updated_at = ?1,
                        diagnostic = 'Email disabled' WHERE state IN ('queued', 'retrying')",
-                    [timestamp(Utc::now())],
+                    [timestamp(now)],
                 )?;
+                tx.execute("UPDATE notification_deliveries SET remind_from = NULL WHERE remind_from IS NOT NULL", [])?;
                 tx.commit()?;
                 return Ok(None);
             }
-            let now = Utc::now();
+            let reachability_hosts = serde_json::to_string(
+                &config
+                    .hosts
+                    .iter()
+                    .filter(|host| host.reachability.is_some())
+                    .map(|host| &host.id)
+                    .collect::<Vec<_>>(),
+            )?;
+            // Materialize at most one reminder per poll; no backlog accumulates
+            // during restarts, suppression, or an unfinished SMTP attempt.
+            queue_due_reminder(&tx, &config, now, &reachability_hosts)?;
             // Bound how much reconciliation can delay check writes or reload.
             for _ in 0..32 {
                 let candidate = tx
                     .query_row(
                         "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
-                            e.occurred_at, d.attempts
+                            e.occurred_at, d.attempts, e.reminder_for IS NOT NULL
                      FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
                      WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= ?1
+                       AND (e.service_id = '' OR e.host_id NOT IN (
+                           SELECT host_id FROM check_problems WHERE check_kind = 'host'
+                             AND service_id = '' AND confirmed_severity = 2
+                             AND host_id IN (SELECT value FROM json_each(?2))
+                       ))
                      ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1",
-                        [now.timestamp_millis()],
+                        params![now.timestamp_millis(), reachability_hosts],
                         read_notification,
                     )
                     .optional()?;
@@ -289,8 +416,18 @@ impl Store {
             if !Arc::ptr_eq(&config, &relay_config) || config.smtp.is_none() {
                 return Ok(None);
             }
+            if !notification.service_id.is_empty()
+                && config.hosts.iter().any(|host| host.id == notification.host_id && host.reachability.is_some())
+                && host_is_down(&tx, &notification.host_id)?
+            {
+                return Ok(None);
+            }
             if let Some(reason) = obsolete_reason(&tx, &config, &notification)? {
                 discard(&tx, &notification, reason)?;
+                tx.commit()?;
+                return Ok(None);
+            }
+            if reconcile_held_change(&tx, &notification)? {
                 tx.commit()?;
                 return Ok(None);
             }
@@ -310,19 +447,30 @@ impl Store {
         notification: Notification,
         outcome: DeliveryOutcome,
     ) -> Result<()> {
+        self.finish_notification_at(notification, outcome, Utc::now())
+            .await
+    }
+
+    pub async fn finish_notification_at(
+        &self,
+        notification: Notification,
+        outcome: DeliveryOutcome,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
         self.notification_db(move |db| {
-            let now = Utc::now();
+            let tx = db.transaction()?;
             let (state, diagnostic, delay, undo_attempt) = match outcome {
                 DeliveryOutcome::Delivered => ("delivered", None, 0, false),
                 DeliveryOutcome::Retry(message) => ("retrying", Some(message), (3_i64 << notification.attempts.saturating_sub(1).min(7)).min(300), false),
                 DeliveryOutcome::Failed(message) => ("failed", Some(message), 0, false),
                 DeliveryOutcome::RecheckConfiguration => ("queued", None, 0, true),
             };
-            db.execute(
+            let updated = tx.execute(
                 "UPDATE notification_deliveries AS d SET
                     state = CASE WHEN ?3 IN ('queued', 'retrying') AND EXISTS (
                         SELECT 1 FROM notification_events e JOIN notification_events newer
-                        ON newer.host_id = e.host_id AND newer.service_id = e.service_id AND newer.id > e.id
+                        ON newer.host_id = e.host_id AND newer.service_id = e.service_id
+                           AND newer.reminder_for IS NULL AND newer.id > COALESCE(e.reminder_for, e.id)
                         WHERE e.id = d.event_id
                     ) THEN 'discarded' ELSE ?3 END,
                     diagnostic = ?4, retry_at = ?5, updated_at = ?6, attempts = attempts - ?7
@@ -330,6 +478,21 @@ impl Store {
                 params![notification.event_id, notification.recipient, state, diagnostic,
                     now.timestamp_millis() + delay * 1000, timestamp(now), undo_attempt],
             )?;
+            if updated != 0 && notification.kind != TransitionKind::Recovery
+                && matches!(state, "delivered" | "failed")
+            {
+                tx.execute(
+                    "UPDATE notification_deliveries SET remind_from = ?3 WHERE recipient = ?2
+                     AND event_id = (SELECT COALESCE(reminder_for, id) FROM notification_events WHERE id = ?1)
+                     AND EXISTS (SELECT 1 FROM notification_events e
+                         WHERE e.id = notification_deliveries.event_id AND NOT EXISTS (
+                             SELECT 1 FROM notification_events newer WHERE newer.host_id = e.host_id
+                               AND newer.service_id = e.service_id AND newer.reminder_for IS NULL AND newer.id > e.id
+                         ))",
+                    params![notification.event_id, notification.recipient, now.timestamp_millis()],
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         }).await
     }
@@ -340,6 +503,26 @@ impl Store {
         let cutoff = timestamp(now - super::TRANSITION_RETENTION);
         self.notification_db(move |db| {
             let tx = db.transaction()?;
+            // Keep the first accepted reminder if the lifecycle message failed:
+            // it can be the only evidence that qualifies the recipient for recovery.
+            // Otherwise, old reminders can expire even in an active episode.
+            let old_reminders = {
+                let mut query = tx.prepare(
+                    "SELECT e.id FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
+                     WHERE d.updated_at < ?1 AND e.reminder_for IS NOT NULL
+                       AND (d.state IN ('failed', 'discarded') OR (d.state = 'delivered' AND EXISTS (
+                           SELECT 1 FROM notification_deliveries prior WHERE prior.recipient = d.recipient
+                             AND prior.state = 'delivered' AND (prior.event_id = e.reminder_for
+                               OR prior.event_id IN (SELECT id FROM notification_events
+                                   WHERE reminder_for = e.reminder_for AND id < e.id))
+                       ))) LIMIT 500",
+                )?;
+                query.query_map([&cutoff], |row| row.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for id in old_reminders {
+                tx.execute("DELETE FROM notification_deliveries WHERE event_id = ?1", [id])?;
+                tx.execute("DELETE FROM notification_events WHERE id = ?1", [id])?;
+            }
             let expired = {
                 let mut query = tx.prepare(
                     "SELECT COALESCE(e.episode_id, e.id) FROM notification_events e
@@ -370,22 +553,111 @@ impl Store {
         self.notification_db(|db| {
             let mut statement = db.prepare(
                 "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
-                        e.occurred_at, d.attempts, d.state, d.diagnostic, d.updated_at
+                        e.occurred_at, d.attempts, e.reminder_for IS NOT NULL,
+                        d.state, d.diagnostic, d.updated_at, d.remind_from
                  FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
                  ORDER BY d.updated_at DESC, d.event_id DESC, d.recipient LIMIT 100",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(DeliveryRecord {
                     notification: read_notification(row)?,
-                    state: row.get(8)?,
-                    diagnostic: row.get(9)?,
-                    updated_at: row.get(10)?,
+                    state: row.get(9)?,
+                    diagnostic: row.get(10)?,
+                    updated_at: row.get(11)?,
+                    reminder_from: row
+                        .get::<_, Option<i64>>(12)?
+                        .and_then(DateTime::from_timestamp_millis),
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
         .await
     }
+}
+
+// If the service changed away and back during the outage, the current
+// severity is already known to this recipient. Resume the reminder cadence
+// instead of sending a spurious change; keep distinct changes and recoveries.
+fn reconcile_held_change(tx: &Transaction<'_>, notification: &Notification) -> Result<bool> {
+    if notification.reminder || notification.kind != TransitionKind::SeverityChanged {
+        return Ok(false);
+    }
+    let known = tx.query_row(
+        "SELECT prior.severity, delivered.retry_at
+         FROM notification_events e JOIN notification_deliveries held ON held.event_id = e.id
+         JOIN notification_events prior ON prior.id = e.episode_id OR prior.episode_id = e.episode_id
+         JOIN notification_deliveries delivered ON delivered.event_id = prior.id AND delivered.recipient = held.recipient
+         WHERE e.id = ?1 AND held.recipient = ?2 AND held.held = 1
+           AND delivered.state = 'delivered' AND prior.kind != 'recovery'
+         ORDER BY prior.id DESC LIMIT 1",
+        params![notification.event_id, notification.recipient],
+        |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i64>(1)?)),
+    ).optional()?;
+    let Some((severity, delivered_at)) = known else {
+        return Ok(false);
+    };
+    if severity != status_code(notification.severity) {
+        return Ok(false);
+    }
+    discard(
+        tx,
+        notification,
+        "Current severity already delivered before host suppression",
+    )?;
+    tx.execute(
+        "UPDATE notification_deliveries SET remind_from = ?3 WHERE event_id = ?1 AND recipient = ?2",
+        params![notification.event_id, notification.recipient, delivered_at],
+    )?;
+    Ok(true)
+}
+
+fn queue_due_reminder(
+    tx: &Transaction<'_>,
+    config: &Config,
+    now: DateTime<Utc>,
+    reachability_hosts: &str,
+) -> Result<()> {
+    let due = tx
+        .query_row(
+            "SELECT d.event_id, d.recipient
+         FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
+         WHERE d.remind_from <= ?1 AND (e.service_id = '' OR e.host_id NOT IN (
+             SELECT host_id FROM check_problems WHERE check_kind = 'host'
+               AND service_id = '' AND confirmed_severity = 2
+               AND host_id IN (SELECT value FROM json_each(?2))
+         )) ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
+            params![
+                now.timestamp_millis() - i64::from(config.reminder_interval_seconds) * 1000,
+                reachability_hosts
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((event, recipient)) = due else {
+        return Ok(());
+    };
+    tx.execute(
+        "UPDATE notification_deliveries SET remind_from = NULL WHERE event_id = ?1 AND recipient = ?2",
+        params![event, recipient],
+    )?;
+    let at = timestamp(now);
+    tx.execute(
+        "INSERT INTO notification_events (host_id, service_id, episode_id, kind, severity, occurred_at, reminder_for)
+         SELECT host_id, service_id, COALESCE(episode_id, id), kind, severity, ?2, id
+         FROM notification_events WHERE id = ?1",
+        params![event, at],
+    )?;
+    tx.execute(
+        "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at)
+         VALUES (?1, ?2, 'queued', ?3, ?4)",
+        params![
+            tx.last_insert_rowid(),
+            recipient,
+            at,
+            now.timestamp_millis()
+        ],
+    )?;
+    Ok(())
 }
 
 fn obsolete_reason(
@@ -396,9 +668,11 @@ fn obsolete_reason(
     let Some((episode, current)) = db
         .query_row(
             "SELECT e.episode_id,
-                NOT EXISTS(SELECT 1 FROM notification_events newer WHERE newer.id > e.id
+                NOT EXISTS(SELECT 1 FROM notification_events newer
+                    WHERE newer.reminder_for IS NULL AND newer.id > COALESCE(e.reminder_for, e.id)
                     AND newer.host_id = e.host_id AND newer.service_id = e.service_id)
-                AND EXISTS(SELECT 1 FROM check_problems p WHERE p.check_kind = 'service'
+                AND EXISTS(SELECT 1 FROM check_problems p
+                    WHERE p.check_kind = CASE WHEN e.service_id = '' THEN 'host' ELSE 'service' END
                     AND p.host_id = e.host_id AND p.service_id = e.service_id
                     AND p.confirmed_severity IS NULLIF(e.severity, 0))
          FROM notification_events e WHERE e.id = ?1",
@@ -415,12 +689,19 @@ fn obsolete_reason(
     if !config.hosts.iter().any(|host| {
         host.id == notification.host_id
             && host.recipients.contains(&notification.recipient)
-            && host
-                .services
-                .iter()
-                .any(|service| service.id == notification.service_id)
+            && if notification.service_id.is_empty() {
+                host.reachability.is_some()
+            } else {
+                host.services
+                    .iter()
+                    .any(|service| service.id == notification.service_id)
+            }
     }) {
-        return Ok(Some("Service or recipient no longer configured"));
+        return Ok(Some(if notification.service_id.is_empty() {
+            "Reachability check or recipient no longer configured"
+        } else {
+            "Service or recipient no longer configured"
+        }));
     }
     if notification.kind == TransitionKind::Recovery
         && !has_problem_delivery(db, episode, &notification.recipient, false)?
@@ -456,5 +737,6 @@ fn read_notification(row: &rusqlite::Row<'_>) -> rusqlite::Result<Notification> 
         severity: Status::from_code(Some(row.get(5)?)),
         occurred_at: row.get(6)?,
         attempts: row.get(7)?,
+        reminder: row.get(8)?,
     })
 }

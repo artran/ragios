@@ -1078,6 +1078,7 @@ dependencies = [
  "rusqlite",
  "rustls",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",

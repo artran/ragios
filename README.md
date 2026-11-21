@@ -2,7 +2,7 @@
 
 A Rust monitoring server that runs installed host reachability and service-check
 plugins from YAML, stores their latest results in SQLite, and serves an HTML dashboard with HTMX
-updates. Email is disabled: this version has no email transport.
+updates. Email is disabled by default.
 
 ## Development setup
 
@@ -242,10 +242,13 @@ transition IDs; it does not infer host reachability from service results.
 ## Email notifications
 
 Email is disabled by default. [Configure an authenticated SMTP relay](docs/configuration.md#email-delivery)
-to send email for confirmed service problems, confirmed severity changes, and
-eligible recoveries. Pending problems do not send email. Delivery retries run
-independently of checks and survive restarts in SQLite. Follow **Email delivery**
-from the dashboard to see delivery outcomes and SMTP errors.
+to send email for confirmed host and service problems, confirmed status changes,
+and eligible recoveries. Unresolved problems send reminders every hour by default.
+Confirmed host down holds service notifications, not service checks. When the host
+is no longer confirmed down, Ragios sends only notifications that still apply.
+Retries and reminder timing survive restarts in SQLite. Open **Email delivery**
+on the dashboard to see which hosts are holding service mail, upcoming reminders,
+and delivery outcomes.
 
 ## Access and current scope
 

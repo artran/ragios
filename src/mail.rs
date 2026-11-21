@@ -33,13 +33,20 @@ impl Relay {
             return DeliveryOutcome::Failed("Invalid SMTP recipient address".into());
         };
         let label = notification.label();
+        let check = if notification.service_id.is_empty() {
+            "Check"
+        } else {
+            "Service"
+        };
         let Ok(message) = Message::builder()
             .from(self.from.clone().into())
             .to(recipient.into())
             .subject(format!("Ragios: {label}"))
             .body(format!(
-                "{label}\nHost: {}\nService: {}\nObserved at: {}\n",
-                notification.host_id, notification.service_id, notification.occurred_at
+                "{label}\nHost: {}\n{check}: {}\nObserved at: {}\n",
+                notification.host_id,
+                notification.target_label(),
+                notification.occurred_at
             ))
         else {
             return DeliveryOutcome::Failed("Could not compose notification email".into());
