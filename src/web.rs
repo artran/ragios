@@ -13,7 +13,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use ragios::{
     config::{Check, Config, Host, HostGroup, Probe, Service},
     runner::{CheckResult, Reachability, Status},
-    schedule,
+    schedule::{self, Freshness},
     store::{
         AcknowledgeOutcome, LatestHosts, LatestResults, ProblemEpisode, ProblemState, Store,
         TRANSITION_RETENTION, Transition, TransitionKind,
@@ -431,27 +431,13 @@ impl Snapshot {
         check: &Check,
         state: Option<(&CheckResult, ProblemState)>,
     ) -> Freshness {
-        let Some((result, problem)) = state else {
-            let due = self.scheduler.unchecked_since.get(key);
-            return match due.map(|&since| schedule::eligible_from(check, since)) {
-                Some(due) if schedule::is_overdue(check, due, self.now) => Freshness::Missing(due),
-                Some(due) => Freshness::Current(due),
-                None => Freshness::NotYetChecked,
-            };
-        };
-        // An unreadable or future timestamp cannot establish current monitoring.
-        let retry = self.config.retry_interval_seconds;
-        let Some(due) = result
-            .finished()
-            .and_then(|finished| schedule::due_at(check, retry, finished, problem, self.now))
-        else {
-            return Freshness::Overdue(None);
-        };
-        if schedule::is_overdue(check, due, self.now) {
-            Freshness::Overdue(Some(due))
-        } else {
-            Freshness::Current(due)
-        }
+        schedule::freshness(
+            check,
+            self.config.retry_interval_seconds,
+            state,
+            self.scheduler.unchecked_since.get(key).copied(),
+            self.now,
+        )
     }
 
     fn overdue_count(&self) -> usize {
@@ -483,38 +469,21 @@ fn service_key(host: &Host, service: &Service) -> Key {
     (host.id.clone(), service.id.clone())
 }
 
-/// Whether a latest result still reflects current monitoring. Freshness is
-/// assessed from when the check is due, never from the plugin's status.
-#[derive(Clone, Copy)]
-enum Freshness {
-    NotYetChecked,
-    Current(DateTime<Utc>),
-    Overdue(Option<DateTime<Utc>>),
-    /// Overdue without ever saving a result.
-    Missing(DateTime<Utc>),
-}
-
-impl Freshness {
-    fn is_overdue(self) -> bool {
-        matches!(self, Self::Overdue(_) | Self::Missing(_))
-    }
-
-    fn cell(self) -> String {
-        let time = |due: DateTime<Utc>| due.to_rfc3339_opts(SecondsFormat::Millis, true);
-        match self {
-            Self::NotYetChecked => "<td>Awaiting first check</td>".into(),
-            Self::Current(due) => format!("<td>Due {}</td>", time(due)),
-            Self::Overdue(Some(due)) => format!(
-                "<td class=\"stale\">Overdue since {}; latest result is stale</td>",
-                time(due)
-            ),
-            Self::Missing(due) => format!(
-                "<td class=\"stale\">Overdue since {}; no result yet</td>",
-                time(due)
-            ),
-            Self::Overdue(None) => {
-                "<td class=\"stale\">Overdue; due time unknown, latest result is stale</td>".into()
-            }
+fn freshness_cell(freshness: Freshness) -> String {
+    let time = |due: DateTime<Utc>| due.to_rfc3339_opts(SecondsFormat::Millis, true);
+    match freshness {
+        Freshness::NotYetChecked => "<td>Awaiting first check</td>".into(),
+        Freshness::Current(due) => format!("<td>Due {}</td>", time(due)),
+        Freshness::Overdue(Some(due)) => format!(
+            "<td class=\"stale\">Overdue since {}; latest result is stale</td>",
+            time(due)
+        ),
+        Freshness::Missing(due) => format!(
+            "<td class=\"stale\">Overdue since {}; no result yet</td>",
+            time(due)
+        ),
+        Freshness::Overdue(None) => {
+            "<td class=\"stale\">Overdue; due time unknown, latest result is stale</td>".into()
         }
     }
 }
@@ -791,7 +760,7 @@ fn render_result(
 ) {
     if let Some((result, problem)) = state {
         html.push_str(&latest_cell(result, display, freshness));
-        html.push_str(&freshness.cell());
+        html.push_str(&freshness_cell(freshness));
         html.push_str(&confirmed_cell(problem, display, episode));
         html.push_str(&pending_cell(problem, display, confirmation_attempts));
         let _ = write!(
@@ -804,7 +773,7 @@ fn render_result(
         );
     } else {
         html.push_str("<td>Not yet checked</td>");
-        html.push_str(&freshness.cell());
+        html.push_str(&freshness_cell(freshness));
         html.push_str("<td colspan=\"6\">No result available</td>");
     }
     html.push_str("</tr>\n");
@@ -966,7 +935,7 @@ impl<'a> CheckDetail<'a> {
                     html,
                     "<tr><th>Latest result</th>{}</tr><tr><th>Freshness</th>{}</tr><tr><th>Confirmed problem</th>{}</tr><tr><th>Pending problem / severity change</th>{}</tr><tr><th>Output</th><td><pre>{}</pre></td></tr><tr><th>Started (UTC)</th><td>{}</td></tr><tr><th>Finished (UTC)</th><td>{}</td></tr><tr><th>Duration</th><td>{} ms</td></tr><tr><th>Result age</th><td>{}</td></tr>",
                     latest_cell(result, self.display, self.freshness),
-                    self.freshness.cell(),
+                    freshness_cell(self.freshness),
                     confirmed_cell(problem, self.display, self.episode),
                     pending_cell(problem, self.display, confirmation_attempts),
                     escape(&result.output),
@@ -980,7 +949,7 @@ impl<'a> CheckDetail<'a> {
                 let _ = write!(
                     html,
                     "<tr><th>Latest result</th><td>Not yet checked</td></tr><tr><th>Freshness</th>{}</tr>",
-                    self.freshness.cell()
+                    freshness_cell(self.freshness)
                 );
             }
         }
