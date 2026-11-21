@@ -3,7 +3,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use ragios::{
     config::{Check, Config},
     runner::{self, CheckResult},
-    schedule,
+    schedule::{self, Cadence},
     store::{CheckTarget, ProblemState, Store},
 };
 use std::{
@@ -59,18 +59,16 @@ struct ScheduledCheck {
     generation: u64,
     eligible: Instant,
     finished: Option<Instant>,
-    retry: bool,
+    cadence: Cadence,
 }
 
 impl ScheduledCheck {
     fn deadline(&self, config: &Config) -> Instant {
         self.finished.map_or(self.eligible, |finished| {
             finished
-                + Duration::from_secs(if self.retry {
-                    config.retry_interval_seconds
-                } else {
-                    self.check.interval_seconds
-                })
+                + self
+                    .cadence
+                    .interval(&self.check, config.retry_interval_seconds)
         })
     }
 
@@ -164,7 +162,7 @@ impl Monitor {
                         generation: self.generation,
                         eligible: Instant::now(),
                         finished: None,
-                        retry: false,
+                        cadence: Cadence::Normal,
                     }
                 });
                 scheduled.check = check.clone();
@@ -215,7 +213,7 @@ impl Monitor {
                     schedule::interval_due_at(
                         &scheduled.check,
                         self.config.retry_interval_seconds,
-                        result.finished()?,
+                        result,
                         problem,
                         now,
                     )
@@ -291,7 +289,7 @@ impl Monitor {
             && scheduled.generation == generation
         {
             scheduled.finished = Some(Instant::now());
-            scheduled.retry = true;
+            scheduled.cadence = Cadence::Retry;
             self.unsaved.insert(key);
         }
         self.report_fault(format!("a check execution stopped unexpectedly: {error}"));
@@ -314,7 +312,7 @@ impl Monitor {
             scheduled.finished = Some(Instant::now());
             match saved {
                 Ok(problem) => {
-                    scheduled.retry = problem.needs_retry();
+                    scheduled.cadence = Cadence::from(problem);
                     self.unsaved.remove(&key);
                     let recovered = self.unsaved.is_empty();
                     self.status.send_if_modified(|status| {
@@ -326,7 +324,7 @@ impl Monitor {
                 Err(error) => {
                     // The observation is lost; try again at retry timing
                     // rather than stopping every other check.
-                    scheduled.retry = true;
+                    scheduled.cadence = Cadence::Retry;
                     self.unsaved.insert(key);
                     self.report_fault(format!("cannot record check results: {error:#}"));
                 }

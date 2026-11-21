@@ -1,8 +1,10 @@
 //! When checks fall due and whether their latest results are still current.
-//! Every decision takes an explicit `now`, so callers control time.
+//! Wall-clock decisions take explicit timestamps; cadence can also drive
+//! monotonic timers without a wall clock.
 
 use crate::{
     config::{Check, CheckWindow},
+    runner::CheckResult,
     store::ProblemState,
 };
 use chrono::{
@@ -11,41 +13,94 @@ use chrono::{
 use chrono_tz::Tz;
 use std::time::Duration;
 
-/// Slack beyond a due execution's own timeout before it counts as overdue.
-pub const OVERDUE_GRACE: TimeDelta = TimeDelta::seconds(30);
-
-/// When a check is next due and allowed to run after the result that finished
-/// at `finished`: its interval deadline, deferred while its window is closed.
-pub fn due_at(
-    check: &Check,
-    retry_interval_seconds: u64,
-    finished: DateTime<Utc>,
-    problem: ProblemState,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    interval_due_at(check, retry_interval_seconds, finished, problem, now)
-        .map(|due| eligible_from(check, due))
+/// The repeat cadence, independent of the clock used to measure it.
+#[derive(Clone, Copy)]
+pub enum Cadence {
+    Normal,
+    Retry,
 }
 
-/// When a check is next due after the result that finished at `finished`,
-/// ignoring its window. Pending problems use retry timing. A result that claims
-/// to finish after `now` means the clock moved back, so its due time is unknown.
+impl From<ProblemState> for Cadence {
+    fn from(problem: ProblemState) -> Self {
+        if problem.needs_retry() {
+            Self::Retry
+        } else {
+            Self::Normal
+        }
+    }
+}
+
+impl Cadence {
+    pub fn interval(self, check: &Check, retry_interval_seconds: u64) -> Duration {
+        Duration::from_secs(match self {
+            Self::Normal => check.interval_seconds,
+            Self::Retry => retry_interval_seconds,
+        })
+    }
+}
+
+/// Slack beyond a due execution's own timeout before it counts as overdue.
+const OVERDUE_GRACE: TimeDelta = TimeDelta::seconds(30);
+
+/// Wall-clock freshness, independent of the plugin's reported status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    NotYetChecked,
+    Current(DateTime<Utc>),
+    Overdue(Option<DateTime<Utc>>),
+    /// Overdue without ever saving a result.
+    Missing(DateTime<Utc>),
+}
+
+impl Freshness {
+    pub fn is_overdue(self) -> bool {
+        matches!(self, Self::Overdue(_) | Self::Missing(_))
+    }
+}
+
+/// Assess when a newer result should have been available. Use the first due
+/// time only in the absence of a saved result. Apply the window at the original
+/// due time, not at `now`: a missed deadline survives a later window closure.
+pub fn freshness(
+    check: &Check,
+    retry_interval_seconds: u64,
+    saved: Option<(&CheckResult, ProblemState)>,
+    first_due: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Freshness {
+    let Some((result, problem)) = saved else {
+        return match first_due.map(|since| eligible_from(check, since)) {
+            Some(due) if is_overdue(check, due, now) => Freshness::Missing(due),
+            Some(due) => Freshness::Current(due),
+            None => Freshness::NotYetChecked,
+        };
+    };
+    let Some(due) = interval_due_at(check, retry_interval_seconds, result, problem, now) else {
+        return Freshness::Overdue(None);
+    };
+    let due = eligible_from(check, due);
+    if is_overdue(check, due, now) {
+        Freshness::Overdue(Some(due))
+    } else {
+        Freshness::Current(due)
+    }
+}
+
+/// Restore the saved result's interval deadline, ignoring Check windows.
+/// An unreadable or future finish time leaves the deadline unknown.
 pub fn interval_due_at(
     check: &Check,
     retry_interval_seconds: u64,
-    finished: DateTime<Utc>,
+    result: &CheckResult,
     problem: ProblemState,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    let finished = result.finished()?;
     if finished > now {
         return None;
     }
-    let interval = if problem.needs_retry() {
-        retry_interval_seconds
-    } else {
-        check.interval_seconds
-    };
-    Some(finished + seconds(interval))
+    let interval = Cadence::from(problem).interval(check, retry_interval_seconds);
+    Some(finished + TimeDelta::from_std(interval).expect("bounded check interval"))
 }
 
 /// The earliest instant at or after `at` when `check` may start.
@@ -128,12 +183,13 @@ fn resolve_local(timezone: Tz, local: NaiveDateTime) -> Vec<DateTime<Utc>> {
 }
 
 /// Whether a check due at `due` should have produced a newer result by `now`.
-pub fn is_overdue(check: &Check, due: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+fn is_overdue(check: &Check, due: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now > due + seconds(check.timeout_seconds) + OVERDUE_GRACE
 }
 
 /// How long after `now` each check becomes eligible at startup, given when it
-/// is due, or `None` if it has never run. Never-run checks start now. Checks
+/// is due, or `None` if its deadline is unknown. Unknown deadlines are
+/// eligible immediately. Checks
 /// due before the end of the `spread` period take evenly spaced slots across
 /// it in due order, oldest first, so a restart neither forgets overdue checks
 /// nor launches them all at once; none runs before it is due. Later checks wait
