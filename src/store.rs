@@ -2,7 +2,7 @@ mod notifications;
 mod schema;
 mod silences;
 
-pub use notifications::{DeliveryOutcome, Notification, NotificationPolicy};
+pub use notifications::{DeliveryOutcome, Notification};
 pub use silences::{CreateSilence, Silence, SilenceScope};
 
 use crate::{
@@ -336,23 +336,36 @@ impl Store {
         result: CheckResult,
         confirmation_attempts: u32,
     ) -> Result<ProblemState> {
-        self.save_with_notifications(
-            host_id,
-            target,
-            result,
-            confirmation_attempts,
-            Default::default(),
-        )
-        .await
+        self.save_check_result(host_id, target, result, confirmation_attempts, None)
+            .await
     }
 
+    /// Record using the scheduler's current configuration, after it rejects
+    /// obsolete execution generations. Notification policy stays in its module.
     pub async fn save_with_notifications(
         &self,
         host_id: String,
         target: CheckTarget,
         result: CheckResult,
+        config: Arc<Config>,
+    ) -> Result<ProblemState> {
+        self.save_check_result(
+            host_id,
+            target,
+            result,
+            config.confirmation_attempts,
+            Some(config),
+        )
+        .await
+    }
+
+    async fn save_check_result(
+        &self,
+        host_id: String,
+        target: CheckTarget,
+        result: CheckResult,
         confirmation_attempts: u32,
-        policy: NotificationPolicy,
+        config: Option<Arc<Config>>,
     ) -> Result<ProblemState> {
         ensure!(
             confirmation_attempts > 0,
@@ -444,13 +457,7 @@ impl Store {
                         target.kind().as_str()
                     ],
                 )?;
-                notifications::record(&transaction, (&host_id, service_id), kind, previous.confirmed_severity, assessment, &result.finished_at, &policy)?;
-                if matches!(target, CheckTarget::Host(_))
-                    && previous.confirmed_severity != Some(Status::Critical)
-                    && state.confirmed_severity == Some(Status::Critical)
-                {
-                    notifications::hold_services(&transaction, &host_id)?;
-                }
+                notifications::record(&transaction, (&host_id, &target), kind, previous.confirmed_severity, assessment, &result.finished_at, config.as_deref())?;
             }
             transaction.commit()?;
             Ok(state)

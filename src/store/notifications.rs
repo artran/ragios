@@ -1,6 +1,14 @@
-use super::{Store, TransitionKind, silences, status_code};
+//! Notification eligibility and durable hold reconciliation live here.
+//!
+//! `Eligibility` owns recording, selection, reminder, and dispatch policy; the
+//! phases intentionally observe different facts. `record` and the hold helpers
+//! participate in their callers' SQLite transactions. Store methods own the
+//! selection/dispatch transactions; SMTP runs only after dispatch commits.
+//! See `docs/notification-policy.md` for the phase distinctions and regressions.
+
+use super::{CheckTarget, Store, TransitionKind, status_code};
 use crate::{
-    config::{CheckWindow, Config},
+    config::Config,
     runner::{Reachability, Status},
 };
 use anyhow::{Result, ensure};
@@ -98,7 +106,7 @@ fn host_is_down(db: &Connection, host: &str) -> Result<bool> {
 
 // This marker survives restarts and lets dispatch reconcile against what each
 // recipient actually saw. The host's current confirmed state gates dispatch.
-pub(super) fn hold_services(tx: &Transaction<'_>, host: &str) -> Result<()> {
+fn hold_services(tx: &Transaction<'_>, host: &str) -> Result<()> {
     tx.execute(
         "UPDATE notification_deliveries SET held = 1
          WHERE state IN ('queued', 'retrying', 'sending') AND event_id IN (
@@ -113,24 +121,252 @@ fn timestamp(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-#[derive(Default)]
-pub struct NotificationPolicy {
-    pub recipients: Vec<String>,
-    pub window: Option<CheckWindow>,
-    pub group: Option<String>,
+/// Owns phase-specific eligibility. Recording remembers suppression history;
+/// selection skips temporarily suppressed targets; dispatch revalidates current
+/// facts and reconciles held changes against each recipient's accepted mail.
+struct Eligibility<'a> {
+    config: &'a Config,
+    now: DateTime<Utc>,
+}
+
+// SQL uses these configuration facts as values, never as JSON path syntax.
+struct SelectionFacts {
+    reachability_hosts: String,
+    groups: String,
+    closed_targets: Option<String>,
+}
+
+// Both queued selection and reminder selection skip temporary suppression.
+// Acknowledgement is deliberately absent: it applies only to reminders.
+fn selection_filter() -> String {
+    format!(
+        "(e.service_id = '' OR e.host_id NOT IN (
+        SELECT host_id FROM check_problems WHERE check_kind = 'host'
+          AND service_id = '' AND confirmed_severity = 2
+          AND host_id IN (SELECT value FROM json_each(:reachability))
+    )) AND {NOT_SILENCED} AND (e.host_id, e.service_id) NOT IN (
+        SELECT value ->> 0, value ->> 1 FROM json_each(:closed_targets)
+    )"
+    )
+}
+
+const NOT_SILENCED: &str = "NOT EXISTS (
+    SELECT 1 FROM silences s WHERE s.expires_at > :now AND (
+        (s.host_id = e.host_id AND (s.service_id IS NULL OR s.service_id = e.service_id))
+        OR s.group_id = (SELECT value FROM json_each(:groups) WHERE key = e.host_id)
+    )
+)";
+
+fn host_groups(config: &Config) -> Result<String> {
+    Ok(serde_json::to_string(
+        &config
+            .hosts
+            .iter()
+            .map(|host| (&host.id, &host.group))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )?)
+}
+
+// Called under the caller's lock/transaction, before a Silence or new group
+// membership becomes visible. Include sending rows: SMTP may still be in flight.
+pub(super) fn hold_silenced(db: &Connection, config: &Config, now: DateTime<Utc>) -> Result<()> {
+    let groups = host_groups(config)?;
+    db.execute(
+        &format!(
+            "UPDATE notification_deliveries AS d SET held = 1
+         WHERE state IN ('queued', 'retrying', 'sending') AND held = 0
+           AND EXISTS (SELECT 1 FROM notification_events e WHERE e.id = d.event_id
+             AND e.kind = 'severity_changed' AND NOT {NOT_SILENCED})"
+        ),
+        named_params! {":now": now.timestamp_millis(), ":groups": groups},
+    )?;
+    Ok(())
+}
+
+impl<'a> Eligibility<'a> {
+    fn new(config: &'a Config, now: DateTime<Utc>) -> Self {
+        Self { config, now }
+    }
+
+    fn host(&self, host_id: &str) -> Option<&crate::config::Host> {
+        self.config.hosts.iter().find(|host| host.id == host_id)
+    }
+
+    fn window_closed(&self, host: &str, service: &str, at: DateTime<Utc>) -> bool {
+        self.host(host)
+            .and_then(|host| host.notification_window(service))
+            .is_some_and(|window| !window.is_open(at))
+    }
+
+    fn silenced(&self, db: &Connection, host: &str, service: &str) -> Result<bool> {
+        let groups = self
+            .host(host)
+            .map(|host| {
+                serde_json::to_string(&std::collections::BTreeMap::from([(&host.id, &host.group)]))
+            })
+            .transpose()?;
+        // Use the same scope match as selection/hold reconciliation, with one
+        // target instead of scanning the queue. Missing configuration still
+        // permits a Host or Service Silence, but has no Host group to match.
+        Ok(db.query_row(
+            &format!(
+                "WITH e(host_id, service_id) AS (VALUES (:host, :service))
+                SELECT NOT {NOT_SILENCED} FROM e"
+            ),
+            named_params! {":host": host, ":service": service,
+            ":now": self.now.timestamp_millis(), ":groups": groups},
+            |row| row.get(0),
+        )?)
+    }
+
+    fn select(&self, tx: &Transaction<'_>) -> Result<Option<Notification>> {
+        if self.config.smtp.is_none() {
+            tx.execute(
+                "UPDATE notification_deliveries SET state = 'discarded', updated_at = ?1,
+                   diagnostic = 'Email disabled' WHERE state IN ('queued', 'retrying')",
+                [timestamp(self.now)],
+            )?;
+            tx.execute("UPDATE notification_deliveries SET remind_from = NULL WHERE remind_from IS NOT NULL", [])?;
+            return Ok(None);
+        }
+        let closed_targets = self
+            .config
+            .hosts
+            .iter()
+            .flat_map(|host| {
+                host.notification_windows()
+                    .filter(|(_, window)| !window.is_open(self.now))
+                    .map(|(id, _)| (&host.id, id))
+            })
+            .collect::<Vec<_>>();
+        let facts = SelectionFacts {
+            reachability_hosts: serde_json::to_string(
+                &self
+                    .config
+                    .hosts
+                    .iter()
+                    .filter(|host| host.reachability.is_some())
+                    .map(|host| &host.id)
+                    .collect::<Vec<_>>(),
+            )?,
+            groups: host_groups(self.config)?,
+            closed_targets: if closed_targets.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&closed_targets)?)
+            },
+        };
+        // A retry may have been queued while open. Remember its closed-window
+        // history before selection, even if no message is ready to dispatch.
+        if let Some(closed_targets) = &facts.closed_targets {
+            tx.execute(
+                "UPDATE notification_deliveries AS d SET held = 1
+                 WHERE d.state IN ('queued', 'retrying') AND d.held = 0 AND EXISTS (
+                     SELECT 1 FROM notification_events e WHERE e.id = d.event_id
+                       AND e.kind = 'severity_changed' AND e.reminder_for IS NULL
+                       AND (e.host_id, e.service_id) IN (
+                           SELECT value ->> 0, value ->> 1 FROM json_each(?1)
+                       )
+                 )",
+                [closed_targets],
+            )?;
+        }
+        // At most one reminder per poll; no accumulated suppression backlog.
+        self.queue_due_reminder(tx, &facts)?;
+        // Bound reconciliation so check writes and reload can get the lock.
+        for _ in 0..32 {
+            let candidate = tx.query_row(
+                &format!("SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
+                    e.occurred_at, d.attempts, e.reminder_for IS NOT NULL
+                 FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
+                 WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= :now AND {}
+                 ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1", selection_filter()),
+                named_params! {":now": self.now.timestamp_millis(), ":reachability": facts.reachability_hosts,
+                    ":groups": facts.groups, ":closed_targets": facts.closed_targets},
+                read_notification,
+            ).optional()?;
+            let Some(candidate) = candidate else {
+                return Ok(None);
+            };
+            if let Some(reason) = self.obsolete_reason(tx, &candidate)? {
+                discard(tx, &candidate, reason)?;
+                continue;
+            }
+            return Ok(Some(candidate));
+        }
+        Ok(None)
+    }
+
+    fn prepare_dispatch(
+        &self,
+        tx: &Transaction<'_>,
+        notification: &mut Notification,
+    ) -> Result<bool> {
+        let host = self.host(&notification.host_id);
+        if self.window_closed(&notification.host_id, &notification.service_id, self.now) {
+            tx.execute(
+                "UPDATE notification_deliveries SET held = 1 WHERE event_id = ?1 AND recipient = ?2
+                 AND state IN ('queued', 'retrying') AND held = 0",
+                params![notification.event_id, notification.recipient],
+            )?;
+            return Ok(false);
+        }
+        if !notification.service_id.is_empty()
+            && host.is_some_and(|host| host.reachability.is_some())
+            && host_is_down(tx, &notification.host_id)?
+        {
+            return Ok(false);
+        }
+        if let Some(reason) = self.obsolete_reason(tx, notification)? {
+            discard(tx, notification, reason)?;
+            return Ok(false);
+        }
+        if self.silenced(tx, &notification.host_id, &notification.service_id)? {
+            return Ok(false);
+        }
+        Ok(!reconcile_held_change(tx, notification)?)
+    }
+
+    fn held_at_recording(
+        &self,
+        db: &Connection,
+        (host, service): (&str, &str),
+        kind: TransitionKind,
+        occurred_at: &str,
+    ) -> Result<bool> {
+        let observed_at = DateTime::parse_from_rfc3339(occurred_at)
+            .map(|at| at.with_timezone(&Utc))
+            .unwrap_or(self.now);
+        Ok(self.window_closed(host, service, observed_at)
+            || (!service.is_empty() && host_is_down(db, host)?)
+            || (kind == TransitionKind::SeverityChanged && self.silenced(db, host, service)?))
+    }
 }
 
 /// A confirmed problem begins an episode; subsequent severity changes and its
 /// recovery share that ID. This history is independent of check history pruning.
 pub(super) fn record(
     tx: &Transaction<'_>,
-    check: (&str, &str),
+    check: (&str, &CheckTarget),
     kind: TransitionKind,
     previous_severity: Option<Status>,
     severity: Status,
     occurred_at: &str,
-    policy: &NotificationPolicy,
+    config: Option<&Config>,
 ) -> Result<()> {
+    let (host_id, target) = check;
+    let service_id = target.service_id();
+    // Even result-only writes must preserve host-down suppression history.
+    if matches!(target, CheckTarget::Host(_))
+        && severity == Status::Critical
+        && previous_severity != Some(Status::Critical)
+        && matches!(
+            kind,
+            TransitionKind::Confirmed | TransitionKind::SeverityChanged
+        )
+    {
+        hold_services(tx, host_id)?;
+    }
     if !matches!(
         kind,
         TransitionKind::Confirmed | TransitionKind::SeverityChanged | TransitionKind::Recovery
@@ -138,7 +374,14 @@ pub(super) fn record(
     {
         return Ok(());
     }
-    let (host_id, service_id) = check;
+    let now = Utc::now();
+    let eligibility = config.map(|config| Eligibility::new(config, now));
+    let recipients = eligibility
+        .as_ref()
+        .filter(|policy| policy.config.smtp.is_some())
+        .and_then(|policy| policy.host(host_id))
+        .map(|host| host.recipients.as_slice())
+        .unwrap_or_default();
     let previous = tx
         .query_row(
             "SELECT id, COALESCE(episode_id, id), kind FROM notification_events
@@ -158,7 +401,7 @@ pub(super) fn record(
             kind != TransitionKind::Confirmed && *previous_kind != TransitionKind::Recovery
         })
         .map(|(_, episode, _)| episode);
-    if policy.recipients.is_empty() {
+    if recipients.is_empty() {
         match (kind, episode, previous) {
             // Keep one recovery marker to close an existing episode.
             (TransitionKind::Recovery, Some(_), _) => {}
@@ -173,7 +416,6 @@ pub(super) fn record(
             _ => return Ok(()),
         }
     }
-    let now = Utc::now();
     let updated_at = timestamp(now);
     if let Some((id, _, _)) = previous {
         tx.execute(
@@ -192,15 +434,11 @@ pub(super) fn record(
     )?;
     let event = tx.last_insert_rowid();
     let ready_at = now.timestamp_millis();
-    let held = policy.window.as_ref().is_some_and(|window| {
-        let observed_at = DateTime::parse_from_rfc3339(occurred_at)
-            .map(|at| at.with_timezone(&Utc))
-            .unwrap_or(now);
-        !window.is_open(observed_at)
-    }) || (!service_id.is_empty() && host_is_down(tx, host_id)?)
-        || (kind == TransitionKind::SeverityChanged
-            && silences::is_silenced(tx, (host_id, service_id, policy.group.as_deref()), now)?);
-    for recipient in &policy.recipients {
+    let held = match &eligibility {
+        Some(policy) => policy.held_at_recording(tx, (host_id, service_id), kind, occurred_at)?,
+        None => !service_id.is_empty() && host_is_down(tx, host_id)?,
+    };
+    for recipient in recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
         if kind == TransitionKind::Recovery && !has_problem_delivery(tx, episode, recipient, true)?
@@ -309,9 +547,8 @@ impl Store {
         config: Arc<Config>,
         published: watch::Sender<Arc<Config>>,
     ) -> Result<()> {
-        let groups = silences::host_groups(&config)?;
         self.with_connection(move |db| {
-            silences::hold_pending(db, &groups, Utc::now())?;
+            hold_silenced(db, &config, Utc::now())?;
             published.send_replace(config);
             Ok(())
         })
@@ -320,8 +557,7 @@ impl Store {
 
     // The worker also marks holds when it starts, including after a restart.
     pub async fn hold_silenced_deliveries(&self, config: Arc<Config>) -> Result<()> {
-        let groups = silences::host_groups(&config)?;
-        self.with_connection(move |db| silences::hold_pending(db, &groups, Utc::now()))
+        self.with_connection(move |db| hold_silenced(db, &config, Utc::now()))
             .await
     }
 
@@ -364,86 +600,9 @@ impl Store {
             let tx = db.transaction()?;
             // Keep the configuration stable until reconciliation commits.
             let config = active.borrow();
-            if config.smtp.is_none() {
-                tx.execute(
-                    "UPDATE notification_deliveries SET state = 'discarded', updated_at = ?1,
-                       diagnostic = 'Email disabled' WHERE state IN ('queued', 'retrying')",
-                    [timestamp(now)],
-                )?;
-                tx.execute("UPDATE notification_deliveries SET remind_from = NULL WHERE remind_from IS NOT NULL", [])?;
-                tx.commit()?;
-                return Ok(None);
-            }
-            let reachability_hosts = serde_json::to_string(
-                &config
-                    .hosts
-                    .iter()
-                    .filter(|host| host.reachability.is_some())
-                    .map(|host| &host.id)
-                    .collect::<Vec<_>>(),
-            )?;
-            let groups = silences::host_groups(&config)?;
-            let closed_targets = config.hosts.iter().flat_map(|host| {
-                host.notification_windows()
-                    .filter(|(_, window)| !window.is_open(now))
-                    .map(|(id, _)| (&host.id, id))
-            }).collect::<Vec<_>>();
-            let closed_targets = if closed_targets.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&closed_targets)?)
-            };
-            // Remember changes that were queued before the window closed (e.g.
-            // an SMTP retry). Recording transitions also marks those made while closed.
-            if let Some(closed_targets) = &closed_targets {
-                tx.execute(
-                    "UPDATE notification_deliveries AS d SET held = 1
-                     WHERE d.state IN ('queued', 'retrying') AND d.held = 0 AND EXISTS (
-                         SELECT 1 FROM notification_events e WHERE e.id = d.event_id
-                           AND e.kind = 'severity_changed' AND e.reminder_for IS NULL
-                           AND (e.host_id, e.service_id) IN (
-                               SELECT value ->> 0, value ->> 1 FROM json_each(?1)
-                           )
-                     )",
-                    [closed_targets],
-                )?;
-            }
-            // Materialize at most one reminder per poll; no backlog accumulates
-            // during restarts, suppression, or an unfinished SMTP attempt.
-            queue_due_reminder(&tx, &config, now, &reachability_hosts, &groups, closed_targets.as_deref())?;
-            // Bound how much reconciliation can delay check writes or reload.
-            for _ in 0..32 {
-                let candidate = tx
-                    .query_row(
-                        &format!("SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
-                            e.occurred_at, d.attempts, e.reminder_for IS NOT NULL
-                     FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
-                     WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= :now
-                       AND (e.service_id = '' OR e.host_id NOT IN (
-                           SELECT host_id FROM check_problems WHERE check_kind = 'host'
-                             AND service_id = '' AND confirmed_severity = 2
-                             AND host_id IN (SELECT value FROM json_each(:reachability))
-                       )) AND {} AND (e.host_id, e.service_id) NOT IN (
-                           SELECT value ->> 0, value ->> 1 FROM json_each(:closed_targets)
-                       )
-                     ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1", silences::ACTIVE_FILTER),
-                        named_params!{":now": now.timestamp_millis(), ":reachability": reachability_hosts, ":groups": groups, ":closed_targets": closed_targets},
-                        read_notification,
-                    )
-                    .optional()?;
-                let Some(candidate) = candidate else {
-                    tx.commit()?;
-                    return Ok(None);
-                };
-                if let Some(reason) = obsolete_reason(&tx, &config, &candidate)? {
-                    discard(&tx, &candidate, reason)?;
-                    continue;
-                }
-                tx.commit()?;
-                return Ok(Some(candidate));
-            }
+            let candidate = Eligibility::new(&config, now).select(&tx)?;
             tx.commit()?;
-            Ok(None)
+            Ok(candidate)
         })
         .await
     }
@@ -488,35 +647,8 @@ impl Store {
             if !Arc::ptr_eq(&config, &relay_config) || config.smtp.is_none() {
                 return Ok(None);
             }
-            let host = config.hosts.iter().find(|host| host.id == notification.host_id);
             let now = clock();
-            if host.and_then(|host| host.notification_window(&notification.service_id))
-                .is_some_and(|window| !window.is_open(now))
-            {
-                tx.execute(
-                    "UPDATE notification_deliveries SET held = 1 WHERE event_id = ?1 AND recipient = ?2
-                     AND state IN ('queued', 'retrying') AND held = 0",
-                    params![notification.event_id, notification.recipient],
-                )?;
-                tx.commit()?;
-                return Ok(None);
-            }
-            if !notification.service_id.is_empty()
-                && host.is_some_and(|host| host.reachability.is_some())
-                && host_is_down(&tx, &notification.host_id)?
-            {
-                return Ok(None);
-            }
-            if let Some(reason) = obsolete_reason(&tx, &config, &notification)? {
-                discard(&tx, &notification, reason)?;
-                tx.commit()?;
-                return Ok(None);
-            }
-            let group = host.map(|host| host.group.as_str());
-            if silences::is_silenced(&tx, (&notification.host_id, &notification.service_id, group), now)? {
-                return Ok(None);
-            }
-            if reconcile_held_change(&tx, &mut notification)? {
+            if !Eligibility::new(&config, now).prepare_dispatch(&tx, &mut notification)? {
                 tx.commit()?;
                 return Ok(None);
             }
@@ -710,74 +842,62 @@ fn reconcile_held_change(tx: &Transaction<'_>, notification: &mut Notification) 
     Ok(true)
 }
 
-fn queue_due_reminder(
-    tx: &Transaction<'_>,
-    config: &Config,
-    now: DateTime<Utc>,
-    reachability_hosts: &str,
-    groups: &str,
-    closed_targets: Option<&str>,
-) -> Result<()> {
-    let due = tx
+impl Eligibility<'_> {
+    fn queue_due_reminder(&self, tx: &Transaction<'_>, facts: &SelectionFacts) -> Result<()> {
+        let now = self.now;
+        let due = tx
         .query_row(
             &format!(
                 "SELECT d.event_id, d.recipient
          FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
-         WHERE d.remind_from <= :due AND (e.service_id = '' OR e.host_id NOT IN (
-             SELECT host_id FROM check_problems WHERE check_kind = 'host'
-               AND service_id = '' AND confirmed_severity = 2
-               AND host_id IN (SELECT value FROM json_each(:reachability))
-         )) AND {} AND (e.host_id, e.service_id) NOT IN (
-             SELECT value ->> 0, value ->> 1 FROM json_each(:closed_targets)
-         ) AND NOT EXISTS (
+         WHERE d.remind_from <= :due AND {} AND NOT EXISTS (
              SELECT 1 FROM check_problem_episodes p
              WHERE p.host_id = e.host_id AND p.service_id = e.service_id AND p.acknowledged = 1
-         ) ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
-                silences::ACTIVE_FILTER
+         ) ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1", selection_filter()
             ),
             named_params! {
-                ":due": now.timestamp_millis() - i64::from(config.reminder_interval_seconds) * 1000,
+                ":due": now.timestamp_millis() - i64::from(self.config.reminder_interval_seconds) * 1000,
                 ":now": now.timestamp_millis(),
-                ":reachability": reachability_hosts,
-                ":groups": groups,
-                ":closed_targets": closed_targets,
+                ":reachability": facts.reachability_hosts,
+                ":groups": facts.groups,
+                ":closed_targets": facts.closed_targets,
             },
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    let Some((event, recipient)) = due else {
-        return Ok(());
-    };
-    tx.execute(
+        let Some((event, recipient)) = due else {
+            return Ok(());
+        };
+        tx.execute(
         "UPDATE notification_deliveries SET remind_from = NULL WHERE event_id = ?1 AND recipient = ?2",
         params![event, recipient],
     )?;
-    let at = timestamp(now);
-    tx.execute(
+        let at = timestamp(now);
+        tx.execute(
         "INSERT INTO notification_events (host_id, service_id, episode_id, kind, severity, occurred_at, reminder_for)
          SELECT host_id, service_id, COALESCE(episode_id, id), kind, severity, ?2, id
          FROM notification_events WHERE id = ?1",
         params![event, at],
     )?;
-    tx.execute(
-        "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at)
+        tx.execute(
+            "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at)
          VALUES (?1, ?2, 'queued', ?3, ?4)",
-        params![
-            tx.last_insert_rowid(),
-            recipient,
-            at,
-            now.timestamp_millis()
-        ],
-    )?;
-    Ok(())
-}
+            params![
+                tx.last_insert_rowid(),
+                recipient,
+                at,
+                now.timestamp_millis()
+            ],
+        )?;
+        Ok(())
+    }
 
-fn obsolete_reason(
-    db: &Connection,
-    config: &Config,
-    notification: &Notification,
-) -> Result<Option<&'static str>> {
-    let Some((episode, current, acknowledged)) = db
+    fn obsolete_reason(
+        &self,
+        db: &Connection,
+        notification: &Notification,
+    ) -> Result<Option<&'static str>> {
+        let Some((episode, current, acknowledged)) = db
         .query_row(
             "SELECT e.episode_id,
                 NOT EXISTS(SELECT 1 FROM notification_events newer
@@ -797,37 +917,38 @@ fn obsolete_reason(
     else {
         return Ok(Some("Notification history expired"));
     };
-    if !current {
-        return Ok(Some("Superseded by a newer confirmed state"));
-    }
-    if notification.reminder && acknowledged {
-        return Ok(Some("Problem acknowledged"));
-    }
-    if !config.hosts.iter().any(|host| {
-        host.id == notification.host_id
-            && host.recipients.contains(&notification.recipient)
-            && if notification.service_id.is_empty() {
-                host.reachability.is_some()
+        if !current {
+            return Ok(Some("Superseded by a newer confirmed state"));
+        }
+        if notification.reminder && acknowledged {
+            return Ok(Some("Problem acknowledged"));
+        }
+        if !self.config.hosts.iter().any(|host| {
+            host.id == notification.host_id
+                && host.recipients.contains(&notification.recipient)
+                && if notification.service_id.is_empty() {
+                    host.reachability.is_some()
+                } else {
+                    host.services
+                        .iter()
+                        .any(|service| service.id == notification.service_id)
+                }
+        }) {
+            return Ok(Some(if notification.service_id.is_empty() {
+                "Reachability check or recipient no longer configured"
             } else {
-                host.services
-                    .iter()
-                    .any(|service| service.id == notification.service_id)
-            }
-    }) {
-        return Ok(Some(if notification.service_id.is_empty() {
-            "Reachability check or recipient no longer configured"
-        } else {
-            "Service or recipient no longer configured"
-        }));
+                "Service or recipient no longer configured"
+            }));
+        }
+        if notification.kind == TransitionKind::Recovery
+            && !has_problem_delivery(db, episode, &notification.recipient, false)?
+        {
+            return Ok(Some(
+                "No problem notification was delivered to this recipient",
+            ));
+        }
+        Ok(None)
     }
-    if notification.kind == TransitionKind::Recovery
-        && !has_problem_delivery(db, episode, &notification.recipient, false)?
-    {
-        return Ok(Some(
-            "No problem notification was delivered to this recipient",
-        ));
-    }
-    Ok(None)
 }
 
 fn discard(db: &Connection, notification: &Notification, reason: &str) -> Result<()> {

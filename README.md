@@ -265,6 +265,9 @@ expires. Ragios considers the current confirmed state rather than replaying
 intermediate changes. Recovery mail still requires a delivered problem notification.
 An SMTP attempt already in flight may finish after a silence is created.
 
+For maintainers, [Notification policy ownership](docs/notification-policy.md)
+describes recording, selection, dispatch, and durable hold reconciliation.
+
 ## Access and current scope
 
 Use **Check now** on a reachability or service detail page to run that
