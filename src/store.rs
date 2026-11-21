@@ -1,7 +1,9 @@
 mod notifications;
 mod schema;
+mod silences;
 
 pub use notifications::{DeliveryOutcome, Notification, NotificationPolicy};
+pub use silences::{CreateSilence, Silence, SilenceScope};
 
 use crate::{
     config::Probe,
@@ -227,6 +229,21 @@ struct StoredCheck {
 }
 
 impl Store {
+    async fn with_connection<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut connection = store
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
+            operation(&mut connection)
+        })
+        .await?
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let mut connection = Connection::open(path)
             .with_context(|| format!("open SQLite database {}", path.display()))?;
