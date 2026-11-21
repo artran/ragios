@@ -19,6 +19,60 @@ const SERVICE: &str = "/hosts/local/services/application";
 const DELIVERY: &str = "/notifications/status";
 
 #[test]
+fn confirmed_host_down_holds_service_email_until_reachability_returns() {
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
+    fs::copy(dir.path().join("check"), dir.path().join("probe")).unwrap();
+    let probe = dir.path().join("probe");
+    let script = fs::read_to_string(&probe).unwrap();
+    fs::write(&probe, script.replace("< observation", "< reachability")).unwrap();
+    with_reachability(&path, "ping", "probe", &[]);
+    let reachability = "/hosts/local/reachability";
+    let host_result = |status, text| {
+        fs::write(
+            dir.path().join("reachability"),
+            format!("{status} {text}\n"),
+        )
+        .unwrap();
+    };
+    host_result(0, "initially reachable");
+    observation(&dir, 0, "initially healthy");
+    let mut app = Application::start(&path);
+    app.page(reachability, "initially reachable");
+    app.page(SERVICE, "initially healthy");
+
+    host_result(2, "confirmed down sample");
+    request_check(&mut app, reachability, "confirmed down sample");
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: Down")
+        .respond(250);
+    check(&mut app, &dir, 2, "hidden service failure");
+    check(&mut app, &dir, 0, "hidden service recovery");
+    check(&mut app, &dir, 1, "still broken while down");
+    app.page(DELIVERY, "Held: host confirmed down");
+    relay.expect_quiet(Duration::from_millis(400));
+
+    host_result(3, "undetermined sample");
+    request_check(&mut app, reachability, "undetermined sample");
+    relay
+        .receive(
+            "observer@example.invalid",
+            "Confirmed reachability change: Undetermined",
+        )
+        .respond(250);
+    relay
+        .receive("observer@example.invalid", "Confirmed problem: WARNING")
+        .respond(250);
+    host_result(1, "degraded but reachable sample");
+    request_check(&mut app, reachability, "degraded but reachable sample");
+    relay
+        .receive("observer@example.invalid", "Recovery: Reachable")
+        .respond(250);
+    relay.expect_quiet(Duration::from_millis(400));
+}
+
+#[test]
 fn smtp_credentials_must_be_in_protected_files() {
     let dir = tempfile::tempdir().unwrap();
     let credentials = dir.path().join("password");

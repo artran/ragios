@@ -287,7 +287,8 @@ async fn notifications_status(State(dashboard): State<Dashboard>) -> WebResult {
 }
 
 async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebError> {
-    let mode = if dashboard.config.borrow().smtp.is_some() {
+    let config = dashboard.config.borrow().clone();
+    let mode = if config.smtp.is_some() {
         "enabled"
     } else {
         "disabled"
@@ -298,6 +299,22 @@ async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebErr
         .await
         .map_err(load_error)?;
     let mut html = format!("<p>SMTP email {mode}.</p>");
+    if config.smtp.is_some() {
+        let hosts = dashboard.store.latest_hosts().await.map_err(load_error)?;
+        for host in &config.hosts {
+            if host.reachability.is_some()
+                && hosts
+                    .get(&host.id)
+                    .is_some_and(|state| state.is_confirmed_down())
+            {
+                let _ = write!(
+                    html,
+                    "<p>{}: Held: host confirmed down. Service checks continue.</p>",
+                    escape(&host.id)
+                );
+            }
+        }
+    }
     if records.is_empty() {
         html.push_str("<p>No notification deliveries recorded.</p>");
         return Ok(html);
@@ -309,7 +326,7 @@ async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebErr
             html,
             "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             escape(&notification.host_id),
-            escape(&notification.service_id),
+            escape(notification.target_label()),
             escape(&notification.label()),
             escape(&notification.recipient),
             escape(&record.state),

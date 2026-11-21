@@ -1,7 +1,7 @@
 use super::{Store, TransitionKind, status_code};
 use crate::{
     config::Config,
-    runner::{CheckResult, Status},
+    runner::{Reachability, Status},
 };
 use anyhow::{Result, anyhow, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -32,12 +32,52 @@ pub(super) const SCHEMA: &str = "
         retry_at INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL,
         diagnostic TEXT,
+        held INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (event_id, recipient)
     );
     CREATE INDEX IF NOT EXISTS notification_deliveries_due
         ON notification_deliveries(retry_at, event_id, recipient) WHERE state IN ('queued', 'retrying');
     CREATE INDEX IF NOT EXISTS notification_deliveries_recent
         ON notification_deliveries(updated_at DESC, event_id DESC, recipient);";
+
+pub(super) fn migrate(tx: &Transaction<'_>) -> Result<()> {
+    if !has_delivery_column(tx, "held")? {
+        tx.execute_batch(
+            "ALTER TABLE notification_deliveries ADD COLUMN held INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+fn has_delivery_column(db: &Connection, name: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('notification_deliveries') WHERE name = ?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
+fn host_is_down(db: &Connection, host: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM check_problems WHERE check_kind = 'host'
+            AND host_id = ?1 AND service_id = '' AND confirmed_severity = 2)",
+        [host],
+        |row| row.get(0),
+    )?)
+}
+
+// This marker survives restarts and lets dispatch reconcile against what each
+// recipient actually saw. The host's current confirmed state gates dispatch.
+pub(super) fn hold_services(tx: &Transaction<'_>, host: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE notification_deliveries SET held = 1
+         WHERE state IN ('queued', 'retrying', 'sending') AND event_id IN (
+            SELECT id FROM notification_events WHERE host_id = ?1 AND service_id != ''
+         )",
+        [host],
+    )?;
+    Ok(())
+}
 
 fn timestamp(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -50,7 +90,8 @@ pub(super) fn record(
     check: (&str, &str),
     kind: TransitionKind,
     previous_severity: Option<Status>,
-    result: &CheckResult,
+    severity: Status,
+    occurred_at: &str,
     recipients: &[String],
 ) -> Result<()> {
     if !matches!(
@@ -108,10 +149,11 @@ pub(super) fn record(
     tx.execute(
         "INSERT INTO notification_events (host_id, service_id, episode_id, kind, severity, occurred_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![host_id, service_id, episode, kind.as_str(), status_code(result.status), result.finished_at],
+        params![host_id, service_id, episode, kind.as_str(), status_code(severity), occurred_at],
     )?;
     let event = tx.last_insert_rowid();
     let ready_at = now.timestamp_millis();
+    let held = !service_id.is_empty() && host_is_down(tx, host_id)?;
     for recipient in recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
@@ -120,9 +162,9 @@ pub(super) fn record(
             continue;
         }
         tx.execute(
-            "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at)
-             VALUES (?1, ?2, 'queued', ?3, ?4) ON CONFLICT DO NOTHING",
-            params![event, recipient, updated_at, ready_at],
+            "INSERT INTO notification_deliveries (event_id, recipient, state, updated_at, retry_at, held)
+             VALUES (?1, ?2, 'queued', ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+            params![event, recipient, updated_at, ready_at, held],
         )?;
     }
     Ok(())
@@ -157,7 +199,26 @@ pub struct Notification {
 }
 
 impl Notification {
+    pub fn target_label(&self) -> &str {
+        if self.service_id.is_empty() {
+            "Host reachability"
+        } else {
+            &self.service_id
+        }
+    }
+
     pub fn label(&self) -> String {
+        if self.service_id.is_empty() {
+            let state = Reachability::from_status(self.severity).label();
+            return match self.kind {
+                TransitionKind::Recovery => format!("Recovery: {state}"),
+                TransitionKind::Confirmed => format!("Confirmed problem: {state}"),
+                TransitionKind::SeverityChanged => {
+                    format!("Confirmed reachability change: {state}")
+                }
+                _ => unreachable!("pending transitions do not create notifications"),
+            };
+        }
         match self.kind {
             TransitionKind::Recovery => "Recovery: OK".into(),
             TransitionKind::Confirmed => format!("Confirmed problem: {}", self.severity.label()),
@@ -241,6 +302,14 @@ impl Store {
                 return Ok(None);
             }
             let now = Utc::now();
+            let reachability_hosts = serde_json::to_string(
+                &config
+                    .hosts
+                    .iter()
+                    .filter(|host| host.reachability.is_some())
+                    .map(|host| &host.id)
+                    .collect::<Vec<_>>(),
+            )?;
             // Bound how much reconciliation can delay check writes or reload.
             for _ in 0..32 {
                 let candidate = tx
@@ -249,8 +318,13 @@ impl Store {
                             e.occurred_at, d.attempts
                      FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
                      WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= ?1
-                     ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1",
-                        [now.timestamp_millis()],
+                       AND (e.service_id = '' OR e.host_id NOT IN (
+                           SELECT host_id FROM check_problems WHERE check_kind = 'host'
+                             AND service_id = '' AND confirmed_severity = 2
+                             AND host_id IN (SELECT value FROM json_each(?2))
+                       ))
+                     ORDER BY d.held, d.retry_at, d.event_id, d.recipient LIMIT 1",
+                        params![now.timestamp_millis(), reachability_hosts],
                         read_notification,
                     )
                     .optional()?;
@@ -287,6 +361,12 @@ impl Store {
             let tx = db.transaction()?;
             let config = active.borrow();
             if !Arc::ptr_eq(&config, &relay_config) || config.smtp.is_none() {
+                return Ok(None);
+            }
+            if !notification.service_id.is_empty()
+                && config.hosts.iter().any(|host| host.id == notification.host_id && host.reachability.is_some())
+                && host_is_down(&tx, &notification.host_id)?
+            {
                 return Ok(None);
             }
             if let Some(reason) = obsolete_reason(&tx, &config, &notification)? {
@@ -398,7 +478,8 @@ fn obsolete_reason(
             "SELECT e.episode_id,
                 NOT EXISTS(SELECT 1 FROM notification_events newer WHERE newer.id > e.id
                     AND newer.host_id = e.host_id AND newer.service_id = e.service_id)
-                AND EXISTS(SELECT 1 FROM check_problems p WHERE p.check_kind = 'service'
+                AND EXISTS(SELECT 1 FROM check_problems p
+                    WHERE p.check_kind = CASE WHEN e.service_id = '' THEN 'host' ELSE 'service' END
                     AND p.host_id = e.host_id AND p.service_id = e.service_id
                     AND p.confirmed_severity IS NULLIF(e.severity, 0))
          FROM notification_events e WHERE e.id = ?1",
@@ -415,12 +496,19 @@ fn obsolete_reason(
     if !config.hosts.iter().any(|host| {
         host.id == notification.host_id
             && host.recipients.contains(&notification.recipient)
-            && host
-                .services
-                .iter()
-                .any(|service| service.id == notification.service_id)
+            && if notification.service_id.is_empty() {
+                host.reachability.is_some()
+            } else {
+                host.services
+                    .iter()
+                    .any(|service| service.id == notification.service_id)
+            }
     }) {
-        return Ok(Some("Service or recipient no longer configured"));
+        return Ok(Some(if notification.service_id.is_empty() {
+            "Reachability check or recipient no longer configured"
+        } else {
+            "Service or recipient no longer configured"
+        }));
     }
     if notification.kind == TransitionKind::Recovery
         && !has_problem_delivery(db, episode, &notification.recipient, false)?

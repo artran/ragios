@@ -38,8 +38,10 @@ impl Relay {
             .to(recipient.into())
             .subject(format!("Ragios: {label}"))
             .body(format!(
-                "{label}\nHost: {}\nService: {}\nObserved at: {}\n",
-                notification.host_id, notification.service_id, notification.occurred_at
+                "{label}\nHost: {}\nCheck: {}\nObserved at: {}\n",
+                notification.host_id,
+                notification.target_label(),
+                notification.occurred_at
             ))
         else {
             return DeliveryOutcome::Failed("Could not compose notification email".into());

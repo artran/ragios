@@ -302,9 +302,7 @@ impl Monitor {
         if let Some(scheduled) = self.checks.get_mut(&key)
             && scheduled.generation == generation
         {
-            let recipients = if self.config.smtp.is_some()
-                && matches!(scheduled.target, CheckTarget::Service(_))
-            {
+            let recipients = if self.config.smtp.is_some() {
                 self.config
                     .hosts
                     .iter()
