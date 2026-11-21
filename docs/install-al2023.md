@@ -120,10 +120,16 @@ and the unchanged script path as the first argument. Add the check to the
 installed service's YAML and inspect its dashboard result to verify imports,
 file access, and exit status under systemd rather than in your login shell.
 
-Prefer file-based credentials: install them under `/etc/ragios/credentials`
-with owner `root:ragios` and mode `0640`. Pass the **path**, not the secret,
-to a check that accepts it. For SMTP, use the YAML `username_file` and
-`password_file` keys ([configuration reference](configuration.md#email-delivery)).
+Prefer file-based credentials. For custom checks that accept credential files,
+install them under `/etc/ragios/credentials` with owner `root:ragios` and mode
+`0640`. Pass the **path**, not the secret, to the check.
+
+SMTP credentials have stricter permissions. Set the YAML `username_file` and
+`password_file` keys to regular files owned by `ragios:ragios` with mode `0400`
+or `0600`. Keep the parent directory owned by `root:ragios` with mode `0750`.
+Ragios rejects SMTP files with any group or other permissions, including `0640`.
+See the [email configuration reference](configuration.md#email-delivery).
+
 For a legacy script that only accepts environment variables, make
 `/etc/ragios/plugin.env` root-owned and mode `0600`. Systemd reads it before
 starting the unprivileged process. Ragios and all its plugins inherit the
