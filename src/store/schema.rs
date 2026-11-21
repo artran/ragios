@@ -50,6 +50,7 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
          );",
     )?;
     transaction.execute_batch(super::notifications::SCHEMA)?;
+    transaction.execute_batch(super::silences::SCHEMA)?;
     super::notifications::migrate(&transaction)?;
     let legacy: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'latest_results')",

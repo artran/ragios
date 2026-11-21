@@ -1,11 +1,11 @@
-use super::{Store, TransitionKind, status_code};
+use super::{Store, TransitionKind, silences, status_code};
 use crate::{
     config::{CheckWindow, Config},
     runner::{Reachability, Status},
 };
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, ensure};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, named_params, params};
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -117,6 +117,7 @@ fn timestamp(now: DateTime<Utc>) -> String {
 pub struct NotificationPolicy {
     pub recipients: Vec<String>,
     pub window: Option<CheckWindow>,
+    pub group: Option<String>,
 }
 
 /// A confirmed problem begins an episode; subsequent severity changes and its
@@ -196,7 +197,9 @@ pub(super) fn record(
             .map(|at| at.with_timezone(&Utc))
             .unwrap_or(now);
         !window.is_open(observed_at)
-    }) || (!service_id.is_empty() && host_is_down(tx, host_id)?);
+    }) || (!service_id.is_empty() && host_is_down(tx, host_id)?)
+        || (kind == TransitionKind::SeverityChanged
+            && silences::is_silenced(tx, (host_id, service_id, policy.group.as_deref()), now)?);
     for recipient in &policy.recipients {
         // If SMTP is still in flight, record recovery intent conditionally. The
         // worker will require an actual acceptance before sending this recovery.
@@ -299,19 +302,27 @@ pub enum DeliveryOutcome {
 }
 
 impl Store {
-    async fn notification_db<T: Send + 'static>(
+    /// Mark holds before exposing new group membership. Serialize with silence
+    /// creation so neither operation can miss the other's configuration.
+    pub async fn publish_notification_config(
         &self,
-        operation: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut connection = store
-                .0
-                .lock()
-                .map_err(|_| anyhow!("database lock poisoned"))?;
-            operation(&mut connection)
+        config: Arc<Config>,
+        published: watch::Sender<Arc<Config>>,
+    ) -> Result<()> {
+        let groups = silences::host_groups(&config)?;
+        self.with_connection(move |db| {
+            silences::hold_pending(db, &groups, Utc::now())?;
+            published.send_replace(config);
+            Ok(())
         })
-        .await?
+        .await
+    }
+
+    // The worker also marks holds when it starts, including after a restart.
+    pub async fn hold_silenced_deliveries(&self, config: Arc<Config>) -> Result<()> {
+        let groups = silences::host_groups(&config)?;
+        self.with_connection(move |db| silences::hold_pending(db, &groups, Utc::now()))
+            .await
     }
 
     /// Only the single delivery worker calls this at startup. An interrupted
@@ -321,7 +332,7 @@ impl Store {
             self.1.is_some(),
             "email delivery requires the exclusive server database lock"
         );
-        self.notification_db(|db| {
+        self.with_connection(|db| {
             db.execute(
                 "UPDATE notification_deliveries SET state = 'retrying', retry_at = 0,
                    updated_at = ?1, diagnostic = 'Interrupted SMTP attempt; outcome unknown'
@@ -349,7 +360,7 @@ impl Store {
             self.1.is_some(),
             "email delivery requires the exclusive server database lock"
         );
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             // Keep the configuration stable until reconciliation commits.
             let config = active.borrow();
@@ -371,6 +382,7 @@ impl Store {
                     .map(|host| &host.id)
                     .collect::<Vec<_>>(),
             )?;
+            let groups = silences::host_groups(&config)?;
             let closed_targets = config.hosts.iter().flat_map(|host| {
                 host.notification_windows()
                     .filter(|(_, window)| !window.is_open(now))
@@ -398,25 +410,24 @@ impl Store {
             }
             // Materialize at most one reminder per poll; no backlog accumulates
             // during restarts, suppression, or an unfinished SMTP attempt.
-            queue_due_reminder(&tx, &config, now, &reachability_hosts, closed_targets.as_deref())?;
+            queue_due_reminder(&tx, &config, now, &reachability_hosts, &groups, closed_targets.as_deref())?;
             // Bound how much reconciliation can delay check writes or reload.
             for _ in 0..32 {
                 let candidate = tx
                     .query_row(
-                        "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
+                        &format!("SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
                             e.occurred_at, d.attempts, e.reminder_for IS NOT NULL
                      FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
-                     WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= ?1
+                     WHERE d.state IN ('queued', 'retrying') AND d.retry_at <= :now
                        AND (e.service_id = '' OR e.host_id NOT IN (
                            SELECT host_id FROM check_problems WHERE check_kind = 'host'
                              AND service_id = '' AND confirmed_severity = 2
-                             AND host_id IN (SELECT value FROM json_each(?2))
-                       ))
-                       AND (e.host_id, e.service_id) NOT IN (
-                           SELECT value ->> 0, value ->> 1 FROM json_each(?3)
+                             AND host_id IN (SELECT value FROM json_each(:reachability))
+                       )) AND {} AND (e.host_id, e.service_id) NOT IN (
+                           SELECT value ->> 0, value ->> 1 FROM json_each(:closed_targets)
                        )
-                     ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1",
-                        params![now.timestamp_millis(), reachability_hosts, closed_targets],
+                     ORDER BY d.retry_at, d.event_id, d.recipient LIMIT 1", silences::ACTIVE_FILTER),
+                        named_params!{":now": now.timestamp_millis(), ":reachability": reachability_hosts, ":groups": groups, ":closed_targets": closed_targets},
                         read_notification,
                     )
                     .optional()?;
@@ -471,7 +482,7 @@ impl Store {
             self.1.is_some(),
             "email delivery requires the exclusive server database lock"
         );
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             let config = active.borrow();
             if !Arc::ptr_eq(&config, &relay_config) || config.smtp.is_none() {
@@ -499,6 +510,10 @@ impl Store {
             if let Some(reason) = obsolete_reason(&tx, &config, &notification)? {
                 discard(&tx, &notification, reason)?;
                 tx.commit()?;
+                return Ok(None);
+            }
+            let group = host.map(|host| host.group.as_str());
+            if silences::is_silenced(&tx, (&notification.host_id, &notification.service_id, group), now)? {
                 return Ok(None);
             }
             if reconcile_held_change(&tx, &mut notification)? {
@@ -531,7 +546,7 @@ impl Store {
         outcome: DeliveryOutcome,
         now: DateTime<Utc>,
     ) -> Result<()> {
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             let (state, diagnostic, delay, undo_attempt) = match outcome {
                 DeliveryOutcome::Delivered => ("delivered", None, 0, false),
@@ -575,7 +590,7 @@ impl Store {
     /// recovery) and completed episodes with unfinished or recent deliveries.
     pub async fn prune_notifications(&self, now: DateTime<Utc>) -> Result<()> {
         let cutoff = timestamp(now - super::TRANSITION_RETENTION);
-        self.notification_db(move |db| {
+        self.with_connection(move |db| {
             let tx = db.transaction()?;
             // Keep the first accepted reminder if the lifecycle message failed:
             // it can be the only evidence that qualifies the recipient for recovery.
@@ -624,7 +639,7 @@ impl Store {
     }
 
     pub async fn recent_deliveries(&self) -> Result<Vec<DeliveryRecord>> {
-        self.notification_db(|db| {
+        self.with_connection(|db| {
             let mut statement = db.prepare(
                 "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
                         e.occurred_at, d.attempts, e.reminder_for IS NOT NULL,
@@ -700,27 +715,33 @@ fn queue_due_reminder(
     config: &Config,
     now: DateTime<Utc>,
     reachability_hosts: &str,
+    groups: &str,
     closed_targets: Option<&str>,
 ) -> Result<()> {
     let due = tx
         .query_row(
-            "SELECT d.event_id, d.recipient
+            &format!(
+                "SELECT d.event_id, d.recipient
          FROM notification_deliveries d JOIN notification_events e ON e.id = d.event_id
-         WHERE d.remind_from <= ?1 AND (e.service_id = '' OR e.host_id NOT IN (
+         WHERE d.remind_from <= :due AND (e.service_id = '' OR e.host_id NOT IN (
              SELECT host_id FROM check_problems WHERE check_kind = 'host'
                AND service_id = '' AND confirmed_severity = 2
-               AND host_id IN (SELECT value FROM json_each(?2))
-         )) AND (e.host_id, e.service_id) NOT IN (
-             SELECT value ->> 0, value ->> 1 FROM json_each(?3)
+               AND host_id IN (SELECT value FROM json_each(:reachability))
+         )) AND {} AND (e.host_id, e.service_id) NOT IN (
+             SELECT value ->> 0, value ->> 1 FROM json_each(:closed_targets)
          ) AND NOT EXISTS (
              SELECT 1 FROM check_problem_episodes p
              WHERE p.host_id = e.host_id AND p.service_id = e.service_id AND p.acknowledged = 1
          ) ORDER BY d.remind_from, d.event_id, d.recipient LIMIT 1",
-            params![
-                now.timestamp_millis() - i64::from(config.reminder_interval_seconds) * 1000,
-                reachability_hosts,
-                closed_targets
-            ],
+                silences::ACTIVE_FILTER
+            ),
+            named_params! {
+                ":due": now.timestamp_millis() - i64::from(config.reminder_interval_seconds) * 1000,
+                ":now": now.timestamp_millis(),
+                ":reachability": reachability_hosts,
+                ":groups": groups,
+                ":closed_targets": closed_targets,
+            },
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;

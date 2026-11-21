@@ -251,6 +251,17 @@ to recurring weekly hours without changing when checks run. Retries and reminder
 timing survive restarts in SQLite. Open **Email delivery** on the dashboard to see
 held notifications, upcoming reminders, and delivery outcomes.
 
+For maintenance, open **Silences**, choose a service, host (including its
+services), or host group, and enter a future RFC 3339 expiry, such as
+`2027-01-15T18:00:00Z`. Add a reason if useful. Silences live in SQLite, not YAML,
+and survive restart. The page lists active silences and lets you browse expired ones.
+
+Checks, including **Check now**, still run and update results, history, and
+confirmed problems. Notifications resume only after the last matching silence
+expires. Ragios considers the current confirmed state rather than replaying
+intermediate changes. Recovery mail still requires a delivered problem notification.
+An SMTP attempt already in flight may finish after a silence is created.
+
 ## Access and current scope
 
 Use **Check now** on a reachability or service detail page to run that

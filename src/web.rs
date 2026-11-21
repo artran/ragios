@@ -1,3 +1,5 @@
+mod silences;
+
 use crate::monitor::{CheckRequest, CheckRequestOutcome, Key, SchedulerStatus};
 use axum::{
     Form, Router,
@@ -52,6 +54,8 @@ pub fn router(
         .route("/status", get(status))
         .route("/notifications", get(notifications_page))
         .route("/notifications/status", get(notifications_status))
+        .route("/silences", get(silences::page).post(silences::create))
+        .route("/silences/status", get(silences::status))
         .route("/hosts/{host}", get(host_page))
         .route("/hosts/{host}/status", get(host_status))
         .route("/hosts/{host}/reachability", get(reachability_page))
@@ -123,7 +127,11 @@ async fn require_served_host(
         )
             .into_response();
     }
-    next.run(request).await
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
 }
 
 fn serves(listener: SocketAddr, host: &str) -> bool {
@@ -248,7 +256,7 @@ async fn page(State(dashboard): State<Dashboard>, Query(filters): Query<Filters>
     Ok(layout(
         "Ragios — host reachability and service health",
         &format!(
-            r##"<h1>Ragios</h1><p>Host reachability and service health · <a href="/notifications">Email delivery</a></p>
+            r##"<h1>Ragios</h1><p>Host reachability and service health · <a href="/notifications">Email delivery</a> · <a href="/silences">Silences</a></p>
 <p>Latest results, confirmed problems, and pending changes are shown separately.
 Reachability is assessed from this monitoring server, independently of service health.
 A failed probe does not prove the machine is powered off. Service checks continue regardless of host reachability.</p>
@@ -284,7 +292,7 @@ async fn notifications_page(State(dashboard): State<Dashboard>) -> WebResult {
     Ok(layout(
         "Ragios — Email delivery",
         &format!(
-            r#"<nav><a href="/">Overview</a></nav><h1>Email delivery</h1>
+            r#"<nav><a href="/">Overview</a> · <a href="/silences">Silences</a></nav><h1>Email delivery</h1>
 <div hx-get="/notifications/status" hx-trigger="every 2s" hx-swap="innerHTML">{fragment}</div>"#,
         ),
     ))
@@ -1089,9 +1097,6 @@ async fn check_detail(
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
-        .headers_mut()
-        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     Ok(response)
 }
 
@@ -1136,29 +1141,36 @@ struct CheckNowForm {
     csrf: String,
 }
 
-fn validate_mutation(
+// The token is process-local. Also reject explicit foreign browser origins,
+// even if they include a token. The host middleware has already validated the
+// request authority against the HTTP listener; proxy headers are not trusted.
+fn require_mutation(
     dashboard: &Dashboard,
     uri: &Uri,
     headers: &HeaderMap,
     csrf: &str,
 ) -> Result<(), WebError> {
-    // The private dashboard has no accounts. A foreign page cannot read this
-    // process-local token, and explicit non-same-origin browser requests are
-    // rejected even when they include a token.
-    if headers
-        .get("sec-fetch-site")
-        .is_some_and(|site| site != "same-origin")
-        || csrf != dashboard.csrf.as_ref()
+    let authority = uri
+        .authority()
+        .map(|authority| authority.as_str())
+        .or_else(|| headers.get(header::HOST)?.to_str().ok());
+    let foreign_origin = headers.get_all(header::ORIGIN).iter().any(|origin| {
+        !authority.is_some_and(|authority| {
+            origin
+                .to_str()
+                .is_ok_and(|origin| origin.eq_ignore_ascii_case(&format!("http://{authority}")))
+        })
+    });
+    if csrf != dashboard.csrf.as_ref()
+        || foreign_origin
+        || headers
+            .get_all("sec-fetch-site")
+            .iter()
+            .any(|site| site != "same-origin")
     {
         return Err((
             StatusCode::FORBIDDEN,
-            "Invalid dashboard request; reload the page.",
-        ));
-    }
-    if uri.query().is_some() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Dashboard mutations do not accept query parameters.",
+            "Invalid dashboard request; reload the dashboard.",
         ));
     }
     Ok(())
@@ -1171,7 +1183,13 @@ async fn check_now(
     headers: &HeaderMap,
     form: CheckNowForm,
 ) -> Result<Response, WebError> {
-    validate_mutation(dashboard, uri, headers, &form.csrf)?;
+    require_mutation(dashboard, uri, headers, &form.csrf)?;
+    if uri.query().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Check requests do not accept query parameters.",
+        ));
+    }
     let unavailable = (StatusCode::SERVICE_UNAVAILABLE, "Scheduler is unavailable.");
     let (reply, outcome) = oneshot::channel();
     let outcome = match dashboard.requests.try_send(CheckRequest { key, reply }) {
@@ -1237,7 +1255,13 @@ async fn acknowledge(
     headers: &HeaderMap,
     form: AcknowledgeForm,
 ) -> Result<Response, WebError> {
-    validate_mutation(dashboard, uri, headers, &form.csrf)?;
+    require_mutation(dashboard, uri, headers, &form.csrf)?;
+    if uri.query().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Acknowledgement requests do not accept query parameters.",
+        ));
+    }
     let (host, service) = match path {
         CheckPath::Service(host, service) => (host, Some(service)),
         CheckPath::Reachability(host) => (host, None),
