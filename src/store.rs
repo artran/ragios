@@ -1,6 +1,9 @@
+mod browsing;
 mod notifications;
 mod schema;
 mod silences;
+
+pub use browsing::{CheckPath, CheckSnapshot, NotificationSnapshot, NotificationSuppression};
 
 pub use notifications::{DeliveryOutcome, Notification};
 pub use silences::{CreateSilence, Silence, SilenceScope};
@@ -240,6 +243,52 @@ struct StoredCheck {
     service_id: String,
     state: CheckState,
     probe: Option<Probe>,
+}
+
+const CHECK_STATE_SELECT: &str = "SELECT r.host_id, r.service_id, r.status, r.output, r.started_at,
+    r.finished_at, r.duration_ms, p.confirmed_severity, p.pending_severity, p.pending_attempts,
+    r.probe, e.token, COALESCE(e.acknowledged, 0)
+    FROM check_results r JOIN check_problems p
+        ON r.host_id = p.host_id AND r.service_id = p.service_id AND r.check_kind = p.check_kind
+    LEFT JOIN check_problem_episodes e ON r.host_id = e.host_id AND r.service_id = e.service_id";
+
+impl StoredCheck {
+    fn read(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            host_id: row.get(0)?,
+            service_id: row.get(1)?,
+            state: CheckState {
+                result: CheckResult {
+                    status: Status::from_code(Some(row.get(2)?)),
+                    output: row.get(3)?,
+                    started_at: row.get(4)?,
+                    finished_at: row.get(5)?,
+                    duration_ms: row.get(6)?,
+                },
+                problem: read_problem(row, 7)?,
+                episode: match row.get(11)? {
+                    Some(token) => Some(ProblemEpisode {
+                        token,
+                        acknowledged: row.get(12)?,
+                    }),
+                    None => None,
+                },
+            },
+            probe: row.get(10)?,
+        })
+    }
+
+    fn into_host(self) -> Result<(String, HostState)> {
+        Ok((
+            self.host_id,
+            HostState {
+                probe: self.probe.context("host result missing probe origin")?,
+                result: self.state.result,
+                problem: self.state.problem,
+                episode: self.state.episode,
+            },
+        ))
+    }
 }
 
 impl Store {
@@ -519,61 +568,17 @@ impl Store {
         self.latest_checks(CheckKind::Host)
             .await?
             .into_iter()
-            .map(|saved| {
-                Ok((
-                    saved.host_id,
-                    HostState {
-                        probe: saved.probe.context("host result missing probe origin")?,
-                        result: saved.state.result,
-                        problem: saved.state.problem,
-                        episode: saved.state.episode,
-                    },
-                ))
-            })
+            .map(StoredCheck::into_host)
             .collect()
     }
 
     async fn latest_checks(&self, kind: CheckKind) -> Result<Vec<StoredCheck>> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<StoredCheck>> {
-            let connection = store
-                .0
-                .lock()
-                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            let mut query = connection.prepare(
-                "SELECT r.host_id, r.service_id, r.status, r.output, r.started_at,
-                        r.finished_at, r.duration_ms,
-                        p.confirmed_severity, p.pending_severity, p.pending_attempts, r.probe,
-                        e.token, COALESCE(e.acknowledged, 0)
-                 FROM check_results r JOIN check_problems p
-                    ON r.host_id = p.host_id AND r.service_id = p.service_id AND r.check_kind = p.check_kind
-                 LEFT JOIN check_problem_episodes e ON r.host_id = e.host_id AND r.service_id = e.service_id
-                 WHERE r.check_kind = ?1",
-            )?;
-            let rows = query.query_map([kind.as_str()], |row| {
-                Ok(StoredCheck {
-                    host_id: row.get(0)?,
-                    service_id: row.get(1)?,
-                    state: CheckState {
-                        result: CheckResult {
-                            status: Status::from_code(Some(row.get(2)?)),
-                            output: row.get(3)?,
-                            started_at: row.get(4)?,
-                            finished_at: row.get(5)?,
-                            duration_ms: row.get(6)?,
-                        },
-                        problem: read_problem(row, 7)?,
-                        episode: match row.get(11)? {
-                            Some(token) => Some(ProblemEpisode { token, acknowledged: row.get(12)? }),
-                            None => None,
-                        },
-                    },
-                    probe: row.get(10)?,
-                })
-            })?;
+        self.with_connection(move |db| {
+            let mut query = db.prepare(&format!("{CHECK_STATE_SELECT} WHERE r.check_kind = ?1"))?;
+            let rows = query.query_map([kind.as_str()], StoredCheck::read)?;
             Ok(rows.collect::<rusqlite::Result<_>>()?)
         })
-        .await?
+        .await
     }
 
     /// Delete state changes older than the retention period before `now`.
@@ -603,45 +608,39 @@ impl Store {
         host_id: String,
         service_id: String,
     ) -> Result<Vec<Transition>> {
-        self.check_transitions(host_id, CheckKind::Service, service_id)
-            .await
+        self.with_connection(move |db| {
+            read_transitions(db, CheckKind::Service, &host_id, &service_id)
+        })
+        .await
     }
 
     pub async fn host_transitions(&self, host_id: String) -> Result<Vec<Transition>> {
-        self.check_transitions(host_id, CheckKind::Host, String::new())
+        self.with_connection(move |db| read_transitions(db, CheckKind::Host, &host_id, ""))
             .await
     }
+}
 
-    async fn check_transitions(
-        &self,
-        host_id: String,
-        kind: CheckKind,
-        service_id: String,
-    ) -> Result<Vec<Transition>> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<Transition>> {
-            let connection = store
-                .0
-                .lock()
-                .map_err(|_| anyhow::anyhow!("database lock poisoned"))?;
-            let mut query = connection.prepare(
-                "SELECT id, occurred_at, result_status, kind,
-                        confirmed_severity, pending_severity, pending_attempts
-                 FROM check_transitions WHERE host_id = ?1 AND service_id = ?2 AND check_kind = ?3 ORDER BY id",
-            )?;
-            let rows = query.query_map(params![host_id, service_id, kind.as_str()], |row| {
-                Ok(Transition {
-                    id: row.get(0)?,
-                    occurred_at: row.get(1)?,
-                    result_status: Status::from_code(Some(row.get(2)?)),
-                    kind: row.get(3)?,
-                    state: read_problem(row, 4)?,
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
+fn read_transitions(
+    db: &Connection,
+    kind: CheckKind,
+    host_id: &str,
+    service_id: &str,
+) -> Result<Vec<Transition>> {
+    let mut query = db.prepare(
+        "SELECT id, occurred_at, result_status, kind,
+                confirmed_severity, pending_severity, pending_attempts
+         FROM check_transitions WHERE host_id = ?1 AND service_id = ?2 AND check_kind = ?3 ORDER BY id",
+    )?;
+    let rows = query.query_map(params![host_id, service_id, kind.as_str()], |row| {
+        Ok(Transition {
+            id: row.get(0)?,
+            occurred_at: row.get(1)?,
+            result_status: Status::from_code(Some(row.get(2)?)),
+            kind: row.get(3)?,
+            state: read_problem(row, 4)?,
         })
-        .await?
-    }
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 impl FromSql for Probe {

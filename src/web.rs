@@ -15,8 +15,9 @@ use ragios::{
     runner::{CheckResult, Reachability, Status},
     schedule::{self, Freshness},
     store::{
-        AcknowledgeOutcome, LatestHosts, LatestResults, ProblemEpisode, ProblemState, Store,
-        TRANSITION_RETENTION, Transition, TransitionKind,
+        AcknowledgeOutcome, CheckPath, CheckSnapshot, NotificationSnapshot,
+        NotificationSuppression, ProblemEpisode, ProblemState, Store, TRANSITION_RETENTION,
+        Transition, TransitionKind,
     },
 };
 use serde::Deserialize;
@@ -228,12 +229,12 @@ label{{display:grid;gap:.25rem}}select,button{{font:inherit;padding:.3rem}}
 }
 
 async fn page(State(dashboard): State<Dashboard>, Query(filters): Query<Filters>) -> WebResult {
-    let snapshot = snapshot(&dashboard).await?;
+    let snapshot = snapshot(&dashboard, None).await?;
     let fragment = overview(&snapshot, &filters);
     let mut form = String::from(
         r##"<form id="filters" action="/" method="get" hx-get="/status" hx-target="#status" hx-trigger="change, submit" hx-sync="this:replace"><label>Host group <select name="group"><option value="">All groups</option>"##,
     );
-    for group in &snapshot.config.groups {
+    for group in &snapshot.checks.config.groups {
         let _ = write!(
             form,
             r#"<option value="{}"{}>{}</option>"#,
@@ -276,7 +277,7 @@ async fn status(
     Query(filters): Query<Filters>,
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
-    let fragment = overview(&snapshot(&dashboard).await?, &filters);
+    let fragment = overview(&snapshot(&dashboard, None).await?, &filters);
     let mut response = Html(fragment).into_response();
     // A filter change keeps the address bar shareable; polling leaves it alone.
     if headers.get("hx-trigger").is_some_and(|id| id == "filters")
@@ -303,89 +304,64 @@ async fn notifications_status(State(dashboard): State<Dashboard>) -> WebResult {
 }
 
 async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebError> {
-    let config = dashboard.config.borrow().clone();
-    let mode = if config.smtp.is_some() {
-        "enabled"
-    } else {
-        "disabled"
-    };
-    let records = dashboard
+    let snapshot = dashboard
         .store
-        .recent_deliveries()
+        .browse_notifications(dashboard.config.clone())
         .await
         .map_err(load_error)?;
-    let mut html = format!("<p>SMTP email {mode}.</p>");
-    if config.smtp.is_some() {
-        let _ = write!(
-            html,
-            "<p>Reminder interval: {} seconds.</p>",
-            config.reminder_interval_seconds
-        );
-        let hosts = dashboard.store.latest_hosts().await.map_err(load_error)?;
-        let services = if config
-            .hosts
-            .iter()
-            .any(|host| host.notification_windows().any(|(id, _)| !id.is_empty()))
-        {
-            dashboard.store.latest().await.map_err(load_error)?
-        } else {
-            LatestResults::new()
-        };
-        let now = Utc::now();
-        for host in &config.hosts {
-            for (id, window) in host.notification_windows() {
-                if window.is_open(now) {
-                    continue;
-                }
-                let problem = if id.is_empty() {
-                    hosts.get(&host.id).map(|state| state.problem)
-                } else {
-                    services
-                        .get(&(host.id.clone(), id.to_string()))
-                        .map(|state| state.problem)
-                };
-                if problem.is_some_and(|problem| problem.confirmed_severity.is_some()) {
-                    let target = if id.is_empty() {
-                        "Host reachability"
-                    } else {
-                        id
-                    };
-                    let _ = write!(
-                        html,
-                        "<p>{} / {}: Outside notification window ({})</p>",
-                        escape(&host.id),
-                        escape(target),
-                        escape(&window.id)
-                    );
-                }
+    Ok(render_deliveries(snapshot))
+}
+
+fn render_deliveries(snapshot: NotificationSnapshot) -> String {
+    let NotificationSnapshot {
+        reminder_interval_seconds,
+        deliveries,
+        suppressions,
+    } = snapshot;
+    let mut html = match reminder_interval_seconds {
+        Some(interval) => {
+            format!("<p>SMTP email enabled.</p><p>Reminder interval: {interval} seconds.</p>")
+        }
+        None => "<p>SMTP email disabled.</p>".into(),
+    };
+    for suppression in suppressions {
+        match suppression {
+            NotificationSuppression::OutsideWindow {
+                host_id,
+                service_id,
+                window_id,
+            } => {
+                let _ = write!(
+                    html,
+                    "<p>{} / {}: Outside notification window ({})</p>",
+                    escape(&host_id),
+                    escape(service_id.as_deref().unwrap_or("Host reachability")),
+                    escape(&window_id),
+                );
             }
-            if host.reachability.is_some()
-                && hosts
-                    .get(&host.id)
-                    .is_some_and(|state| state.is_confirmed_down())
-            {
+            NotificationSuppression::HostDown { host_id } => {
                 let _ = write!(
                     html,
                     "<p>{}: Held: host confirmed down. Service checks continue.</p>",
-                    escape(&host.id)
+                    escape(&host_id),
                 );
             }
         }
     }
-    if records.is_empty() {
+    if deliveries.is_empty() {
         html.push_str("<p>No notification deliveries recorded.</p>");
-        return Ok(html);
+        return html;
     }
     html.push_str("<h2>Recent notification deliveries</h2><div class=\"scroll\"><table><thead><tr><th>Host / Service</th><th>Notification</th><th>Recipient</th><th>State</th><th>Attempts</th><th>Last update</th><th>Next reminder (if eligible)</th><th>Diagnostic</th></tr></thead><tbody>");
-    for record in records {
+    for record in deliveries {
         let notification = record.notification;
-        let reminder_due = record
-            .reminder_from
-            .filter(|_| config.smtp.is_some())
-            .map(|from| {
-                (from + chrono::TimeDelta::seconds(i64::from(config.reminder_interval_seconds)))
-                    .to_rfc3339()
-            });
+        let reminder_due =
+            record
+                .reminder_from
+                .zip(reminder_interval_seconds)
+                .map(|(from, interval)| {
+                    (from + chrono::TimeDelta::seconds(i64::from(interval))).to_rfc3339()
+                });
         let _ = write!(
             html,
             "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
@@ -401,7 +377,7 @@ async fn notification_deliveries(dashboard: &Dashboard) -> Result<String, WebErr
         );
     }
     html.push_str("</tbody></table></div>");
-    Ok(html)
+    html
 }
 
 fn load_error(error: anyhow::Error) -> WebError {
@@ -413,16 +389,15 @@ fn load_error(error: anyhow::Error) -> WebError {
 }
 
 struct Snapshot {
-    config: Arc<Config>,
-    services: LatestResults,
-    hosts: LatestHosts,
+    checks: CheckSnapshot,
+    // Live observation, not part of the durable snapshot.
     scheduler: SchedulerStatus,
     now: DateTime<Utc>,
 }
 
 impl Snapshot {
     fn host(&self, id: &str) -> Option<&Host> {
-        self.config.hosts.iter().find(|host| host.id == id)
+        self.checks.config.hosts.iter().find(|host| host.id == id)
     }
 
     fn freshness(
@@ -433,7 +408,7 @@ impl Snapshot {
     ) -> Freshness {
         schedule::freshness(
             check,
-            self.config.retry_interval_seconds,
+            self.checks.config.retry_interval_seconds,
             state,
             self.scheduler.unchecked_since.get(key).copied(),
             self.now,
@@ -442,16 +417,16 @@ impl Snapshot {
 
     fn overdue_count(&self) -> usize {
         let mut count = 0;
-        for host in &self.config.hosts {
+        for host in &self.checks.config.hosts {
             if let Some(probe) = &host.reachability {
-                let state = self.hosts.get(&host.id);
+                let state = self.checks.hosts.get(&host.id);
                 let state = state.map(|state| (&state.result, state.problem));
                 let freshness = self.freshness(&reachability_key(host), &probe.check, state);
                 count += usize::from(freshness.is_overdue());
             }
             for service in &host.services {
                 let key = service_key(host, service);
-                let state = self.services.get(&key);
+                let state = self.checks.services.get(&key);
                 let state = state.map(|state| (&state.result, state.problem));
                 count += usize::from(self.freshness(&key, &service.check, state).is_overdue());
             }
@@ -509,24 +484,17 @@ fn alerts(snapshot: &Snapshot) -> String {
     html
 }
 
-async fn snapshot(dashboard: &Dashboard) -> Result<Snapshot, WebError> {
-    // If a reload spans the database read, retry with the newly published
-    // definitions. Otherwise old names could be paired with new-command results
-    // that were never active together. Rendering has no further awaits.
-    loop {
-        let config = dashboard.config.borrow().clone();
-        let services = dashboard.store.latest().await.map_err(load_error)?;
-        let hosts = dashboard.store.latest_hosts().await.map_err(load_error)?;
-        if Arc::ptr_eq(&config, &dashboard.config.borrow()) {
-            return Ok(Snapshot {
-                config,
-                services,
-                hosts,
-                scheduler: dashboard.scheduler.borrow().clone(),
-                now: Utc::now(),
-            });
-        }
-    }
+async fn snapshot(dashboard: &Dashboard, history: Option<CheckPath>) -> Result<Snapshot, WebError> {
+    let checks = dashboard
+        .store
+        .browse_checks(dashboard.config.clone(), history)
+        .await
+        .map_err(load_error)?;
+    Ok(Snapshot {
+        checks,
+        scheduler: dashboard.scheduler.borrow().clone(),
+        now: Utc::now(),
+    })
 }
 
 fn overview(snapshot: &Snapshot, filters: &Filters) -> String {
@@ -553,12 +521,12 @@ fn checks_table(
     include: impl Fn(&Host) -> bool,
     problem: ProblemFilter,
 ) -> Option<String> {
-    let Snapshot {
+    let CheckSnapshot {
         config,
         services,
         hosts,
         ..
-    } = snapshot;
+    } = &snapshot.checks;
     let mut rows = String::new();
     for group in &config.groups {
         for host in config
@@ -828,11 +796,11 @@ async fn host_page(
     State(dashboard): State<Dashboard>,
     Path(host_id): Path<String>,
 ) -> Result<Response, WebError> {
-    let snapshot = snapshot(&dashboard).await?;
+    let snapshot = snapshot(&dashboard, None).await?;
     let Some(host) = snapshot.host(&host_id) else {
         return Ok(not_configured("host"));
     };
-    let heading = host_heading(&snapshot.config, host);
+    let heading = host_heading(&snapshot.checks.config, host);
     Ok(detail_page(
         &host.name,
         &heading,
@@ -845,7 +813,7 @@ async fn host_status(
     State(dashboard): State<Dashboard>,
     Path(host_id): Path<String>,
 ) -> Result<Response, WebError> {
-    let snapshot = snapshot(&dashboard).await?;
+    let snapshot = snapshot(&dashboard, None).await?;
     Ok(match snapshot.host(&host_id) {
         Some(host) => Html(host_checks(&snapshot, host)).into_response(),
         None => not_configured("host"),
@@ -883,7 +851,7 @@ impl<'a> CheckDetail<'a> {
             .iter()
             .find(|service| service.id == service_id)?;
         let key = service_key(host, service);
-        let saved = snapshot.services.get(&key);
+        let saved = snapshot.checks.services.get(&key);
         let state = saved.map(|state| (&state.result, state.problem));
         Some(Self {
             host,
@@ -900,7 +868,7 @@ impl<'a> CheckDetail<'a> {
     fn reachability(snapshot: &'a Snapshot, host_id: &str) -> Option<Self> {
         let host = snapshot.host(host_id)?;
         let probe = host.reachability.as_ref()?;
-        let saved = snapshot.hosts.get(&host.id);
+        let saved = snapshot.checks.hosts.get(&host.id);
         let state = saved.map(|state| (&state.result, state.problem));
         Some(Self {
             host,
@@ -925,8 +893,9 @@ impl<'a> CheckDetail<'a> {
         )
     }
 
-    fn fragment(&self, snapshot: &Snapshot, transitions: &[Transition], csrf: &str) -> String {
-        let confirmation_attempts = snapshot.config.confirmation_attempts;
+    fn fragment(&self, snapshot: &Snapshot, csrf: &str) -> String {
+        let transitions = &snapshot.checks.transitions;
+        let confirmation_attempts = snapshot.checks.config.confirmation_attempts;
         let mut html = alerts(snapshot);
         html.push_str("<h2>Current state</h2><table class=\"facts\"><tbody>");
         match self.state {
@@ -1023,17 +992,12 @@ fn age(result: &CheckResult, now: DateTime<Utc>) -> String {
     }
 }
 
-enum CheckPath {
-    Service(String, String),
-    Reachability(String),
-}
-
 async fn check_detail(
     dashboard: &Dashboard,
     path: CheckPath,
     fragment_only: bool,
 ) -> Result<Response, WebError> {
-    let snapshot = snapshot(dashboard).await?;
+    let snapshot = snapshot(dashboard, Some(path.clone())).await?;
     let detail = match &path {
         CheckPath::Service(host, service) => CheckDetail::service(&snapshot, host, service),
         CheckPath::Reachability(host) => CheckDetail::reachability(&snapshot, host),
@@ -1041,17 +1005,7 @@ async fn check_detail(
     let Some(detail) = detail else {
         return Ok(not_configured("check"));
     };
-    let transitions = match &path {
-        CheckPath::Service(host, service) => {
-            dashboard
-                .store
-                .transitions(host.clone(), service.clone())
-                .await
-        }
-        CheckPath::Reachability(host) => dashboard.store.host_transitions(host.clone()).await,
-    }
-    .map_err(load_error)?;
-    let fragment = detail.fragment(&snapshot, &transitions, &dashboard.csrf);
+    let fragment = detail.fragment(&snapshot, &dashboard.csrf);
     let mut response = if fragment_only {
         Html(fragment).into_response()
     } else {

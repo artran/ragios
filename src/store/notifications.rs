@@ -771,8 +771,12 @@ impl Store {
     }
 
     pub async fn recent_deliveries(&self) -> Result<Vec<DeliveryRecord>> {
-        self.with_connection(|db| {
-            let mut statement = db.prepare(
+        self.with_connection(|db| read_recent_deliveries(db)).await
+    }
+}
+
+pub(super) fn read_recent_deliveries(db: &Connection) -> Result<Vec<DeliveryRecord>> {
+    let mut statement = db.prepare(
                 "SELECT e.id, e.host_id, e.service_id, d.recipient, e.kind, e.severity,
                         e.occurred_at, d.attempts, e.reminder_for IS NOT NULL,
                         d.state, d.diagnostic, d.updated_at,
@@ -781,21 +785,18 @@ impl Store {
                  LEFT JOIN check_problem_episodes p ON p.host_id = e.host_id AND p.service_id = e.service_id
                  ORDER BY d.updated_at DESC, d.event_id DESC, d.recipient LIMIT 100",
             )?;
-            let rows = statement.query_map([], |row| {
-                Ok(DeliveryRecord {
-                    notification: read_notification(row)?,
-                    state: row.get(9)?,
-                    diagnostic: row.get(10)?,
-                    updated_at: row.get(11)?,
-                    reminder_from: row
-                        .get::<_, Option<i64>>(12)?
-                        .and_then(DateTime::from_timestamp_millis),
-                })
-            })?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let rows = statement.query_map([], |row| {
+        Ok(DeliveryRecord {
+            notification: read_notification(row)?,
+            state: row.get(9)?,
+            diagnostic: row.get(10)?,
+            updated_at: row.get(11)?,
+            reminder_from: row
+                .get::<_, Option<i64>>(12)?
+                .and_then(DateTime::from_timestamp_millis),
         })
-        .await
-    }
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 // Compare a held change with what the recipient actually saw, not the last
