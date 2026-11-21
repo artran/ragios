@@ -1,0 +1,26 @@
+[Unit]
+Description=Ragios monitoring server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=ragios
+Group=ragios
+ExecStart=/usr/local/bin/ragios --config /etc/ragios/ragios.yaml
+ExecReload=/usr/bin/kill -HUP $MAINPID
+EnvironmentFile=-/etc/ragios/plugin.env
+StateDirectory=ragios
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/ragios
+UMask=0027
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

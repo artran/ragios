@@ -4,6 +4,9 @@ A Rust monitoring server that runs installed host reachability and service-check
 plugins from YAML, stores their latest results in SQLite, and serves an HTML dashboard with HTMX
 updates. Email is disabled by default.
 
+For production installation as an unprivileged systemd service, see
+[Install Ragios on Amazon Linux 2023](docs/install-al2023.md).
+
 ## Development setup
 
 Install Devbox and enable the direnv hook for your shell. From the project
