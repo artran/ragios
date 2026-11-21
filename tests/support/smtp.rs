@@ -849,13 +849,24 @@ fn windowed_store(
             smtp_yaml("127.0.0.1", 1, "implicit"),
         ),
     );
-    with_reachability(&path, "ping", "check", &[]);
-    let yaml = fs::read_to_string(&path).unwrap().replace(
-        "    reachability:\n",
-        "    reachability:\n      notification_window: always\n",
-    );
-    fs::write(&path, yaml).unwrap();
+    let mut yaml: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    yaml["hosts"][0]["reachability"] = serde_yaml::Mapping::from_iter([
+        ("probe".into(), "ping".into()),
+        ("executable".into(), "check".into()),
+        ("notification_window".into(), "always".into()),
+    ])
+    .into();
+    fs::write(&path, serde_yaml::to_string(&yaml).unwrap()).unwrap();
     let config = Arc::new(ragios::config::Config::load(&path).unwrap());
+    assert!(
+        config.hosts[0]
+            .reachability
+            .as_ref()
+            .unwrap()
+            .notification_window
+            .is_none()
+    );
     let store = ragios::store::Store::open_server(&config.database).unwrap();
     (dir, store, config)
 }
