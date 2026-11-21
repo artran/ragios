@@ -2,6 +2,7 @@ use anyhow::{Context, Result, ensure};
 use lettre::{
     Address, AsyncSmtpTransport, Tokio1Executor,
     transport::smtp::{
+        AsyncSmtpTransportBuilder,
         authentication::Credentials,
         client::{Certificate, Tls, TlsParameters},
     },
@@ -11,6 +12,7 @@ use std::{
     fmt,
     fs::OpenOptions,
     io::Read,
+    net::IpAddr,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -71,8 +73,8 @@ impl EmailSource {
             return Ok(None);
         };
         ensure!(
-            !server.is_empty() && !server.chars().any(char::is_whitespace),
-            "SMTP server must be a hostname or IP address"
+            server.parse::<IpAddr>().is_ok() || is_hostname(server),
+            "email.server must be a hostname or IP address, not a URL or host:port"
         );
         let port = port.unwrap_or(match tls {
             TlsMode::Implicit => 465,
@@ -93,13 +95,14 @@ impl EmailSource {
                 .map(|file| std::fs::read(base.join(file)).context("read SMTP ca_file"))
                 .transpose()?,
         };
-        smtp.transport()?;
+        // Building the connection pool requires Tokio; validation does not.
+        smtp.transport_builder()?;
         Ok(Some(smtp))
     }
 }
 
 impl Smtp {
-    pub fn transport(&self) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
+    pub fn transport_builder(&self) -> Result<AsyncSmtpTransportBuilder> {
         let mut tls = TlsParameters::builder(self.server.clone());
         if let Some(pem) = &self.ca {
             tls = tls.add_root_certificate(
@@ -122,10 +125,23 @@ impl Smtp {
                 .credentials(Credentials::new(
                     self.username.clone(),
                     self.password.clone(),
-                ))
-                .build(),
+                )),
         )
     }
+}
+
+fn is_hostname(server: &str) -> bool {
+    let name = server.strip_suffix('.').unwrap_or(server);
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            bytes.len() <= 63
+                && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
 }
 
 fn secret(path: &Path) -> Result<String> {

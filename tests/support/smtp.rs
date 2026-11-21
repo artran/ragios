@@ -258,6 +258,174 @@ fn recovery_goes_only_to_recipients_whose_problem_mail_was_accepted() {
     relay.expect_quiet(Duration::from_millis(350));
 }
 
+#[test]
+fn smtp_reload_applies_new_relay_and_rejects_a_url_as_the_server() {
+    let dir = TempDir::new().unwrap();
+    let first = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &first, "confirmation_attempts: 1");
+    observation(&dir, 0, "healthy before reload");
+    let mut app = Application::start(&path);
+    app.page(SERVICE, "healthy before reload");
+
+    let second = TestRelay::listen(&dir, "starttls");
+    let yaml = fs::read_to_string(&path).unwrap().replace(
+        &smtp_yaml("127.0.0.1", first.port, first.mode),
+        &smtp_yaml("127.0.0.1", second.port, second.mode),
+    );
+    fs::write(&path, &yaml).unwrap();
+    app.reload("reloaded");
+    fs::write(
+        &path,
+        yaml.replace("server: 127.0.0.1", "server: smtp://relay.example"),
+    )
+    .unwrap();
+    assert!(app.reload("rejected").contains("email.server"));
+    check(&mut app, &dir, 2, "problem after reload");
+    second
+        .receive("observer@example.invalid", "Confirmed problem: CRITICAL")
+        .respond(250);
+    app.page(DELIVERY, "<td>delivered</td>");
+    first.expect_quiet(Duration::from_millis(300));
+}
+
+#[test]
+fn another_server_cannot_resume_the_same_outbox() {
+    let dir = TempDir::new().unwrap();
+    let relay = TestRelay::listen(&dir, "implicit");
+    let path = notification_config(&dir, &relay, "confirmation_attempts: 1");
+    observation(&dir, 2, "problem in flight");
+    let mut first = Application::start(&path);
+    let delivery = relay.receive("observer@example.invalid", "Confirmed problem: CRITICAL");
+
+    // Even a different database pathname must contend for the same lock.
+    std::os::unix::fs::symlink("state.sqlite3", dir.path().join("alias.sqlite3")).unwrap();
+    let alternate = dir.path().join("alternate.yaml");
+    let yaml = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &alternate,
+        yaml.replace("database: state.sqlite3", "database: alias.sqlite3"),
+    )
+    .unwrap();
+    let mut second = Command::new(env!("CARGO_BIN_EXE_ragios"))
+        .arg("--config")
+        .arg(alternate)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while second.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    if second.try_wait().unwrap().is_none() {
+        second.kill().unwrap();
+    }
+    let result = second.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("exclusive Ragios server lock"));
+    delivery.respond(250);
+    first.page(DELIVERY, "<td>delivered</td><td>1</td>");
+    drop(first);
+    let mut restarted = Application::start(&path);
+    restarted.page(DELIVERY, "<td>delivered</td><td>1</td>");
+    relay.expect_quiet(Duration::from_millis(350));
+}
+
+#[tokio::test]
+async fn dispatch_rechecks_confirmed_state_and_pruning_keeps_active_recovery_evidence() {
+    use ragios::{
+        config::Config,
+        runner::{CheckResult, Status},
+        store::{CheckTarget, DeliveryOutcome, Store},
+    };
+    let dir = TempDir::new().unwrap();
+    private_file(&dir, "username", USER);
+    private_file(&dir, "password", PASSWORD);
+    let path = config(
+        &dir,
+        &format!(
+            "{}recipients: [observer@example.invalid]",
+            smtp_yaml("127.0.0.1", 1, "implicit")
+        ),
+    );
+    let config = Arc::new(Config::load(&path).unwrap());
+    let (_publisher, active) = tokio::sync::watch::channel(config.clone());
+    let store = Store::open_server(&config.database).unwrap();
+    let old = chrono::Utc::now() - chrono::TimeDelta::days(40);
+    let save = |status| {
+        let timestamp = old.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store.save_with_notifications(
+            "local".into(),
+            CheckTarget::Service("application".into()),
+            CheckResult {
+                status,
+                output: String::new(),
+                started_at: timestamp.clone(),
+                finished_at: timestamp,
+                duration_ms: 0,
+            },
+            1,
+            vec!["observer@example.invalid".into()],
+        )
+    };
+    save(Status::Critical).await.unwrap();
+    let candidate = store
+        .next_notification(active.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    save(Status::Ok).await.unwrap();
+    assert!(
+        store
+            .begin_notification(candidate, active.clone(), config.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    save(Status::Warning).await.unwrap();
+    let candidate = store
+        .next_notification(active.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let sending = store
+        .begin_notification(candidate, active.clone(), config.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .finish_notification(sending, DeliveryOutcome::Delivered)
+        .await
+        .unwrap();
+
+    let future = chrono::Utc::now() + chrono::TimeDelta::days(31);
+    store.prune_notifications(future).await.unwrap();
+    let remaining = store.recent_deliveries().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        remaining[0].notification.label(),
+        "Confirmed problem: WARNING"
+    );
+    save(Status::Ok).await.unwrap();
+    store.prune_notifications(future).await.unwrap();
+    let recovery = store
+        .next_notification(active.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovery.label(), "Recovery: OK");
+    let sending = store
+        .begin_notification(recovery, active, config)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .finish_notification(sending, DeliveryOutcome::Delivered)
+        .await
+        .unwrap();
+    store.prune_notifications(future).await.unwrap();
+    assert!(store.recent_deliveries().await.unwrap().is_empty());
+}
+
 fn check(app: &mut Application, dir: &TempDir, status: i32, text: &str) {
     observation(dir, status, text);
     request_check(app, SERVICE, text);

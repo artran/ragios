@@ -1,4 +1,7 @@
-use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    transport::smtp::AsyncSmtpTransportBuilder,
+};
 use ragios::{
     config::{Config, Smtp},
     store::{DeliveryOutcome, Notification, Store},
@@ -12,17 +15,20 @@ use tokio::{
 struct Relay {
     from: lettre::Address,
     transport: AsyncSmtpTransport<Tokio1Executor>,
+    builder: AsyncSmtpTransportBuilder,
 }
 
 impl Relay {
     fn new(config: &Smtp) -> anyhow::Result<Self> {
+        let builder = config.transport_builder()?;
         Ok(Self {
             from: config.from.clone(),
-            transport: config.transport()?,
+            transport: builder.clone().build(),
+            builder,
         })
     }
 
-    async fn deliver(&self, notification: &Notification) -> DeliveryOutcome {
+    async fn deliver(&mut self, notification: &Notification) -> DeliveryOutcome {
         let Ok(recipient) = notification.recipient.parse::<lettre::Address>() else {
             return DeliveryOutcome::Failed("Invalid SMTP recipient address".into());
         };
@@ -40,7 +46,12 @@ impl Relay {
         };
         match timeout(Duration::from_secs(15), self.transport.send(message)).await {
             Ok(Ok(_)) => DeliveryOutcome::Delivered,
-            Err(_) => DeliveryOutcome::Retry("SMTP delivery timed out".into()),
+            Err(_) => {
+                // Cancellation may have returned a connection with unread
+                // replies to the pool. Drop that pool before the next send.
+                self.transport = self.builder.clone().build();
+                DeliveryOutcome::Retry("SMTP delivery timed out".into())
+            }
             Ok(Err(error)) => {
                 // SMTP servers can echo AUTH values in replies. Persist only a
                 // numeric reply code or a locally defined error description.
@@ -70,7 +81,7 @@ pub async fn run(store: Store, mut active: watch::Receiver<Arc<Config>>) {
     }
     while active.has_changed().is_ok() {
         let config = active.borrow_and_update().clone();
-        let relay = match config.smtp.as_ref().map(Relay::new).transpose() {
+        let mut relay = match config.smtp.as_ref().map(Relay::new).transpose() {
             Ok(relay) => relay,
             Err(error) => {
                 eprintln!("Configure email delivery: {error:#}");
@@ -82,14 +93,26 @@ pub async fn run(store: Store, mut active: watch::Receiver<Arc<Config>>) {
             if !matches!(active.has_changed(), Ok(false)) {
                 break;
             }
-            match store.claim_notification(config.clone()).await {
-                Ok(Some(notification)) => {
+            match store.next_notification(active.clone()).await {
+                Ok(Some(candidate)) => {
+                    let notification = match store
+                        .begin_notification(candidate, active.clone(), config.clone())
+                        .await
+                    {
+                        Ok(Some(notification)) => notification,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            eprintln!("Dispatch email delivery: {error:#}");
+                            sleep(Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    };
                     let outcome = if !matches!(active.has_changed(), Ok(false)) {
                         DeliveryOutcome::RecheckConfiguration
                     } else {
                         relay
-                            .as_ref()
-                            .expect("SMTP enabled for claimed email")
+                            .as_mut()
+                            .expect("SMTP enabled for dispatch")
                             .deliver(&notification)
                             .await
                     };

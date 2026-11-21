@@ -325,8 +325,8 @@ Confirmed service problems and severity changes create email intent in the same
 SQLite transaction as the check result. Pending-only failures do not send email.
 A recovery is sent only to still-configured recipients whose problem message
 was accepted by the relay during that confirmed problem. A newer confirmed
-state supersedes unsent messages. Disabling email discards queued deliveries;
-re-enabling does not replay transitions that occurred while it was disabled.
+state supersedes unsent messages. While email is disabled, the worker discards
+queued deliveries. Transitions recorded while disabled are not replayed.
 
 Open **Email delivery** on the dashboard to see delivery state, attempts, and
 sanitized SMTP diagnostics. Temporary failures retry starting after three seconds,
@@ -335,6 +335,15 @@ Ragios does not resend a recorded delivery on restart. If the relay accepts a
 message but Ragios cannot record that outcome (for example, on a crash), the
 outcome is uncertain and a still-current message may be retried. A message
 already in flight at a state change or configuration reload may still arrive.
+
+Completed notification episodes are pruned after 30 days without a delivery
+update, once all their deliveries are finished. Active episodes keep the records
+needed to decide whether to send a recovery.
+
+Run only one Ragios server per SQLite database. Ragios holds an exclusive lock
+on a sibling `<database>.ragios.lock` file while running. Leave the lock file in
+place; the operating system releases the lock when Ragios exits. Do not expose
+the same database through hard links; SQLite's WAL requires a single filename.
 
 ## Validation and runtime reload
 

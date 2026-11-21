@@ -25,9 +25,18 @@ struct Arguments {
     validate: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let arguments = Arguments::parse();
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run(Arguments::parse()));
+    // A system DNS lookup may still be running on Tokio's blocking pool.
+    // Delivery has already had its chance to record a known SMTP outcome.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
+}
+
+async fn run(arguments: Arguments) -> Result<()> {
     let config = Arc::new(Config::load(&arguments.config)?);
     if arguments.validate {
         println!("Configuration valid: {}", arguments.config.display());
@@ -38,7 +47,7 @@ async fn main() -> Result<()> {
     let reloads = signal(SignalKind::hangup()).context("listen for SIGHUP")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("listen for SIGINT")?;
     let mut terminate = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
-    let store = Store::open(&config.database)?;
+    let store = Store::open_server(&config.database)?;
     let listener = TcpListener::bind(config.bind)
         .await
         .context("bind HTTP listener")?;
@@ -86,8 +95,12 @@ async fn prune_history(store: Store) {
     let mut ticks = tokio::time::interval(Duration::from_secs(3600));
     loop {
         ticks.tick().await;
-        if let Err(error) = store.prune_transitions(chrono::Utc::now()).await {
+        let now = chrono::Utc::now();
+        if let Err(error) = store.prune_transitions(now).await {
             eprintln!("prune state-change history: {error:#}");
+        }
+        if let Err(error) = store.prune_notifications(now).await {
+            eprintln!("prune notification history: {error:#}");
         }
     }
 }
