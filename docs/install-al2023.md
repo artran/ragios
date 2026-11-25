@@ -4,6 +4,26 @@ Use a new AL2023 machine. These instructions do not copy or edit Nagios
 configuration, stop Nagios, or enable email. The example checks only the new
 machine. Run the commands from the root of the Ragios checkout unless noted.
 
+## Size an EC2 trial instance
+
+For a small trial with lightweight checks, start with a Graviton `t4g.micro`
+(2 vCPUs, 1 GiB RAM), an Amazon Linux 2023 ARM64 AMI, and a 10 GiB `gp3` EBS
+volume. Ragios runs as one binary with embedded SQLite. Skip the `t4g.nano`:
+its 512 MiB leaves little room for the OS and concurrent plugins.
+
+At 730 hours per month, Linux On-Demand compute in US East (N. Virginia) is
+about $6.13/month for a `t4g.micro` or $12.26/month for a `t4g.small`. With the
+10 GiB volume, budget about $7/month for the micro, or $10.60/month with one
+public IPv4 address. These estimates exclude snapshots, data transfer, and any
+surplus CPU-credit charges. Check your region in the [AWS Pricing Calculator][pricing].
+
+Check memory usage on the host and `CPUCreditBalance` in CloudWatch after a
+few days of real checks. If memory is tight, especially with concurrent
+Python plugins, move to a `t4g.small` (2 vCPUs, 2 GiB RAM). Use a separate
+AL2023 ARM64 builder for release builds, and verify that any custom plugin
+binaries support ARM64. Keep the dashboard private; see
+[Access from a private machine](#access-from-a-private-machine).
+
 ## Build a release
 
 Use a builder running the same AL2023 release and CPU architecture (`aarch64`
@@ -206,6 +226,7 @@ replicas sharing the file. Run an external watchdog on a different machine to
 detect total monitoring-server loss; a local restart policy or self-check
 cannot detect loss of the whole host from outside.
 
+[pricing]: https://calculator.aws/
 [packages]: https://docs.aws.amazon.com/linux/al2023/release-notes/all-packages-AL2023.12.html
 [spal]: https://docs.aws.amazon.com/linux/al2023/ug/configure-spal-repository.html
 [icmp]: https://docs.kernel.org/networking/ip-sysctl.html#icmp-settings
